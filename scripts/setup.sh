@@ -55,7 +55,29 @@ fi
 
 # ---- install package ---------------------------------------------------------
 echo "    Installing aftermovie..."
-"${VENV}/bin/pip" install -e "${SKILL_DIR}" --quiet
+"${VENV}/bin/pip" install -e "${SKILL_DIR}[mcp]" --quiet
+
+# ---- MCP registration --------------------------------------------------------
+# Write a stanza into ~/.claude/.mcp.json so Claude Code auto-spawns the server.
+MCP_CONFIG="${HOME}/.claude/.mcp.json"
+mkdir -p "$(dirname "${MCP_CONFIG}")"
+
+"${VENV}/bin/python" - <<PYEOF
+import json, os
+path = "${MCP_CONFIG}"
+venv_bin = "${VENV}/bin/aftermovie-mcp"
+try:
+    cfg = json.load(open(path))
+except (FileNotFoundError, json.JSONDecodeError):
+    cfg = {}
+cfg.setdefault("mcpServers", {})["aftermovie"] = {
+    "command": venv_bin,
+    "args": [],
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump(cfg, open(path, "w"), indent=2)
+print(f"    MCP:      registered 'aftermovie' in {path}")
+PYEOF
 
 # ---- self-check --------------------------------------------------------------
 echo ""
@@ -73,8 +95,13 @@ EOF
 echo ""
 echo "Setup complete."
 echo ""
-echo "Try it:"
+echo "Try it from Claude Code:"
+echo "  'make me an aftermovie from ~/Movies/MyTrip using ~/Music/song.mp3'"
+echo ""
+echo "Or from the shell:"
 echo "  ${VENV}/bin/aftermovie auto \\"
 echo "    --clips ~/Movies/MyTrip \\"
 echo "    --song ~/Music/song.mp3 \\"
 echo "    --output ~/Movies/aftermovie.mp4"
+echo ""
+echo "To uninstall the MCP entry, edit ${MCP_CONFIG} and remove the 'aftermovie' key."

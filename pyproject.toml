@@ -39,6 +39,7 @@ dev = ["pytest>=7", "pytest-timeout>=2"]
 
 [project.scripts]
 aftermovie = "aftermovie.cli:main"
+aftermovie-mcp = "aftermovie.mcp_server.server:main"
 
 [project.urls]
 Homepage = "https://github.com/djspilot/claude-aftermovie-skill"

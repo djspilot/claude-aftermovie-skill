@@ -1,0 +1,299 @@
+"""FastMCP server exposing aftermovie's analyze → plan → render pipeline as tools.
+
+The MCP server is the preferred interface for Claude Code; the CLI is the
+fallback. Both call the same underlying functions in `aftermovie.analyze`,
+`aftermovie.score`, and `aftermovie.render`.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+from aftermovie.analyze.clip import analyze_clip
+from aftermovie.config import (
+    DEFAULT_TARGET_LEN_S,
+    THEMES,
+    VIDEO_EXTS,
+    list_luts,
+)
+from aftermovie.mcp_server import jobs
+from aftermovie.render.pipeline import cmd_render
+from aftermovie.score.scorer import build_plan
+from aftermovie.score.song import analyze_song
+from aftermovie.state import (
+    catalog_id_for,
+    load_catalog,
+    load_plan,
+    plan_id_for,
+    save_catalog,
+    save_plan,
+)
+
+mcp = FastMCP("aftermovie")
+
+
+# ---- read-only tools -------------------------------------------------------
+
+@mcp.tool(description="List the built-in theme presets (LUT + audio + ramp policy).")
+def list_themes() -> dict[str, Any]:
+    return {"themes": [{"name": name, **{k: v for k, v in t.items()}}
+                       for name, t in THEMES.items()]}
+
+
+@mcp.tool(description="List the available color LUTs.")
+def aftermovie_list_luts() -> dict[str, Any]:
+    return {"luts": list_luts()}
+
+
+@mcp.tool(description="Fetch a single clip's ClipInfo from a saved catalog.")
+def inspect_clip(catalog_id: str, clip_index: int) -> dict[str, Any]:
+    catalog = load_catalog(catalog_id)
+    clips = catalog.get("clips", [])
+    if clip_index < 0 or clip_index >= len(clips):
+        raise IndexError(f"clip_index {clip_index} out of range (have {len(clips)})")
+    return clips[clip_index]
+
+
+@mcp.tool(description="Fetch a saved plan. If include_entries=False only return the summary.")
+def get_plan(plan_id: str, include_entries: bool = True) -> dict[str, Any]:
+    plan = load_plan(plan_id)
+    if not include_entries:
+        plan = {k: v for k, v in plan.items() if k != "entries"}
+    return plan
+
+
+# ---- jobs ------------------------------------------------------------------
+
+@mcp.tool(description="Scan a folder of video clips, extract per-clip features, "
+                      "and store the catalog. Returns a job_id; poll with get_job.")
+def analyze_folder(path: str, force_reanalyze: bool = False) -> dict[str, Any]:
+    folder = Path(path).expanduser().resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError(f"not a directory: {folder}")
+    catalog_id = catalog_id_for(folder)
+
+    if not force_reanalyze:
+        try:
+            load_catalog(catalog_id)
+            return {"job_id": None, "catalog_id": catalog_id, "cached": True}
+        except FileNotFoundError:
+            pass
+
+    files = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix in VIDEO_EXTS)
+    if not files:
+        raise FileNotFoundError(f"no video files in {folder} (looking for {sorted(VIDEO_EXTS)})")
+
+    def _work(cancel):
+        clips: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for f in files:
+            if cancel.is_set():
+                break
+            info = analyze_clip(f)
+            if info is None:
+                warnings.append(f"skipped {f.name}")
+                continue
+            clips.append(asdict(info))
+        catalog = {"clips": clips, "folder": str(folder)}
+        save_catalog(catalog_id, catalog)
+        return {
+            "catalog_id": catalog_id,
+            "n_clips": len(clips),
+            "n_skipped": len(warnings),
+            "warnings": warnings,
+        }
+
+    job_id = jobs.start_job("analyze_folder", _work)
+    return {"job_id": job_id, "catalog_id": catalog_id, "cached": False}
+
+
+@mcp.tool(description="Propose an edit plan from a catalog + song + theme. "
+                      "Synchronous — returns plan_id + summary.")
+def propose_plan(
+    catalog_id: str,
+    song_path: str,
+    theme: str | None = None,
+    target_length_s: float | None = None,
+    aspect: str = "16:9",
+    seed: int = 0,
+) -> dict[str, Any]:
+    catalog = load_catalog(catalog_id)
+    song = analyze_song(Path(song_path).expanduser().resolve())
+    target = min(song["duration_s"], target_length_s or DEFAULT_TARGET_LEN_S)
+
+    theme_cfg = THEMES.get(theme, {}) if theme else {}
+    no_speed_ramp = bool(theme_cfg.get("no_speed_ramp", False))
+
+    entries = build_plan(catalog, song, target_len=target, no_speed_ramp=no_speed_ramp)
+
+    plan_id = plan_id_for(catalog_id, Path(song_path), theme, target, aspect, seed)
+    plan = {
+        "plan_id": plan_id,
+        "catalog_id": catalog_id,
+        "song": str(Path(song_path).expanduser().resolve()),
+        "song_meta": song,
+        "theme": theme,
+        "target_length_s": target,
+        "aspect": aspect,
+        "resolution": "1920x1080",
+        "fps": 30,
+        "lut": theme_cfg.get("lut"),
+        "music_db": theme_cfg.get("music_db", -8.0),
+        "clip_db": -18.0,
+        "entries": entries,
+    }
+    save_plan(plan_id, plan)
+    sources = sorted({e["source"] for e in entries})
+    return {
+        "plan_id": plan_id,
+        "summary": {
+            "n_cuts": len(entries),
+            "total_length_s": target,
+            "sources_used": len(sources),
+            "bpm": round(song["tempo_bpm"], 1),
+        },
+    }
+
+
+# ---- tweak ops -------------------------------------------------------------
+
+@mcp.tool(description="Apply tweak operations to a plan; returns a new plan_id. "
+                      "Ops: {op:'exclude_source', source}, {op:'set', path, value}, "
+                      "{op:'swap', beat_index, with_candidate_rank}, "
+                      "{op:'pin', beat_index, source, start_s, end_s}.")
+def tweak_plan(plan_id: str, ops: list[dict[str, Any]]) -> dict[str, Any]:
+    import copy
+
+    plan = load_plan(plan_id)
+    new_plan = copy.deepcopy(plan)
+    diff: list[str] = []
+
+    for op in ops:
+        kind = op.get("op")
+        if kind == "exclude_source":
+            src = op["source"]
+            before = len(new_plan["entries"])
+            new_plan["entries"] = [e for e in new_plan["entries"] if e["source"] != src]
+            diff.append(f"excluded {src} ({before - len(new_plan['entries'])} cuts removed)")
+        elif kind == "set":
+            path = op["path"]
+            value = op["value"]
+            _set_path(new_plan, path, value)
+            diff.append(f"set {path}={value}")
+        elif kind == "swap":
+            idx = int(op["beat_index"])
+            rank = int(op.get("with_candidate_rank", 1))
+            _swap_at(new_plan, idx, rank)
+            diff.append(f"swapped entry[{idx}] with rank {rank}")
+        elif kind == "pin":
+            idx = int(op["beat_index"])
+            new_plan["entries"][idx]["source"] = op["source"]
+            new_plan["entries"][idx]["start_s"] = float(op["start_s"])
+            new_plan["entries"][idx]["end_s"] = float(op["end_s"])
+            diff.append(f"pinned entry[{idx}] to {op['source']}")
+        else:
+            raise ValueError(f"unknown op: {kind}")
+
+    # new id: derive from old id + ops payload
+    import hashlib
+    import json as _json
+    seed = plan_id + _json.dumps(ops, sort_keys=True)
+    new_id = hashlib.sha1(seed.encode()).hexdigest()[:12]
+    new_plan["plan_id"] = new_id
+    save_plan(new_id, new_plan)
+    return {"plan_id": new_id, "diff": diff}
+
+
+def _set_path(obj: dict[str, Any], path: str, value: Any) -> None:
+    """Tiny dotted/indexed path setter — 'music_db', 'entries[3].speed'."""
+    parts: list[Any] = []
+    for chunk in path.split("."):
+        if "[" in chunk and chunk.endswith("]"):
+            name, idx = chunk[:-1].split("[")
+            parts.append(name)
+            parts.append(int(idx))
+        else:
+            parts.append(chunk)
+    cur: Any = obj
+    for p in parts[:-1]:
+        cur = cur[p]
+    cur[parts[-1]] = value
+
+
+def _swap_at(plan: dict[str, Any], idx: int, rank: int) -> None:
+    """Replace entries[idx] with the rank-th highest-scoring entry from later in the plan."""
+    entries = plan["entries"]
+    if idx >= len(entries):
+        raise IndexError(f"entry index {idx} out of range")
+    pool = sorted(
+        ((i, e) for i, e in enumerate(entries) if i != idx),
+        key=lambda kv: kv[1].get("score", 0),
+        reverse=True,
+    )
+    if not pool or rank > len(pool):
+        raise ValueError(f"no entry of rank {rank} available to swap")
+    j, other = pool[rank - 1]
+    entries[idx], entries[j] = entries[j], entries[idx]
+
+
+# ---- render job -----------------------------------------------------------
+
+@mcp.tool(description="Render a plan to an MP4. Returns a job_id; poll with get_job.")
+def render_plan(plan_id: str, output_path: str) -> dict[str, Any]:
+    plan = load_plan(plan_id)
+    out = Path(output_path).expanduser().resolve()
+
+    def _work(cancel):
+        # Write plan to a temp file for cmd_render's argparse contract.
+        import json as _json
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+            tf.write(_json.dumps(plan))
+            plan_tmp = tf.name
+        try:
+            args = argparse.Namespace(plan=plan_tmp, output=str(out))
+            cmd_render(args)
+        finally:
+            try:
+                Path(plan_tmp).unlink()
+            except OSError:
+                pass
+
+        from aftermovie.ffmpeg_cmd import ffprobe_json
+        info = ffprobe_json(out)
+        return {
+            "output_path": str(out),
+            "duration_s": float(info.get("format", {}).get("duration", 0)),
+            "streams": [
+                {"codec_type": s.get("codec_type"), "codec_name": s.get("codec_name")}
+                for s in info.get("streams", [])
+            ],
+        }
+
+    job_id = jobs.start_job("render_plan", _work)
+    return {"job_id": job_id}
+
+
+@mcp.tool(description="Get the status (and result, when finished) of a job.")
+def get_job(job_id: str) -> dict[str, Any]:
+    return jobs.get_status(job_id)
+
+
+@mcp.tool(description="Request cancellation of a running job. Returns whether the cancel flag was set.")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    return {"cancelled": jobs.cancel(job_id)}
+
+
+# ---- entrypoint -----------------------------------------------------------
+
+def main() -> None:
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,15 +1,15 @@
 ---
 name: aftermovie
-description: Create GoPro-style beat-synced aftermovies on macOS from a folder of mixed footage (GoPro clips, iPhone video, Live Photos, drone footage, etc.) plus a song. Triggers whenever the user wants to make a montage, highlight reel, aftermovie, recap video, travel video, sports edit, or beat-synced video, and whenever they mention assembling clips automatically. Use this skill even if the user does not say the word "aftermovie" — phrases like "make a video from my trip clips", "edit this folder to music", "GoPro-style edit", "highlight my best moments", or "auto-edit these clips" all mean this skill. Runs locally on the user's Mac via ffmpeg + librosa + GPMF telemetry, no cloud.
+description: Create GoPro-style beat-synced aftermovies from a folder of mixed footage (GoPro clips, iPhone video, Live Photos, drone, screen recording) plus a song. Triggers whenever the user wants to make a montage, highlight reel, aftermovie, recap, travel video, sports edit, or beat-synced video, and whenever they mention assembling clips automatically. Use this skill even if the user does not say "aftermovie" — "make a video from my trip clips", "edit this folder to music", "GoPro-style edit", "highlight my best moments", or "auto-edit these clips" all count. Runs locally on the user's machine via ffmpeg + librosa + GPMF telemetry, no cloud. Exposes both an MCP server (preferred when connected) and a CLI fallback.
 ---
 
 # Aftermovie
 
-A skill that turns a folder of video clips and a song into a beat-synced highlight video — the GoPro Quik recipe, running natively on the user's Mac.
+A skill that turns a folder of video clips and a song into a beat-synced highlight video — the GoPro Quik recipe, running natively.
 
 ## When this skill applies
 
-Use this skill whenever the user wants to assemble multiple clips into a single edited video paced to music. The user does not need to use the word "aftermovie." Trigger phrases include:
+Use this skill whenever the user wants to assemble multiple clips into a single edited video paced to music. Trigger phrases:
 
 - "Make me a video from my trip footage"
 - "Edit this folder to <song>"
@@ -17,91 +17,106 @@ Use this skill whenever the user wants to assemble multiple clips into a single 
 - "Auto-cut these clips to the beat"
 - "Highlight reel of <event>"
 
-Do NOT use this skill for single-clip operations (trimming one video, applying a filter to one file, converting formats). Use plain `ffmpeg` for those.
-
-## Quick start
-
-The skill exposes one Python CLI at `scripts/aftermovie.py`. The fastest path is the `auto` subcommand — give it a folder and a song, get back a video.
-
-```bash
-python3 scripts/aftermovie.py auto \
-  --clips ~/Movies/Iceland2026 \
-  --song ~/Music/song.mp3 \
-  --output ~/Movies/iceland_aftermovie.mp4
-```
-
-Behind the scenes this runs three stages: `analyze`, `score`, and `render`. The user can also run them separately if they want to inspect the plan first (see "Inspecting the plan" below).
+Do NOT use this skill for single-clip operations (trimming one video, applying a filter, format conversion). Use plain `ffmpeg` for those.
 
 ## First-run setup
 
-On the first invocation, run `scripts/setup.sh`. It checks for `ffmpeg`, `python3 ≥ 3.10`, and installs the Python deps into a local venv under `.skills-data/aftermovie/venv` so the user's global Python stays clean. The setup script is idempotent — safe to run again.
+If the user hasn't installed yet, point them at:
 
 ```bash
 bash scripts/setup.sh
 ```
 
-If `ffmpeg` is missing, the setup script prints the Homebrew install command and exits. Don't try to install ffmpeg automatically — confirm with the user first.
+The setup script creates a venv at `~/.skills-data/aftermovie/venv`, installs the package with MCP support, registers an entry in `~/.claude/.mcp.json`, and runs `aftermovie doctor`. Idempotent.
 
-## How the pipeline works
+After setup the user must restart Claude Code once for the MCP server to spawn.
 
-The skill follows the editing recipe described in `references/recipe.md` (read that file when the user asks why a specific choice was made, or when tuning the output). The short version:
+## Preferred workflow — MCP
 
-1. **Analyze** — scan every video file in the input folder. For each clip, extract:
-   - For GoPro files: GPMF telemetry (gyro, accel, GPS speed) + HiLight tags from the HMMT atom.
-   - For all clips: scene-cut points (ffmpeg `select` filter), audio RMS energy (voices/cheering proxy), motion magnitude (frame diff), and metadata-declared frame rate (so high-fps clips can be flagged for slow-mo).
-   - Write everything to `catalog.json` with one entry per discovered sub-clip candidate (1-5 seconds each).
+When the MCP server is connected, tools prefixed `mcp__aftermovie__*` are available. Use them for the whole flow. Do NOT fall back to Bash if MCP is available.
 
-2. **Score** — analyze the song with `librosa`: tempo, beat positions, downbeats, structural boundaries (intro/verse/chorus). Score each candidate sub-clip and assign winners to beat positions using a greedy fill, with the first cut on the first downbeat after the intro. Output: `plan.json`.
+1. `mcp__aftermovie__list_themes` — if the user is vague, show the four themes and let them pick.
+2. `mcp__aftermovie__analyze_folder({path})` — returns `{job_id, catalog_id, cached}`. If `job_id` is set, poll `get_job` until `status == "done"`. If `cached` is true, the catalog already exists and you can skip straight to step 3.
+3. `mcp__aftermovie__propose_plan({catalog_id, song_path, theme, target_length_s?, aspect})` — synchronous, returns `{plan_id, summary: {n_cuts, total_length_s, sources_used, bpm}}`. Show the summary to the user.
+4. `mcp__aftermovie__get_plan({plan_id})` — fetch full entries if the user wants to see them.
+5. If the user wants changes, `mcp__aftermovie__tweak_plan({plan_id, ops})` returns a new `plan_id`. Supported ops:
+   - `{op: "exclude_source", source}` — drop all cuts from one source file
+   - `{op: "set", path, value}` — e.g. `path="music_db", value=-12` or `path="aspect", value="9:16"`
+   - `{op: "swap", beat_index, with_candidate_rank}` — replace one cut with the next-highest-scoring alternative
+   - `{op: "pin", beat_index, source, start_s, end_s}` — lock a specific source segment to a beat
+6. `mcp__aftermovie__render_plan({plan_id, output_path})` — returns `{job_id}`. Poll `get_job` until done. Result includes `output_path`, `duration_s`, and `streams`.
 
-3. **Render** — execute the plan via ffmpeg. Each picked sub-clip is trimmed, optionally speed-ramped (high-fps clips get auto-slowed at action peaks), color-graded with a `.cube` LUT, then concatenated. Music goes on top, original clip audio ducked underneath at -18 dB.
+Use `cancel_job` if the user changes their mind during a long render.
 
-## Defaults to lean on
+## CLI fallback
 
-When the user just says "make me a video" without specifying anything else, pick sensible defaults:
-
-- **Output length**: trim to the song length, or cap at 90 seconds, whichever is shorter.
-- **Aspect ratio**: 16:9 unless the user mentions Instagram/TikTok/Reels (then 9:16 vertical).
-- **LUT**: `assets/luts/cinematic.cube` — neutral, slightly cool, lifted blacks. Good default for action footage.
-- **Music volume**: -8 dB. Clip audio ducked to -18 dB. Tweak with `--music-db` and `--clip-db`.
-- **Resolution**: 1080p. Use `--res 4k` for 2160p if the user wants it.
-
-For Live Photos / Motion Photos: these come in as short ~3s videos. The analyzer detects them by duration + frame rate and the scorer treats them as "punctuation" — short freeze-frames between longer clips, not main beats.
-
-## Inspecting the plan before rendering
-
-If the user wants to see what the edit *will* look like before committing to a render (which can take a few minutes for long source folders), split the workflow:
+If the MCP server is not connected, use the CLI via Bash. Same pipeline, slightly more verbose.
 
 ```bash
-python3 scripts/aftermovie.py analyze --clips <folder> --out catalog.json
-python3 scripts/aftermovie.py score --catalog catalog.json --song <track> --out plan.json
-# show plan.json to user, let them tweak
-python3 scripts/aftermovie.py render --plan plan.json --output out.mp4
+~/.skills-data/aftermovie/venv/bin/aftermovie auto \
+  --clips <folder> --song <track> --output <out.mp4> [--theme <name>]
 ```
 
-`plan.json` is human-readable: each entry is `{source, start_ms, end_ms, speed, beat_time, score, reason}`. The `reason` field explains why this clip was picked (e.g. `"hilight_tag"`, `"high_accel_jump"`, `"smile_detected"`, `"motion_peak"`) — useful for explaining to the user why their favorite clip didn't make the cut, or for manual edits.
+Or staged:
 
-## Tuning knobs
+```bash
+aftermovie analyze --clips <folder> --out catalog.json
+aftermovie score   --catalog catalog.json --song <track> --out plan.json
+aftermovie render  --plan plan.json --output out.mp4
+```
 
-The `auto` command takes optional flags:
+## Theme-prompt parsing
 
-- `--theme cinematic|punchy|chill|nostalgic` — preset pacing + LUT bundle (see `references/themes.md`)
-- `--max-length 60` — cap output length in seconds
-- `--aspect 16:9|9:16|1:1` — output aspect ratio
-- `--lut <path>` — override the color LUT
-- `--no-speed-ramp` — disable auto slow-motion on high-fps clips
-- `--seed 42` — for reproducible runs (the greedy scorer has a small randomness budget to avoid identical edits)
+When the user describes a vibe rather than naming a theme, map it:
 
-If the user wants something the flags don't cover (custom transition style, specific clip ordering, locked-in clips), edit `plan.json` directly and re-run the `render` stage — much faster than tweaking flags.
+- "epic" / "hype" / "intense" → `punchy`
+- "cinematic" / "film" / "moody" → `cinematic`
+- "vibe" / "chill" / "aesthetic" / "lofi" → `chill`
+- "throwback" / "memories" / "old school" → `nostalgic`
+- "Instagram" / "TikTok" / "Reels" / "vertical" → `aspect: "9:16"`
+- "YouTube" / "widescreen" → `aspect: "16:9"`
+- "square" → `aspect: "1:1"`
+
+## When to ask vs. assume
+
+Ask up-front ONLY if missing:
+
+- Clip folder path
+- Song path
+
+Everything else has a sensible default. Show the plan summary (n_cuts, total_length_s, bpm, sources_used) before rendering so the user can intervene. Don't ask "should I render now?" — propose, summarize, render.
+
+## Iterating on the plan
+
+If the user pushes back on the proposal — "too many cuts from clip_07.mp4" or "make it shorter" — apply tweak ops and re-render:
+
+```
+tweak_plan({plan_id, ops: [{op: "exclude_source", source: "/Users/.../clip_07.mp4"}]})
+tweak_plan({plan_id, ops: [{op: "set", path: "target_length_s", value: 60}]})
+```
+
+If they want a totally different feel, just call `propose_plan` again with a different theme — it's cheap (the catalog is cached).
+
+## Defaults
+
+- **Length**: song duration, capped at 90s.
+- **Aspect**: 16:9.
+- **Theme**: `cinematic` if not specified.
+- **Resolution**: 1080p. `--res 3840x2160` for 4K.
+- **FPS**: 30.
+
+## Pipeline summary
+
+1. **Analyze** — scan every video file. For GoPro files extract GPMF telemetry (gyro, accel, GPS speed) + HiLight tags from the HMMT atom. For all clips compute per-second motion energy (signalstats YDIF) and audio RMS. Write `catalog.json`.
+2. **Score** — librosa for tempo + beats + downbeats + intro boundary. Score each candidate sub-clip (motion ×1.5, audio ×1.0, accel jump +3, GPS speed peak +2, HiLight +10, repetition penalty). Greedy-fill beat slots starting after the intro. Write `plan.json`.
+3. **Render** — per-cut ffmpeg passes (trim, scale/crop to aspect, optional speed ramp for slow-mo, LUT). Concat. Mix music on top at `music_db`. Write the MP4.
+
+See `references/recipe.md` for the editorial reasoning, `references/themes.md` for theme specs, `references/gpmf.md` for telemetry format.
 
 ## Failure modes to watch for
 
-- **No clips found**: the folder probably has clips in unsupported formats. The analyzer supports `.mp4`, `.mov`, `.m4v`, `.heic` (Live Photos), `.insv`, `.lrv`. Print the formats it found and ignored.
-- **Song shorter than the target output**: the scorer falls back to the song's actual length and ignores `--max-length`. Tell the user.
-- **All clips have very similar motion profiles** (e.g. all locked-off interview shots): the scorer will produce a flat-feeling edit. Suggest the user either mix in B-roll or pick a more varied song.
-- **Mixed frame rates causing judder**: the renderer normalizes everything to 30 fps by default. Override with `--fps 24` or `--fps 60` if the user has a preference.
-
-## Why the skill is structured this way
-
-The `analyze → score → render` split exists because analysis is slow (1-2 minutes per 10 GB of source footage) but the score and render stages are fast (seconds). Caching the catalog means iterating on the look (different song, different theme) doesn't repeat the expensive work.
-
-For the actual editing logic (why we cut on downbeats, why slow-mo lands on action peaks, why the first cut waits for the drop), see `references/recipe.md`. For theme presets, see `references/themes.md`. For the GPMF telemetry format, see `references/gpmf.md`.
+- **No clips found** — analyzer skipped everything. Tell the user which extensions are supported (`.mp4 .mov .m4v .insv .lrv`).
+- **Song shorter than `target_length_s`** — output is clipped to song length; mention this.
+- **MCP server not registered** — run `setup.sh` again, restart Claude Code.
+- **Slow analyze step** — expected. ~5-10s per minute of source. Reuse `catalog_id` for follow-up `propose_plan` calls.
+- **All clips look the same** — flat-feeling edit. Suggest mixing in B-roll or trying a different song.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# aftermovie/scripts/setup.sh — one-time setup, idempotent
-# Installs Python deps into a local venv so the user's global Python stays clean.
+# aftermovie/scripts/setup.sh — one-time setup, idempotent.
+# Installs the `aftermovie` package into a local venv so the user's global
+# Python stays clean.
 
 set -euo pipefail
 
@@ -12,49 +13,55 @@ echo "==> aftermovie setup"
 echo "    Skill:    ${SKILL_DIR}"
 echo "    Data:     ${DATA_DIR}"
 
-# Check ffmpeg
+# ---- ffmpeg ------------------------------------------------------------------
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo ""
-  echo "  ✗ ffmpeg not found. Install it first:"
-  echo "      brew install ffmpeg"
+  echo "  ! ffmpeg not found. Install it first:"
+  echo "      brew install ffmpeg          (macOS)"
+  echo "      apt-get install -y ffmpeg    (Debian/Ubuntu)"
   echo ""
   exit 1
 fi
-FFMPEG_VERSION="$(ffmpeg -version | head -n1)"
-echo "    ffmpeg:   ${FFMPEG_VERSION}"
+echo "    ffmpeg:   $(ffmpeg -version | head -n1)"
 
-# Check Python ≥ 3.10
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "  ✗ python3 not found. Install with: brew install python@3.12"
+# ---- Python (3.10 - 3.12) ----------------------------------------------------
+pick_python() {
+  for cand in python3.12 python3.11 python3.10 python3; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      local v
+      v="$("$cand" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+      case "$v" in
+        3.10|3.11|3.12) echo "$cand"; return 0 ;;
+      esac
+    fi
+  done
+  return 1
+}
+
+PY="$(pick_python || true)"
+if [ -z "${PY}" ]; then
+  echo "  ! Need Python 3.10-3.12. Install with: brew install python@3.12"
   exit 1
 fi
-PY_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-PY_MAJOR="$(python3 -c 'import sys; print(sys.version_info.major)')"
-PY_MINOR="$(python3 -c 'import sys; print(sys.version_info.minor)')"
-if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
-  echo "  ✗ Python ${PY_VERSION} is too old. Need ≥ 3.10. Install with: brew install python@3.12"
-  exit 1
-fi
-echo "    python3:  ${PY_VERSION}"
+echo "    python:   $("${PY}" --version) ($(command -v "${PY}"))"
 
-# Create venv
+# ---- venv --------------------------------------------------------------------
 mkdir -p "${DATA_DIR}"
 if [ ! -d "${VENV}" ]; then
   echo "    Creating venv at ${VENV}..."
-  python3 -m venv "${VENV}"
+  "${PY}" -m venv "${VENV}"
 fi
-
-# Install deps
-echo "    Installing Python dependencies..."
 "${VENV}/bin/pip" install --upgrade pip --quiet
-"${VENV}/bin/pip" install --quiet \
-  "librosa>=0.10" \
-  "numpy>=1.24,<3" \
-  "soundfile>=0.12" \
-  "scipy>=1.10" \
-  "tqdm>=4.65"
 
-# Record the venv path for the CLI to find
+# ---- install package ---------------------------------------------------------
+echo "    Installing aftermovie..."
+"${VENV}/bin/pip" install -e "${SKILL_DIR}" --quiet
+
+# ---- self-check --------------------------------------------------------------
+echo ""
+"${VENV}/bin/aftermovie" doctor
+
+# ---- record paths ------------------------------------------------------------
 cat > "${DATA_DIR}/config.json" <<EOF
 {
   "venv": "${VENV}",
@@ -64,13 +71,10 @@ cat > "${DATA_DIR}/config.json" <<EOF
 EOF
 
 echo ""
-echo "✓ Setup complete."
+echo "Setup complete."
 echo ""
-echo "Quick test:"
-echo "  python3 ${SKILL_DIR}/scripts/aftermovie.py --help"
-echo ""
-echo "Make a video:"
-echo "  python3 ${SKILL_DIR}/scripts/aftermovie.py auto \\"
+echo "Try it:"
+echo "  ${VENV}/bin/aftermovie auto \\"
 echo "    --clips ~/Movies/MyTrip \\"
 echo "    --song ~/Music/song.mp3 \\"
 echo "    --output ~/Movies/aftermovie.mp4"

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aftermovie"
+version = "0.2.0"
+description = "GoPro-style beat-synced aftermovie generator — point at a folder + song, get a polished MP4. Claude Code skill with MCP server."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "djspilot" }]
+keywords = ["video", "ffmpeg", "gopro", "aftermovie", "claude", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "librosa>=0.10",
+    "numpy>=1.24,<3",
+    "soundfile>=0.12",
+    "scipy>=1.10",
+    "tqdm>=4.65",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+faces = ["mediapipe==0.10.18"]
+all = ["mcp>=1.0", "mediapipe==0.10.18"]
+dev = ["pytest>=7", "pytest-timeout>=2"]
+
+[project.scripts]
+aftermovie = "aftermovie.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/djspilot/claude-aftermovie-skill"
+Repository = "https://github.com/djspilot/claude-aftermovie-skill"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aftermovie"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets/luts" = "aftermovie/_assets/luts"
+"assets/fonts" = "aftermovie/_assets/fonts"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120

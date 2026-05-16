@@ -28,5 +28,12 @@ htmlcov/
 
 # Aftermovie runtime artifacts
 plan.json
+catalog.json
 *.mp4
 *.mov
+*.wav
+
+# Test fixtures are checked in
+!tests/fixtures/*.mp4
+!tests/fixtures/*.wav
+!tests/fixtures/*.mov

@@ -22,6 +22,7 @@ from aftermovie.config import (
 )
 from aftermovie.mcp_server import jobs
 from aftermovie.render.pipeline import cmd_render
+from aftermovie.render.transitions import decide_transitions
 from aftermovie.score.scorer import build_plan
 from aftermovie.score.song import analyze_song
 from aftermovie.state import (
@@ -119,6 +120,9 @@ def propose_plan(
     theme: str | None = None,
     target_length_s: float | None = None,
     aspect: str = "16:9",
+    audio_mix: str = "music_only",
+    transitions: str = "cut",
+    titles: list[dict[str, Any]] | None = None,
     seed: int = 0,
 ) -> dict[str, Any]:
     catalog = load_catalog(catalog_id)
@@ -129,6 +133,8 @@ def propose_plan(
     no_speed_ramp = bool(theme_cfg.get("no_speed_ramp", False))
 
     entries = build_plan(catalog, song, target_len=target, no_speed_ramp=no_speed_ramp)
+    if transitions == "auto":
+        decide_transitions(entries, song)
 
     plan_id = plan_id_for(catalog_id, Path(song_path), theme, target, aspect, seed)
     plan = {
@@ -136,7 +142,7 @@ def propose_plan(
         "catalog_id": catalog_id,
         "song": str(Path(song_path).expanduser().resolve()),
         "song_meta": song,
-        "theme": theme,
+        "theme": theme or "cinematic",
         "target_length_s": target,
         "aspect": aspect,
         "resolution": "1920x1080",
@@ -144,6 +150,9 @@ def propose_plan(
         "lut": theme_cfg.get("lut"),
         "music_db": theme_cfg.get("music_db", -8.0),
         "clip_db": -18.0,
+        "audio_mix": audio_mix,
+        "transitions": transitions,
+        "titles": titles or [],
         "entries": entries,
     }
     save_plan(plan_id, plan)
@@ -195,6 +204,14 @@ def tweak_plan(plan_id: str, ops: list[dict[str, Any]]) -> dict[str, Any]:
             new_plan["entries"][idx]["start_s"] = float(op["start_s"])
             new_plan["entries"][idx]["end_s"] = float(op["end_s"])
             diff.append(f"pinned entry[{idx}] to {op['source']}")
+        elif kind == "add_title":
+            new_plan.setdefault("titles", []).append({
+                "kind": op.get("kind", "intro"),
+                "text": op.get("text", ""),
+                "duration_s": float(op.get("duration_s", 2.0)),
+                "at_s": float(op["at_s"]) if "at_s" in op else None,
+            })
+            diff.append(f"added title kind={op.get('kind')} text={op.get('text', '')!r}")
         else:
             raise ValueError(f"unknown op: {kind}")
 

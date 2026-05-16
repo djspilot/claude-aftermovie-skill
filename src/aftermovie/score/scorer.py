@@ -8,6 +8,7 @@ from typing import Any
 
 from aftermovie.config import DEFAULT_TARGET_LEN_S, MIN_CLIP_S
 from aftermovie.ffmpeg_cmd import log
+from aftermovie.render.transitions import decide_transitions
 from aftermovie.score.song import analyze_song
 from aftermovie.types import Candidate
 
@@ -178,7 +179,17 @@ def cmd_score(args: argparse.Namespace) -> None:
     )
 
     entries = build_plan(catalog, song, target_len, args.no_speed_ramp)
+    if getattr(args, "transitions", "cut") == "auto":
+        decide_transitions(entries, song)
     log(f"Built {len(entries)} cuts over {target_len:.1f}s")
+
+    titles: list[dict] = []
+    title_flag = getattr(args, "titles", None)
+    if title_flag:
+        for kind in (k.strip() for k in title_flag.split(",")):
+            if kind in ("intro", "outro"):
+                titles.append({"kind": kind, "text": getattr(args, "title_text", "") or "",
+                               "duration_s": 2.0})
 
     plan = {
         "song": str(Path(args.song).expanduser().resolve()),
@@ -190,6 +201,9 @@ def cmd_score(args: argparse.Namespace) -> None:
         "lut": args.lut,
         "music_db": args.music_db,
         "clip_db": args.clip_db,
+        "audio_mix": getattr(args, "audio_mix", "music_only"),
+        "transitions": getattr(args, "transitions", "cut"),
+        "titles": titles,
         "entries": entries,
     }
     out = Path(args.out).expanduser().resolve()

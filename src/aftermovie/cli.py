@@ -39,6 +39,10 @@ def cmd_auto(args: argparse.Namespace) -> None:
         music_db=args.music_db,
         clip_db=args.clip_db,
         no_speed_ramp=args.no_speed_ramp,
+        audio_mix=getattr(args, "audio_mix", "music_only"),
+        transitions=getattr(args, "transitions", "cut"),
+        titles=getattr(args, "titles", None),
+        title_text=getattr(args, "title_text", None),
     )
     cmd_score(s)
 
@@ -57,6 +61,15 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--music-db", type=float, default=DEFAULT_MUSIC_DB)
     p.add_argument("--clip-db", type=float, default=DEFAULT_CLIP_DB)
     p.add_argument("--no-speed-ramp", action="store_true")
+    p.add_argument("--audio-mix", default="music_only",
+                   choices=["music_only", "ducked", "clip_only"],
+                   help="How to mix audio: music only, music+clip ducked, or clip only.")
+    p.add_argument("--transitions", default="cut", choices=["cut", "auto"],
+                   help="cut = hard cuts only; auto = let the scorer pick crossfade/whip.")
+    p.add_argument("--titles", default=None,
+                   help="Comma-separated list of title kinds (intro,outro).")
+    p.add_argument("--title-text", default=None,
+                   help="Title text applied to intro/outro cards.")
 
 
 def build_parser() -> argparse.ArgumentParser:

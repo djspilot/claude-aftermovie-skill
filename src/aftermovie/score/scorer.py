@@ -66,6 +66,12 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
             reasons.append("hilight_tag")
             break
 
+    faces = clip.get("face_bboxes") or []
+    in_window = [f for f in faces[start:end] if f]
+    if in_window:
+        score += 0.5
+        reasons.append("face_present")
+
     return score, reasons
 
 
@@ -110,6 +116,8 @@ def build_candidates(catalog: dict[str, Any]) -> list[Candidate]:
 def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                target_len: float, no_speed_ramp: bool) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure."""
+    # Map source path → original clip dict so we can attach face data + dims.
+    by_source = {c["path"]: c for c in catalog["clips"]}
     candidates = build_candidates(catalog)
 
     cut_points = [b for b in song["beats"] if b >= song["intro_end_s"]]
@@ -154,6 +162,10 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
         src_time_needed = gap * speed
         actual_end = min(pick.end_s, pick.start_s + src_time_needed)
 
+        src_clip = by_source.get(pick.source, {})
+        start_i = int(pick.start_s)
+        end_i = max(start_i + 1, int(actual_end + 0.999))
+        src_faces = src_clip.get("face_bboxes") or []
         plan_entries.append({
             "source": pick.source,
             "start_s": pick.start_s,
@@ -163,6 +175,9 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "beat_time_s": beat_t,
             "score": pick.score,
             "reasons": pick.reasons,
+            "source_width": int(src_clip.get("width", 1920)),
+            "source_height": int(src_clip.get("height", 1080)),
+            "face_bboxes": src_faces[start_i:end_i] if src_faces else [],
         })
     return plan_entries
 
@@ -204,6 +219,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         "audio_mix": getattr(args, "audio_mix", "music_only"),
         "transitions": getattr(args, "transitions", "cut"),
         "titles": titles,
+        "reframe": not getattr(args, "no_reframe", False),
         "entries": entries,
     }
     out = Path(args.out).expanduser().resolve()

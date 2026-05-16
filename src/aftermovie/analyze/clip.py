@@ -9,6 +9,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from aftermovie.analyze.audio import measure_audio_energy
+from aftermovie.analyze.faces import available as faces_available
+from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
 from aftermovie.config import VIDEO_EXTS
 from aftermovie.ffmpeg_cmd import ffprobe_json, log
@@ -53,6 +55,9 @@ def analyze_clip(path: Path) -> ClipInfo | None:
 
     motion_energy = measure_motion_energy(path, duration)
     audio_energy = measure_audio_energy(path, duration)
+    face_bboxes: list[dict | None] = (
+        detect_per_second(path, duration) if faces_available() else []
+    )
 
     def per_second(arr: list[float], target_len: int) -> list[float]:
         if not arr or target_len == 0:
@@ -78,6 +83,7 @@ def analyze_clip(path: Path) -> ClipInfo | None:
         accl_peaks=per_second(motion["accl_mag"], n_sec),
         gps_speed=per_second(motion["gps_speed"], n_sec),
         is_short_form=is_short_form,
+        face_bboxes=face_bboxes,
     )
 
 

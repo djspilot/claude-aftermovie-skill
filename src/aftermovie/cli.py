@@ -43,6 +43,7 @@ def cmd_auto(args: argparse.Namespace) -> None:
         transitions=getattr(args, "transitions", "cut"),
         titles=getattr(args, "titles", None),
         title_text=getattr(args, "title_text", None),
+        no_reframe=getattr(args, "no_reframe", False),
     )
     cmd_score(s)
 
@@ -70,6 +71,8 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
                    help="Comma-separated list of title kinds (intro,outro).")
     p.add_argument("--title-text", default=None,
                    help="Title text applied to intro/outro cards.")
+    p.add_argument("--no-reframe", action="store_true",
+                   help="Disable face-aware reframing on 9:16 output.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,6 +141,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             print(f"  {label:24s} OK")
         except ImportError:
             print(f"  {label:24s} not installed")
+
+    from aftermovie.analyze.faces import available as faces_available
+    print(f"  faces feature:           {'OK' if faces_available() else 'unavailable (mediapipe or model missing)'}")
 
     lut_d = lut_dir()
     luts = list(lut_d.glob("*.cube")) if lut_d.is_dir() else []

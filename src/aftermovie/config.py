@@ -64,6 +64,13 @@ def fonts_dir() -> Path:
     return package_dir() / "_assets" / "fonts"
 
 
+def models_dir() -> Path:
+    src = skill_dir() / "assets" / "models"
+    if src.is_dir():
+        return src
+    return package_dir() / "_assets" / "models"
+
+
 def data_dir() -> Path:
     return Path.home() / ".skills-data" / "aftermovie"
 

@@ -123,6 +123,7 @@ def propose_plan(
     audio_mix: str = "music_only",
     transitions: str = "cut",
     titles: list[dict[str, Any]] | None = None,
+    reframe: bool = True,
     seed: int = 0,
 ) -> dict[str, Any]:
     catalog = load_catalog(catalog_id)
@@ -153,6 +154,7 @@ def propose_plan(
         "audio_mix": audio_mix,
         "transitions": transitions,
         "titles": titles or [],
+        "reframe": reframe,
         "entries": entries,
     }
     save_plan(plan_id, plan)

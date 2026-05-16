@@ -113,6 +113,10 @@ If they want a totally different feel, just call `propose_plan` again with a dif
 
 See `references/recipe.md` for the editorial reasoning, `references/themes.md` for theme specs, `references/gpmf.md` for telemetry format.
 
+## Vertical output (TikTok / Reels / Shorts)
+
+When the user mentions Instagram, TikTok, Reels, or vertical, set `aspect: "9:16"` in `propose_plan`. If face detection is available (mediapipe installed + model present — `aftermovie doctor` reports it), the renderer auto-reframes each cut to keep faces centered as they move. Pass `reframe: false` to fall back to center-crop.
+
 ## Failure modes to watch for
 
 - **No clips found** — analyzer skipped everything. Tell the user which extensions are supported (`.mp4 .mov .m4v .insv .lrv`).
@@ -120,3 +124,4 @@ See `references/recipe.md` for the editorial reasoning, `references/themes.md` f
 - **MCP server not registered** — run `setup.sh` again, restart Claude Code.
 - **Slow analyze step** — expected. ~5-10s per minute of source. Reuse `catalog_id` for follow-up `propose_plan` calls.
 - **All clips look the same** — flat-feeling edit. Suggest mixing in B-roll or trying a different song.
+- **Mediapipe unavailable** — face detection / 9:16 reframing degrade to centered crop. Run `aftermovie doctor` to confirm. The skill still works; just no smart reframing.

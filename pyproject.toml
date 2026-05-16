@@ -51,6 +51,7 @@ packages = ["src/aftermovie"]
 [tool.hatch.build.targets.wheel.force-include]
 "assets/luts" = "aftermovie/_assets/luts"
 "assets/fonts" = "aftermovie/_assets/fonts"
+"assets/models" = "aftermovie/_assets/models"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

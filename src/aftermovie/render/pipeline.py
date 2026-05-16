@@ -20,6 +20,7 @@ from aftermovie.ffmpeg_cmd import log, run
 from aftermovie.render.audio_mix import filtergraph as audio_filtergraph
 from aftermovie.render.audio_mix import needs_clip_audio
 from aftermovie.render.filters import aspect_filter
+from aftermovie.render.reframe import crop_x_expr_for_entry
 from aftermovie.render.titles import (
     build_overlay_chain,
     render_title_png,
@@ -41,11 +42,33 @@ def _aspect_dims(aspect: str, target_res: str) -> tuple[int, int]:
 
 def _prerender_clip(entry: dict, out_clip: Path, *,
                     aspect: str, target_res: str, target_fps: int,
-                    lut: Path | None, keep_audio: bool) -> bool:
+                    lut: Path | None, keep_audio: bool,
+                    enable_reframe: bool = True) -> bool:
     src = Path(entry["source"])
     duration = entry["end_s"] - entry["start_s"]
     speed = entry.get("speed", 1.0)
-    vfilter = [aspect_filter(aspect, target_res)]
+
+    target_w, target_h = _aspect_dims(aspect, target_res)
+    vfilter: list[str] = []
+
+    reframe_filter = None
+    if (enable_reframe and aspect == "9:16"
+            and entry.get("face_bboxes")
+            and entry.get("source_width") and entry.get("source_height")):
+        reframe_filter = crop_x_expr_for_entry(
+            entry,
+            int(entry["source_width"]),
+            int(entry["source_height"]),
+            target_w, target_h,
+        )
+
+    if reframe_filter:
+        # crop → scale to target res (the crop already enforces the aspect ratio).
+        vfilter.append(reframe_filter)
+        vfilter.append(f"scale={target_w}:{target_h}")
+    else:
+        vfilter.append(aspect_filter(aspect, target_res))
+
     if speed != 1.0:
         vfilter.append(f"setpts={1.0/speed:.4f}*PTS")
     if lut:
@@ -92,6 +115,7 @@ def cmd_render(args: argparse.Namespace) -> None:
     titles = plan.get("titles", [])
     theme = plan.get("theme", "cinematic")
     entries = plan["entries"]
+    enable_reframe = bool(plan.get("reframe", True))
 
     transitions_active = has_non_cut(entries)
     keep_audio = needs_clip_audio(audio_mix)
@@ -114,6 +138,7 @@ def cmd_render(args: argparse.Namespace) -> None:
                 entry, out_clip,
                 aspect=aspect, target_res=target_res, target_fps=target_fps,
                 lut=lut, keep_audio=keep_audio,
+                enable_reframe=enable_reframe,
             )
             if not ok:
                 continue

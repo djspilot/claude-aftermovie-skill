@@ -55,7 +55,11 @@ fi
 
 # ---- install package ---------------------------------------------------------
 echo "    Installing aftermovie..."
-"${VENV}/bin/pip" install -e "${SKILL_DIR}[mcp]" --quiet
+"${VENV}/bin/pip" install -e "${SKILL_DIR}[all]" --quiet 2>&1 | tail -3 || {
+  echo "    ! mediapipe install failed — face detection / 9:16 reframing will be disabled."
+  echo "    Falling back to install without [faces] extras..."
+  "${VENV}/bin/pip" install -e "${SKILL_DIR}[mcp]" --quiet
+}
 
 # ---- MCP registration --------------------------------------------------------
 # Write a stanza into ~/.claude/.mcp.json so Claude Code auto-spawns the server.

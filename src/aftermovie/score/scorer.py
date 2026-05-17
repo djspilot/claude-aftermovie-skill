@@ -341,6 +341,19 @@ def cmd_score(args: argparse.Namespace) -> None:
         decide_transitions(entries, song, mode=tmode)
     log(f"Built {len(entries)} cuts over {target_len:.1f}s")
 
+    # Heuristic: pace=auto produces beat anchors based on tempo + energy.
+    # If the planner emitted noticeably fewer cuts than the target window's
+    # beat density, we ran out of unique sources under the current
+    # source_cap — tell the user so they can raise it or add clips.
+    expected_cuts_per_s = float(song.get("tempo_bpm", 100)) / 60 / 3
+    expected_cuts = int(target_len * expected_cuts_per_s)
+    cap = int(getattr(args, "source_cap", 1) or 1)
+    if len(entries) < expected_cuts * 0.8 and cap < 4:
+        unique = len({e["source"] for e in entries})
+        log(f"  ! only {len(entries)} cuts fit (wanted ~{expected_cuts}) — "
+            f"{unique} unique sources at source_cap={cap}. "
+            f"Add more clips or raise --source-cap (e.g. {cap+1}).")
+
     titles: list[dict] = []
     title_flag = getattr(args, "titles", None)
     if title_flag:

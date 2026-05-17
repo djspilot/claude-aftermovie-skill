@@ -8,18 +8,30 @@ of the pipeline can use:
   * Live Photos exported as paired files (e.g. `IMG_0488.HEIC` + `IMG_0488.MOV`)
     are detected by shared stem; the still is dropped because the MOV already
     carries the motion.
-  * Live Photos exported as a single file with the video track *embedded* in
-    the HEIC: ffmpeg can read the first frame but the embedded MOV isn't
-    extractable without exiftool; for now those degrade to stills.
+  * Single-file Live Photos (HEIC with the MOV in a metadata box) currently
+    degrade to the still frame — extracting the embedded MOV needs exiftool.
+
+HEIC support: homebrew's stock ffmpeg can't demux HEIC as a loopable image
+(no libheif), so we always pre-decode images via PIL (with pillow-heif
+registered) into a temp PNG, then feed THAT to ffmpeg.
 """
 from __future__ import annotations
 
 import hashlib
 import subprocess
+import tempfile
 from pathlib import Path
 
 from aftermovie.config import data_dir
 from aftermovie.ffmpeg_cmd import log, run
+
+# Register HEIC/AVIF support on PIL as a side-effect import (no-op if missing).
+try:
+    import pillow_heif  # type: ignore[import-not-found]
+    pillow_heif.register_heif_opener()
+    _PIL_HEIC_AVAILABLE = True
+except ImportError:
+    _PIL_HEIC_AVAILABLE = False
 
 STILL_EXTS = {
     ".heic", ".heif", ".jpg", ".jpeg", ".png",
@@ -27,6 +39,10 @@ STILL_EXTS = {
 }
 LIVE_PHOTO_VIDEO_EXTS = {".mov", ".MOV"}
 DEFAULT_STILL_DURATION_S = 2.5
+
+# Filenames at the source-folder root that look like prior aftermovie outputs.
+# Matched as case-insensitive substring against the file name.
+OUTPUT_NAME_HINTS = ("aftermovie", "_aftermovie", "highlight_reel", "recap")
 
 
 def _stills_cache_dir() -> Path:
@@ -66,18 +82,50 @@ def find_stills_excluding_live_pairs(folder: Path) -> list[Path]:
     return sorted(out)
 
 
+def _decode_to_png(src: Path) -> Path | None:
+    """Decode any PIL-readable image (HEIC/JPG/PNG/etc.) to a temp PNG.
+
+    Returns None if PIL can't open it (most commonly: HEIC without
+    pillow-heif). The caller is responsible for unlinking the returned path.
+    """
+    from PIL import Image
+
+    try:
+        with Image.open(src) as img:
+            img = img.convert("RGB")
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            img.save(tmp.name, format="PNG")
+            return Path(tmp.name)
+    except (OSError, ValueError) as e:
+        if src.suffix.lower() in (".heic", ".heif") and not _PIL_HEIC_AVAILABLE:
+            log(f"  ! cannot decode {src.name} — install pillow-heif "
+                f"(pip install pillow-heif)")
+        else:
+            log(f"  ! cannot decode {src.name}: {e}")
+        return None
+
+
 def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
                       target_res: str = "1920x1080",
                       force: bool = False) -> Path | None:
     """Render a still to a cached mp4 with a subtle Ken Burns zoom.
 
-    Returns the cached path, or None if ffmpeg can't read the source.
+    Returns the cached path, or None if the image can't be decoded.
+
+    Strategy: always pre-decode via PIL → temp PNG, then ffmpeg from the PNG.
+    This works for any PIL-readable format (HEIC via pillow-heif), and dodges
+    homebrew ffmpeg's lack of libheif.
     """
     cache_dir = _stills_cache_dir()
     key = _cache_key(path, duration_s, target_res)
     out = cache_dir / f"{key}.mp4"
     if out.is_file() and not force:
         return out
+
+    png_path = _decode_to_png(path)
+    if png_path is None:
+        return None
 
     w, h = (int(x) for x in target_res.split("x"))
     fps = 30
@@ -90,7 +138,7 @@ def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
     )
     cmd = [
         "ffmpeg", "-y", "-v", "error",
-        "-loop", "1", "-i", str(path),
+        "-loop", "1", "-i", str(png_path),
         "-t", f"{duration_s:.3f}",
         "-vf", vf,
         "-an",
@@ -102,10 +150,23 @@ def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
         run(cmd, check=True)
         return out
     except subprocess.CalledProcessError:
-        log(f"  ! could not materialize still {path.name}")
+        log(f"  ! ffmpeg failed on materialized PNG for {path.name}")
         if out.is_file():
             try:
                 out.unlink()
             except OSError:
                 pass
         return None
+    finally:
+        try:
+            png_path.unlink()
+        except OSError:
+            pass
+
+
+def _is_excluded_output(path: Path) -> bool:
+    """Heuristic: filter out our own previous renders that landed in the source folder."""
+    name = path.name.lower()
+    if path.suffix.lower() not in (".mp4", ".mov"):
+        return False
+    return any(hint in name for hint in OUTPUT_NAME_HINTS)

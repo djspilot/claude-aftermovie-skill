@@ -86,6 +86,16 @@ Ask up-front ONLY if missing:
 
 Everything else has a sensible default. Show the plan summary (n_cuts, total_length_s, bpm, sources_used) before rendering so the user can intervene. Don't ask "should I render now?" — propose, summarize, render.
 
+## Output length
+
+The full song does NOT have to be used. Default is `min(song_duration, 90s)` — pass `target_length_s` (MCP) or `--length`/`--max-length` (CLI) to cap shorter. Typical good lengths:
+
+- 30-45s — Instagram/Reels post
+- 60-90s — TikTok / YouTube Short
+- 2-3 min — travel/event highlight reel
+
+If the user gives no length cue, propose 60s and ask "longer or shorter?" only after they see the first plan. If candidates run out before the target length, the plan just gets shorter — that's fine, no need to retry; tell the user the count.
+
 ## Stills + Live Photos
 
 iPhone photo dumps mix video clips, Live Photos, and still HEIC/JPG. The analyzer handles all three:

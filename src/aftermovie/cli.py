@@ -59,7 +59,10 @@ def cmd_auto(args: argparse.Namespace) -> None:
 
 
 def _add_score_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--max-length", type=float, default=None)
+    p.add_argument("--max-length", "--length", dest="max_length", type=float, default=None,
+                   help="Target output length in seconds (default: min(song, 90)). "
+                        "Pass an explicit value to cap shorter — the full song does NOT have "
+                        "to be used.")
     p.add_argument("--aspect", default="16:9", choices=["16:9", "9:16", "1:1"])
     p.add_argument("--res", default=DEFAULT_RES)
     p.add_argument("--fps", type=int, default=DEFAULT_FPS)

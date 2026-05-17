@@ -71,3 +71,43 @@ def test_materialize_is_cached(tmp_path: Path):
     first = materialize_still(src, duration_s=1.0, target_res="320x180")
     second = materialize_still(src, duration_s=1.0, target_res="320x180")
     assert first == second
+
+
+def test_materialize_heic_via_pillow_heif(tmp_path: Path):
+    """HEIC support is supplied by pillow-heif so we don't depend on ffmpeg's libheif."""
+    pytest.importorskip("pillow_heif")
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+
+    src = tmp_path / "photo.heic"
+    img = Image.new("RGB", (320, 240), (100, 160, 220))
+    img.save(src, format="HEIF")
+
+    out = materialize_still(src, duration_s=1.0, target_res="320x180")
+    assert out is not None and out.is_file()
+    from aftermovie.ffmpeg_cmd import ffprobe_json
+    info = ffprobe_json(out)
+    assert float(info["format"]["duration"]) > 0.5
+
+
+def test_discover_sources_skips_prior_aftermovie_output(tmp_path: Path):
+    """The previously rendered aftermovie.mp4 in the source folder must not be re-ingested."""
+    import subprocess
+    # Real video clip (so VIDEO_EXTS would otherwise match it).
+    subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24:duration=1",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        str(tmp_path / "aftermovie.mp4"),
+    ], check=True)
+    subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24:duration=1",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        str(tmp_path / "IMG_0001.MOV"),
+    ], check=True)
+
+    from aftermovie.analyze.clip import discover_sources
+    sources = discover_sources(tmp_path, include_stills=False)
+    names = {p.name for p in sources}
+    assert names == {"IMG_0001.MOV"}, f"output mp4 leaked into sources: {names}"

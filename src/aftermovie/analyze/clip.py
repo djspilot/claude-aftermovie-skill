@@ -14,6 +14,7 @@ from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
 from aftermovie.analyze.stills import (
     DEFAULT_STILL_DURATION_S,
+    _is_excluded_output,
     find_stills_excluding_live_pairs,
     materialize_still,
 )
@@ -105,7 +106,10 @@ def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURAT
     """
     videos = sorted(
         p for p in folder.rglob("*")
-        if p.is_file() and p.suffix in VIDEO_EXTS and not p.name.startswith(".")
+        if (p.is_file()
+            and p.suffix in VIDEO_EXTS
+            and not p.name.startswith(".")
+            and not _is_excluded_output(p))
     )
     sources: list[Path] = list(videos)
     if include_stills:

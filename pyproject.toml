@@ -29,6 +29,7 @@ dependencies = [
     "scipy>=1.10",
     "tqdm>=4.65",
     "pillow>=10",
+    "pillow-heif>=0.16",
 ]
 
 [project.optional-dependencies]

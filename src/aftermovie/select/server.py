@@ -45,7 +45,7 @@ from aftermovie.analyze.stills import (
     _is_excluded_output,
     _under_skipped_dir,
 )
-from aftermovie.config import VIDEO_EXTS
+from aftermovie.config import THEMES, VIDEO_EXTS, list_luts
 from aftermovie.select.thumbnails import _cache_key as thumb_cache_key
 from aftermovie.select.thumbnails import _thumbs_cache_dir, thumb_path_for
 
@@ -283,6 +283,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -308,6 +309,9 @@ class _Handler(BaseHTTPRequestHandler):
             if route == "/api/sources":
                 self._serve_sources()
                 return
+            if route == "/api/options":
+                self._serve_options()
+                return
             m = re.match(r"^/thumbs/([A-Fa-f0-9]+)\.jpg$", route)
             if m:
                 self._serve_thumb(m.group(1))
@@ -316,6 +320,19 @@ class _Handler(BaseHTTPRequestHandler):
             if m:
                 self._serve_status(m.group(1))
                 return
+            # Static sibling files (app.js, style.css, any future assets).
+            # Restricted to `static_dir` so we can't escape via ../ traversal.
+            if self.static_dir is not None and "/" not in route.lstrip("/")[1:]:
+                name = route.lstrip("/")
+                if name and "/" not in name and name not in (".", ".."):
+                    candidate = (self.static_dir / name).resolve()
+                    try:
+                        candidate.relative_to(self.static_dir.resolve())
+                    except ValueError:
+                        candidate = None
+                    if candidate and candidate.is_file():
+                        self._serve_static(candidate)
+                        return
             self._send_json({"error": "not_found", "path": route}, status=404)
         except Exception as e:
             self._send_json({"error": "server_error", "detail": str(e)}, status=500)
@@ -355,6 +372,17 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self._send_bytes(body, "text/html; charset=utf-8")
 
+    def _serve_static(self, path: Path) -> None:
+        import mimetypes
+
+        try:
+            body = path.read_bytes()
+        except OSError:
+            self._send_json({"error": "not_found", "path": str(path)}, status=404)
+            return
+        content_type, _ = mimetypes.guess_type(path.name)
+        self._send_bytes(body, content_type or "application/octet-stream")
+
     def _serve_sources(self) -> None:
         rows = _list_sources(self.clips_root)
         payload = [{
@@ -367,6 +395,20 @@ class _Handler(BaseHTTPRequestHandler):
             "size_bytes": r.size_bytes,
         } for r in rows]
         self._send_json(payload)
+
+    def _serve_options(self) -> None:
+        self._send_json({
+            "luts": list_luts(),
+            "themes": [
+                {"name": name, **meta}
+                for name, meta in sorted(THEMES.items())
+            ],
+            "audio_mix": ["ducked", "music_only", "clip_only"],
+            "pace": ["auto", "slow", "medium", "fast"],
+            "transitions": ["soft", "auto", "cut"],
+            "aspect": ["16:9", "9:16", "1:1"],
+            "resolution": ["1920x1080", "1080x1920", "1080x1080", "1280x720"],
+        })
 
     def _serve_thumb(self, key: str) -> None:
         # Look up the SourceRow whose key matches; this also ensures the
@@ -441,7 +483,7 @@ class _Handler(BaseHTTPRequestHandler):
             "max_length", "pace", "aspect", "res", "fps", "music_db", "clip_db",
             "audio_mix", "transitions", "no_speed_ramp", "no_reframe", "lut",
             "theme", "source_cap", "chronological", "preview", "no_stills",
-            "still_duration", "titles", "title_text",
+            "still_duration", "titles", "title_text", "burst_window_s",
         }
         overrides: dict[str, Any] = {}
         for k in ALLOWED_OVERRIDES:

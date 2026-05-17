@@ -54,6 +54,7 @@ class AutoOpts:
     title_text: str | None = None
     source_cap: int = 1
     chronological: bool = True
+    burst_window_s: float = 3.0
     preview: bool = False
     reveal: bool = True
 
@@ -175,6 +176,7 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
         no_reframe=opts.no_reframe,
         source_cap=opts.source_cap,
         chronological=opts.chronological,
+        burst_window_s=opts.burst_window_s,
     )
     cmd_score(s)
 

@@ -8,9 +8,11 @@
   let sources = [];
   /** @type {Set<string>} */
   const excluded = new Set();
+  const themes = new Map();
   let saveTimer = null;
   let pollTimer = null;
   let currentJobId = null;
+  let pollFailures = 0;
 
   const $ = (sel) => document.querySelector(sel);
 
@@ -20,6 +22,15 @@
     counter: $("#counter"),
     length: $("#length"),
     pace: $("#pace"),
+    lut: $("#lut"),
+    theme: $("#theme"),
+    transitions: $("#transitions"),
+    audioMix: $("#audio-mix"),
+    aspect: $("#aspect"),
+    sourceCap: $("#source-cap"),
+    speedRamp: $("#speed-ramp"),
+    reframe: $("#reframe"),
+    keepBursts: $("#keep-bursts"),
     selectAll: $("#select-all"),
     deselectAll: $("#deselect-all"),
     render: $("#render"),
@@ -59,6 +70,39 @@
     } catch (err) {
       setStatus(`Failed to load sources: ${err.message}`, false, true);
     }
+  }
+
+  async function loadOptions() {
+    try {
+      const opts = await fetch("/api/options").then((r) => {
+        if (!r.ok) throw new Error(`GET /api/options -> ${r.status}`);
+        return r.json();
+      });
+      fillSelect(els.lut, [
+        { value: "", label: "default" },
+        ...(opts.luts || []).map((l) => ({ value: l.name, label: l.name })),
+      ]);
+      themes.clear();
+      for (const t of opts.themes || []) themes.set(t.name, t);
+      fillSelect(els.theme, [
+        { value: "", label: "custom" },
+        ...(opts.themes || []).map((t) => ({ value: t.name, label: t.name })),
+      ]);
+    } catch (err) {
+      console.warn("Failed to load render options:", err);
+    }
+  }
+
+  function fillSelect(select, items) {
+    const current = select.value;
+    select.replaceChildren();
+    for (const item of items) {
+      const opt = document.createElement("option");
+      opt.value = item.value;
+      opt.textContent = item.label;
+      select.appendChild(opt);
+    }
+    if (items.some((item) => item.value === current)) select.value = current;
   }
 
   function setStatus(text, hide = false, error = false) {
@@ -154,18 +198,28 @@
 
   // -------- Render flow --------
   async function startRender() {
-    const body = {
+    const body = compactPayload({
       excluded: [...excluded],
       max_length: clampInt(els.length.value, 10, 600, 90),
       pace: els.pace.value || "auto",
-    };
+      lut: els.lut.value || null,
+      theme: els.theme.value || null,
+      transitions: els.transitions.value || null,
+      audio_mix: els.audioMix.value || null,
+      aspect: els.aspect.value || null,
+      source_cap: clampInt(els.sourceCap.value, 1, 5, 1),
+      no_speed_ramp: !els.speedRamp.checked,
+      no_reframe: !els.reframe.checked,
+      burst_window_s: els.keepBursts.checked ? 0 : 3,
+    });
     openModal();
     setModalState("starting…");
-    appendLog(`POST /api/render  excluded=${body.excluded.length}  max_length=${body.max_length}s  pace=${body.pace}`);
+    appendLog(renderSummary(body));
     els.render.disabled = true;
     try {
       const { job_id } = await api("POST", "/api/render", body);
       currentJobId = job_id;
+      pollFailures = 0;
       appendLog(`job_id = ${job_id}`);
       pollStatus();
     } catch (err) {
@@ -180,10 +234,46 @@
     return Math.max(min, Math.min(max, n));
   }
 
+  function compactPayload(body) {
+    return Object.fromEntries(Object.entries(body).filter(([, value]) => value !== null && value !== ""));
+  }
+
+  function renderSummary(body) {
+    const bits = [
+      `excluded=${body.excluded.length}`,
+      `length=${body.max_length}s`,
+      `pace=${body.pace}`,
+      `lut=${body.lut || "default"}`,
+      `theme=${body.theme || "custom"}`,
+      `transitions=${body.transitions}`,
+      `audio=${body.audio_mix}`,
+      `aspect=${body.aspect}`,
+      `reuse=${body.source_cap}`,
+      `nearby=${body.burst_window_s === 0 ? "keep" : "filter"}`,
+    ];
+    if (body.no_speed_ramp) bits.push("no_speed_ramp");
+    if (body.no_reframe) bits.push("no_reframe");
+    return `POST /api/render  ${bits.join("  ")}`;
+  }
+
+  function applyTheme() {
+    const theme = themes.get(els.theme.value);
+    if (!theme) return;
+    if (theme.lut) els.lut.value = theme.lut;
+    if (theme.pace) els.pace.value = theme.pace;
+    if (theme.transitions) els.transitions.value = theme.transitions;
+    if (theme.audio_mix) els.audioMix.value = theme.audio_mix;
+    els.speedRamp.checked = theme.no_speed_ramp !== true;
+  }
+
   async function pollStatus() {
     if (!currentJobId) return;
     try {
-      const s = await fetch(`/api/status/${encodeURIComponent(currentJobId)}`).then((r) => r.json());
+      const s = await fetch(`/api/status/${encodeURIComponent(currentJobId)}`).then((r) => {
+        if (!r.ok) throw new Error(`GET /api/status -> ${r.status}`);
+        return r.json();
+      });
+      pollFailures = 0;
       setModalState(s.state, s.state === "done" ? "done" : s.state === "error" ? "error" : "");
       if (s.log_tail) replaceLog(s.log_tail);
       if (s.state === "done") {
@@ -197,8 +287,18 @@
       }
       pollTimer = setTimeout(pollStatus, 1500);
     } catch (err) {
-      appendLog(`status poll failed: ${err.message}`);
-      pollTimer = setTimeout(pollStatus, 1500);
+      pollFailures += 1;
+      if (pollFailures === 1 || pollFailures % 5 === 0) {
+        appendLog(`status poll failed (${pollFailures}): ${err.message}`);
+      }
+      setModalState(`server disconnected; retrying (${pollFailures})`, "error");
+      if (pollFailures >= 10) {
+        appendLog("status polling stopped. Reopen the current GUI URL and start the render again.");
+        els.render.disabled = false;
+        currentJobId = null;
+        return;
+      }
+      pollTimer = setTimeout(pollStatus, 2500);
     }
   }
 
@@ -250,6 +350,7 @@
   els.selectAll.addEventListener("click", selectAll);
   els.deselectAll.addEventListener("click", deselectAll);
   els.render.addEventListener("click", startRender);
+  els.theme.addEventListener("change", applyTheme);
   els.modalClose.addEventListener("click", closeModal);
   els.copyPath.addEventListener("click", copyPath);
   els.modal.addEventListener("click", (e) => { if (e.target === els.modal) closeModal(); });
@@ -257,5 +358,6 @@
     if (e.key === "Escape" && !els.modal.classList.contains("hidden")) closeModal();
   });
 
+  loadOptions();
   loadSources();
 })();

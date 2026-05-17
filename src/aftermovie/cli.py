@@ -150,6 +150,10 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
                    action="store_const", const=False, default=None,
                    help="Don't re-order picks by EXIF/creation time. "
                         "Env: AFTERMOVIE_CHRONOLOGICAL.")
+    p.add_argument("--burst-window-s", dest="burst_window_s", type=float,
+                   default=None,
+                   help="Seconds used to collapse near-duplicate burst shots. "
+                        "0 disables burst suppression.")
 
 
 def build_parser() -> argparse.ArgumentParser:

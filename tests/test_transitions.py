@@ -6,6 +6,7 @@ from aftermovie.render.transitions import (
     decide_transitions,
     has_non_cut,
 )
+from aftermovie.render.pipeline import _compensated_render_entry
 
 
 def _e(score: float = 1.0) -> dict:
@@ -62,3 +63,22 @@ def test_xfade_graph_splits_on_crossfade():
     assert "concat=n=2:v=1:a=0" in graph  # first segment is 2 clips
     # Last segment is 2 clips (indices 2 and 3) — also a concat.
     assert graph.count("concat=") == 2
+
+
+def test_transition_prerender_duration_compensates_for_overlap():
+    entry = {
+        "source": "/clip.mp4",
+        "start_s": 0.0,
+        "end_s": 2.0,
+        "out_duration_s": 2.0,
+        "transition_in": {"kind": "crossfade", "duration_s": 0.45},
+    }
+
+    render_entry, planned, prerender = _compensated_render_entry(
+        entry, transitions_active=True, is_first=False,
+    )
+
+    assert planned == 2.0
+    assert prerender == 2.45
+    assert render_entry["out_duration_s"] == 2.45
+    assert entry["out_duration_s"] == 2.0

@@ -186,6 +186,29 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         return False
 
 
+def _compensated_render_entry(entry: dict, *, transitions_active: bool,
+                              is_first: bool) -> tuple[dict, float, float]:
+    """Return (render_entry, planned_duration, prerender_duration).
+
+    xfade/acrossfade overlaps the incoming clip by `transition_in.duration_s`.
+    To preserve the planner's visible timeline length, the incoming clip must
+    be prerendered longer by exactly that overlap.
+    """
+    planned_duration = float(entry.get(
+        "out_duration_s",
+        (entry["end_s"] - entry["start_s"]) / entry.get("speed", 1.0),
+    ))
+    render_duration = planned_duration
+    if transitions_active and not is_first:
+        transition = entry.get("transition_in") or {}
+        if (transition.get("kind") or "cut") != "cut":
+            render_duration += float(transition.get("duration_s") or 0.0)
+
+    render_entry = dict(entry)
+    render_entry["out_duration_s"] = render_duration
+    return render_entry, planned_duration, render_duration
+
+
 def cmd_render(args: argparse.Namespace) -> None:
     plan = json.loads(Path(args.plan).expanduser().read_text())
     output = Path(args.output).expanduser().resolve()
@@ -214,11 +237,17 @@ def cmd_render(args: argparse.Namespace) -> None:
         tmp = Path(tmpdir)
         clip_paths: list[Path] = []
         durations: list[float] = []
+        render_entries: list[dict] = []
+        planned_total = 0.0
 
         for i, entry in enumerate(entries):
+            render_entry, planned_duration, render_duration = _compensated_render_entry(
+                entry, transitions_active=transitions_active, is_first=(i == 0)
+            )
+
             out_clip = tmp / f"clip_{i:04d}.mp4"
             ok = _prerender_clip(
-                entry, out_clip,
+                render_entry, out_clip,
                 aspect=aspect, target_res=target_res, target_fps=target_fps,
                 lut=lut, keep_audio=keep_audio,
                 enable_reframe=enable_reframe,
@@ -226,10 +255,11 @@ def cmd_render(args: argparse.Namespace) -> None:
             if not ok:
                 continue
             clip_paths.append(out_clip)
+            render_entries.append(render_entry)
+            planned_total += planned_duration
             # The prerender pads to `out_duration_s` so beat-sync holds even
             # when the source ran short. Use that as the authoritative duration.
-            native = (entry["end_s"] - entry["start_s"]) / entry.get("speed", 1.0)
-            durations.append(float(entry.get("out_duration_s", native)))
+            durations.append(render_duration)
 
         if not clip_paths:
             sys.exit("No clips rendered. Aborting.")
@@ -238,7 +268,7 @@ def cmd_render(args: argparse.Namespace) -> None:
 
         if use_filter_complex:
             frame_w, frame_h = _aspect_dims(aspect, target_res)
-            resolved_titles = resolve_title_times(titles, sum(durations))
+            resolved_titles = resolve_title_times(titles, planned_total)
             title_pngs: list[Path] = []
             for i, t in enumerate(resolved_titles):
                 if not t.get("text"):
@@ -247,10 +277,10 @@ def cmd_render(args: argparse.Namespace) -> None:
                 render_title_png(t["text"], theme, frame_w, frame_h, png)
                 title_pngs.append(png)
             _render_filter_complex(
-                clip_paths, durations, entries[:len(clip_paths)],
+                clip_paths, durations, render_entries,
                 title_pngs=title_pngs,
                 title_times=[t for t in resolved_titles if t.get("text")],
-                total_duration_s=sum(durations),
+                total_duration_s=planned_total,
                 target_fps=target_fps,
                 keep_audio=keep_audio,
                 out=intermediate,

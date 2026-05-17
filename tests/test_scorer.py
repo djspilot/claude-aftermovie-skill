@@ -74,6 +74,31 @@ def test_repetition_cap_applied():
     assert counts.get("/loud.mp4", 0) <= 3, "loud clip exceeded repetition cap"
 
 
+def test_underfilled_plan_distributes_duration_evenly():
+    """When there are fewer picks than beat slots, don't park all slack on the last image."""
+    catalog = {"clips": [
+        _clip("/still1.mp4", duration=2.5, fps=30.0),
+        _clip("/still2.mp4", duration=2.5, fps=30.0),
+        _clip("/still3.mp4", duration=2.5, fps=30.0),
+    ]}
+    song = {
+        "duration_s": 12.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(24)],
+        "downbeats": [i * 2.0 for i in range(6)],
+        "intro_end_s": 0.0,
+    }
+
+    plan = build_plan(
+        catalog, song, target_len=12.0, no_speed_ramp=True,
+        pace="fast", source_cap=1,
+    )
+
+    assert len(plan) == 3
+    assert [round(e["out_duration_s"], 3) for e in plan] == [4.0, 4.0, 4.0]
+    assert [round(e["beat_time_s"], 3) for e in plan] == [0.0, 4.0, 8.0]
+
+
 def test_speed_ramp_fires_when_all_three_conditions_hold():
     """High-fps source + action reason + cut landing on a downbeat → speed=0.5."""
     # Single high-fps source so the picker fills downbeats with it.

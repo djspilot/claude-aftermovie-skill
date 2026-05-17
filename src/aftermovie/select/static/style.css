@@ -75,6 +75,18 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
   border-radius: var(--radius);
   padding: 4px 8px;
 }
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  white-space: nowrap;
+}
 .ctrl input, .ctrl select {
   background: transparent;
   color: var(--fg);
@@ -87,6 +99,10 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .ctrl input[type="number"] { width: 56px; text-align: right; }
 .ctrl select { appearance: none; padding-right: 4px; }
 .ctrl .suffix { color: var(--fg-dim); }
+.check input {
+  margin: 0;
+  accent-color: var(--accent);
+}
 
 .btn {
   background: var(--bg-elev);

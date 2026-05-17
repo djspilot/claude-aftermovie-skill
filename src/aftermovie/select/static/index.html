@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
   <header class="topbar">
@@ -23,6 +23,58 @@
           <option value="medium">medium</option>
           <option value="fast">fast</option>
         </select>
+      </label>
+      <label class="ctrl">
+        <span>Look</span>
+        <select id="lut" aria-label="LUT">
+          <option value="">default</option>
+        </select>
+      </label>
+      <label class="ctrl">
+        <span>Theme</span>
+        <select id="theme" aria-label="Theme">
+          <option value="">custom</option>
+        </select>
+      </label>
+      <label class="ctrl">
+        <span>Transitions</span>
+        <select id="transitions" aria-label="Transitions">
+          <option value="soft" selected>soft</option>
+          <option value="auto">auto</option>
+          <option value="cut">cut</option>
+        </select>
+      </label>
+      <label class="ctrl">
+        <span>Audio</span>
+        <select id="audio-mix" aria-label="Audio mix">
+          <option value="ducked" selected>ducked</option>
+          <option value="music_only">music only</option>
+          <option value="clip_only">clip only</option>
+        </select>
+      </label>
+      <label class="ctrl">
+        <span>Aspect</span>
+        <select id="aspect" aria-label="Aspect ratio">
+          <option value="16:9" selected>16:9</option>
+          <option value="9:16">9:16</option>
+          <option value="1:1">1:1</option>
+        </select>
+      </label>
+      <label class="ctrl">
+        <span>Reuse</span>
+        <input id="source-cap" type="number" min="1" max="5" step="1" value="1" aria-label="Max uses per source">
+      </label>
+      <label class="check">
+        <input id="speed-ramp" type="checkbox" checked>
+        <span>Speed ramps</span>
+      </label>
+      <label class="check">
+        <input id="reframe" type="checkbox" checked>
+        <span>Reframe</span>
+      </label>
+      <label class="check">
+        <input id="keep-bursts" type="checkbox" checked>
+        <span>Keep nearby</span>
       </label>
       <button id="select-all" class="btn ghost" type="button">Select all</button>
       <button id="deselect-all" class="btn ghost" type="button">Deselect all</button>
@@ -66,6 +118,6 @@
     </div>
   </template>
 
-  <script src="app.js" defer></script>
+  <script src="app.js?v=4" defer></script>
 </body>
 </html>

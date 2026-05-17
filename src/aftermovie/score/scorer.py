@@ -432,24 +432,20 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "face_bboxes": src_faces[start_i:end_i] if src_faces else [],
         })
 
-    # Stretch-stills: if there are unfilled beat slots after this entry (the
-    # allocator ran out of unique sources), extend this entry's slot to cover
-    # the gap. The renderer's tpad/apad logic already holds the last frame
-    # for still-derived clips, so a stretched still looks like a Ken Burns
-    # that settles instead of a duplicated cut.
+    # When the allocator emits fewer entries than beat slots (often because a
+    # still/live-photo heavy folder has many one-window sources), don't dump
+    # all skipped time into the predecessor or final entry. That makes the last
+    # image hang for ages. Instead, distribute the target length evenly across
+    # the chosen entries so the edit stays balanced.
     if stretch_stills and plan_entries:
-        # If the LAST plan_entry doesn't reach target_len, extend it.
-        target_end = float(target_len)
-        # Walk in pairs and absorb skipped slots into the predecessor.
-        for i, e in enumerate(plan_entries):
-            this_beat = float(e["beat_time_s"])
-            if i + 1 < len(plan_entries):
-                next_beat = float(plan_entries[i + 1]["beat_time_s"])
-            else:
-                next_beat = target_end
-            true_gap = next_beat - this_beat
-            if true_gap > e["out_duration_s"] + 1e-6:
-                e["out_duration_s"] = true_gap
+        n_slots = max(0, len(cut_points) - 1)
+        if len(plan_entries) < n_slots:
+            even_gap = float(target_len) / len(plan_entries)
+            beat_t = 0.0
+            for e in plan_entries:
+                e["beat_time_s"] = beat_t
+                e["out_duration_s"] = even_gap
+                beat_t += even_gap
 
     return plan_entries
 

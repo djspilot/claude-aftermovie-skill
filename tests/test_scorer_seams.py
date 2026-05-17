@@ -64,7 +64,7 @@ def test_allocate_candidates_respects_source_cap():
     ]
     # 10 slots each 1s apart, all wide enough to fill.
     cut_points = [float(i) for i in range(11)]
-    picks = allocate_candidates(candidates, cut_points, source_cap=3)
+    picks = allocate_candidates(candidates, cut_points, auto_bump_cap=False, source_cap=3)
     counts: dict[str, int] = {}
     for _beat_t, pick in picks:
         counts[pick.source] = counts.get(pick.source, 0) + 1
@@ -80,13 +80,13 @@ def test_allocate_candidates_custom_cap():
         for i in range(10)
     ]
     cut_points = [float(i) for i in range(11)]
-    picks_cap1 = allocate_candidates(candidates, cut_points, source_cap=1)
+    picks_cap1 = allocate_candidates(candidates, cut_points, auto_bump_cap=False, source_cap=1)
     assert len(picks_cap1) == 1
     picks_cap5 = allocate_candidates(
         [Candidate(source="/only.mp4", start_s=float(i), end_s=float(i) + 2.0,
                    score=100.0 - i, reasons=[], src_fps=60.0)
          for i in range(10)],
-        cut_points, source_cap=5,
+        cut_points, auto_bump_cap=False, source_cap=5,
     )
     assert len(picks_cap5) == 5
 

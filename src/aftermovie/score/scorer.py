@@ -240,13 +240,35 @@ def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> lis
 
 def allocate_candidates(candidates: list[Candidate],
                         cut_points: list[float],
-                        source_cap: int = 3) -> list[tuple[float, Candidate]]:
+                        source_cap: int = 3,
+                        auto_bump_cap: bool = True,
+                        max_auto_cap: int = 5) -> list[tuple[float, Candidate]]:
     """Greedy fill: walk cut points, pick the highest-scoring unused candidate
     that hasn't already hit `source_cap` reuses of the same source file.
 
-    Returns `[(beat_t, picked_candidate), ...]` in cut order. The final
-    sentinel cut point (used only as the gap terminator) is not yielded.
+    When `auto_bump_cap=True` (default) and the available unique sources
+    can't fill every cut point at the given `source_cap`, the cap is bumped
+    automatically (up to `max_auto_cap`). This lets users hit a target
+    length (e.g. `--max-length 120`) even when their source folder is small:
+    some sources will appear more than once, but the alternative is a
+    truncated edit. A single log line surfaces the bump.
+
+    Returns `[(beat_t, picked_candidate), ...]` in cut order.
     """
+    n_unique = len({c.source for c in candidates})
+    n_slots = max(0, len(cut_points) - 1)
+    effective_cap = source_cap
+    # Only auto-bump from the strict-no-duplicates default. When the caller
+    # explicitly passed source_cap > 1 they already weighed reuse vs. variety.
+    if (auto_bump_cap and source_cap == 1
+            and n_unique > 0 and n_unique * source_cap < n_slots):
+        # Round up: e.g. 64 sources, 75 slots, cap=1 → need cap=2.
+        needed = -(-n_slots // n_unique)
+        effective_cap = min(max(source_cap, needed), max_auto_cap)
+        if effective_cap > source_cap:
+            log(f"  ! source_cap auto-bumped {source_cap} → {effective_cap} to fit "
+                f"{n_slots} cuts from {n_unique} unique sources")
+
     candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
     used_sources: dict[str, int] = {}
     picks: list[tuple[float, Candidate]] = []
@@ -262,7 +284,7 @@ def allocate_candidates(candidates: list[Candidate],
             clip_len = c.end_s - c.start_s
             if clip_len < MIN_CLIP_S:
                 continue
-            if used_sources.get(c.source, 0) >= source_cap:
+            if used_sources.get(c.source, 0) >= effective_cap:
                 continue
             pick = c
             break

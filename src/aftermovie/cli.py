@@ -14,6 +14,7 @@ from pathlib import Path
 from aftermovie.analyze.clip import cmd_analyze
 from aftermovie.config import THEMES
 from aftermovie.effective_config import EffectiveConfig, resolve
+from aftermovie.ffmpeg_cmd import log
 from aftermovie.env_config import (
     DEFAULT_CONFIG_TEMPLATE,
     config_path,
@@ -72,6 +73,12 @@ def cmd_auto(args: argparse.Namespace) -> None:
     # then delegate to the shared pipeline_runner so the CLI and MCP
     # surfaces drive the same code path.
     args = _resolved_namespace(args)
+    if not getattr(args, "output", None):
+        out_dir = Path(getattr(args, "output_dir", "")
+                       or str(Path.home() / "Downloads")).expanduser()
+        clips_name = Path(args.clips).expanduser().resolve().name or "edit"
+        args.output = str(out_dir / f"aftermovie-{clips_name}.mp4")
+        log(f"Output → {args.output}")
     opts = opts_from_namespace(args)
     run_auto(Path(args.clips), Path(args.song), Path(args.output), opts)
 
@@ -175,7 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     pu = sub.add_parser("auto", help="One-shot: analyze → score → render.")
     pu.add_argument("--clips", required=True)
     pu.add_argument("--song", required=True)
-    pu.add_argument("--output", required=True)
+    pu.add_argument("--output", default=None,
+                    help="Output path. Defaults to "
+                         "<AFTERMOVIE_OUTPUT_DIR>/aftermovie-<source>.mp4 "
+                         "(typically ~/Downloads/).")
     pu.add_argument("--still-duration", type=float, default=None,
                     help="Per-still clip duration (s) for HEIC/JPG/PNG materials.")
     pu.add_argument("--no-stills", dest="no_stills",

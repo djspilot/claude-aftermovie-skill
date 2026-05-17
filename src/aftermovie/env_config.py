@@ -113,4 +113,7 @@ AFTERMOVIE_NO_REFRAME=false           # true = center-crop instead of face-track
 # ---- Selection ----
 AFTERMOVIE_SOURCE_CAP=1               # max times a source can appear; 1 = no duplicates
 AFTERMOVIE_CHRONOLOGICAL=true         # order entries by EXIF/creation_time after allocation
+
+# ---- Output ----
+AFTERMOVIE_OUTPUT_DIR=~/Downloads     # `auto` writes here when --output is omitted
 """

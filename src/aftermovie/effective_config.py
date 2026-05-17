@@ -54,6 +54,7 @@ BUILTIN_DEFAULTS: dict[str, Any] = {
     "audio_interest_threshold": 0.35,
     "source_cap": 1,
     "chronological": True,
+    "output_dir": str(Path.home() / "Downloads"),
 }
 
 
@@ -105,6 +106,7 @@ ENV_KEYS: dict[str, tuple[str, Any]] = {
                                  _parse_float),
     "source_cap":               ("AFTERMOVIE_SOURCE_CAP", _parse_int),
     "chronological":            ("AFTERMOVIE_CHRONOLOGICAL", _parse_bool),
+    "output_dir":               ("AFTERMOVIE_OUTPUT_DIR", _parse_str),
 }
 
 
@@ -129,6 +131,7 @@ class EffectiveConfig:
     audio_interest_threshold: float
     source_cap: int
     chronological: bool
+    output_dir: str
 
 
 def _read_env_file(path: Path | None) -> dict[str, str]:

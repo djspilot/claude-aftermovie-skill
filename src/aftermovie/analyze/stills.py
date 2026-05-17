@@ -1,19 +1,17 @@
 """Still image → short clip materializer + Live Photo pairing logic.
 
-This module turns iPhone-style mixed folders into a clip-only catalog the rest
-of the pipeline can use:
+Turns iPhone-style mixed folders into a clip-only catalog: HEIC/JPG/PNG become
+2.5-second mp4 clips with a Quik-style display variant (push / pull / pan /
+fit_pad / ...) and are cached under `~/.skills-data/aftermovie/cache/stills/`.
+Live Photo pairs (`IMG_0488.HEIC` + `IMG_0488.MOV`) drop the still — the MOV
+already carries the motion. Single-file Live Photos with an embedded MOV need
+exiftool to extract; otherwise they degrade to the still frame.
 
-  * `.heic`/`.heif`/`.jpg`/`.jpeg`/`.png` files become 2.5-second mp4 clips
-    with a subtle Ken Burns zoom, cached under `~/.skills-data/aftermovie/cache/stills/`.
-  * Live Photos exported as paired files (e.g. `IMG_0488.HEIC` + `IMG_0488.MOV`)
-    are detected by shared stem; the still is dropped because the MOV already
-    carries the motion.
-  * Single-file Live Photos (HEIC with the MOV in a metadata box) currently
-    degrade to the still frame — extracting the embedded MOV needs exiftool.
+HEIC: homebrew ffmpeg lacks libheif, so we pre-decode every image via PIL
+(with pillow-heif registered) into a temp PNG and feed THAT to ffmpeg.
 
-HEIC support: homebrew's stock ffmpeg can't demux HEIC as a loopable image
-(no libheif), so we always pre-decode images via PIL (with pillow-heif
-registered) into a temp PNG, then feed THAT to ffmpeg.
+Filter-chain construction (variant pick + zoompan/pad/blur graph) lives in
+`still_filters.py`; this module is just discovery + IO + the cache.
 """
 from __future__ import annotations
 
@@ -22,6 +20,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from aftermovie.analyze.still_filters import _build_still_filter, _pick_still_variant
 from aftermovie.config import data_dir
 from aftermovie.ffmpeg_cmd import log, run
 
@@ -33,26 +32,18 @@ try:
 except ImportError:
     _PIL_HEIC_AVAILABLE = False
 
-STILL_EXTS = {
-    ".heic", ".heif", ".jpg", ".jpeg", ".png",
-    ".HEIC", ".HEIF", ".JPG", ".JPEG", ".PNG",
-}
+STILL_EXTS = {".heic", ".heif", ".jpg", ".jpeg", ".png",
+              ".HEIC", ".HEIF", ".JPG", ".JPEG", ".PNG"}
 LIVE_PHOTO_VIDEO_EXTS = {".mov", ".MOV"}
 DEFAULT_STILL_DURATION_S = 2.5
 
-# Filenames at the source-folder root that look like prior aftermovie outputs.
-# Matched as case-insensitive substring against the file name.
+# Case-insensitive substring match against filename for prior aftermovie outputs.
 OUTPUT_NAME_HINTS = ("aftermovie", "_aftermovie", "highlight_reel", "recap")
 
-# Subdirectories that should not be recursed into. These are workaround /
-# staging folders the user (or a prior session) created for source
-# conversions; if we ingest both the original AND the staging copy we get
-# every clip listed under two different paths and the per-source repetition
-# cap is silently doubled.
-SKIP_DIR_NAMES = {
-    "_aftermovie_src", "_aftermovie", "aftermovie_workdir",
-    "__pycache__", ".git", "node_modules", ".cache",
-}
+# Subdirectories not to recurse into. Staging copies would otherwise double-count
+# every clip under two paths, silently doubling the per-source repetition cap.
+SKIP_DIR_NAMES = {"_aftermovie_src", "_aftermovie", "aftermovie_workdir",
+                  "__pycache__", ".git", "node_modules", ".cache"}
 
 
 def _stills_cache_dir() -> Path:
@@ -80,16 +71,13 @@ def _under_skipped_dir(p: Path, root: Path) -> bool:
 
 
 def find_live_photos_and_stills(folder: Path) -> tuple[list[Path], list[Path], int]:
-    """Split a folder's still files into (extracted_live_photo_movs, stills, n_orphan_live_marker).
+    """Split stills into (extracted_live_photo_movs, real_stills, orphan_markers).
 
-    For each HEIC/JPG that has no same-stem MOV sibling, probe for an embedded
-    Live Photo / Motion Photo video and extract it into the cache. Successful
-    extractions are returned as MOV paths the analyzer should treat as video.
-    Failed extractions (or non-Live-Photo files) fall through to the stills list.
-
-    `n_orphan_live_marker` counts HEICs that have an Apple ContentIdentifier
-    but no extractable video — i.e. were Live Photos whose motion portion was
-    dropped during export. The caller surfaces this as a hint to re-export.
+    For each HEIC/JPG without a same-stem MOV sibling, probe for an embedded
+    Live Photo video and extract it into the cache. Successful extractions are
+    returned as MOV paths the analyzer should treat as video. `orphan_markers`
+    counts HEICs with an Apple ContentIdentifier but no extractable video —
+    surfaced to the user as a hint to re-export.
     """
     from aftermovie.analyze.live_photo import (
         exiftool_available,
@@ -139,11 +127,7 @@ def find_stills_excluding_live_pairs(folder: Path) -> list[Path]:
 
 
 def _decode_to_png(src: Path) -> Path | None:
-    """Decode any PIL-readable image (HEIC/JPG/PNG/etc.) to a temp PNG.
-
-    Returns None if PIL can't open it (most commonly: HEIC without
-    pillow-heif). The caller is responsible for unlinking the returned path.
-    """
+    """Decode any PIL-readable image to a temp PNG (caller unlinks). None on failure."""
     from PIL import Image
 
     try:
@@ -155,8 +139,7 @@ def _decode_to_png(src: Path) -> Path | None:
             return Path(tmp.name)
     except (OSError, ValueError) as e:
         if src.suffix.lower() in (".heic", ".heif") and not _PIL_HEIC_AVAILABLE:
-            log(f"  ! cannot decode {src.name} — install pillow-heif "
-                f"(pip install pillow-heif)")
+            log(f"  ! cannot decode {src.name} — install pillow-heif (pip install pillow-heif)")
         else:
             log(f"  ! cannot decode {src.name}: {e}")
         return None
@@ -165,13 +148,11 @@ def _decode_to_png(src: Path) -> Path | None:
 def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
                       target_res: str = "1920x1080",
                       force: bool = False) -> Path | None:
-    """Render a still to a cached mp4 with a subtle Ken Burns zoom.
+    """Render a still to a cached mp4 using a per-file Quik-style variant.
 
-    Returns the cached path, or None if the image can't be decoded.
-
-    Strategy: always pre-decode via PIL → temp PNG, then ffmpeg from the PNG.
-    This works for any PIL-readable format (HEIC via pillow-heif), and dodges
-    homebrew ffmpeg's lack of libheif.
+    Pre-decodes via PIL → PNG (so HEIC works via pillow-heif), then feeds it
+    to ffmpeg with the variant chain from `still_filters`. Returns None if
+    the image can't be decoded.
     """
     cache_dir = _stills_cache_dir()
     key = _cache_key(path, duration_s, target_res)
@@ -186,22 +167,13 @@ def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
     w, h = (int(x) for x in target_res.split("x"))
     fps = 30
     n_frames = max(2, int(round(duration_s * fps)))
-    vf = (
-        f"scale={w*2}:{h*2}:force_original_aspect_ratio=increase,"
-        f"crop={w*2}:{h*2},"
-        f"zoompan=z='1+0.1*on/{n_frames}':d={n_frames}:fps={fps}:s={w}x{h},"
-        f"format=yuv420p"
-    )
-    cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-loop", "1", "-i", str(png_path),
-        "-t", f"{duration_s:.3f}",
-        "-vf", vf,
-        "-an",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        str(out),
-    ]
+    variant, seed = _pick_still_variant(path, w, h)
+    spec = _build_still_filter(variant, seed, n_frames, fps, w, h)
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-loop", "1", "-i", str(png_path),
+           "-t", f"{duration_s:.3f}", "-vf", spec.chain, "-an",
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+           "-pix_fmt", "yuv420p", str(out)]
     try:
         run(cmd, check=True)
         return out
@@ -221,8 +193,7 @@ def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
 
 
 def _is_excluded_output(path: Path) -> bool:
-    """Heuristic: filter out our own previous renders that landed in the source folder."""
-    name = path.name.lower()
+    """Filter out our own previous renders that landed in the source folder."""
     if path.suffix.lower() not in (".mp4", ".mov"):
         return False
-    return any(hint in name for hint in OUTPUT_NAME_HINTS)
+    return any(hint in path.name.lower() for hint in OUTPUT_NAME_HINTS)

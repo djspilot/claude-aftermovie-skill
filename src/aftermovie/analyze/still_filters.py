@@ -66,13 +66,20 @@ class FilterSpec:
 
 
 def _image_dims(path: Path) -> tuple[int, int] | None:
-    """Return (width, height) of the source image, or None on failure.
+    """Return (width, height) as the image *displays*, respecting EXIF orientation.
 
-    Uses PIL so HEIC works (pillow-heif is registered by stills.py on import).
+    iPhone photos are stored with raw sensor dimensions (e.g. 4032×3024) plus
+    an EXIF Orientation tag that flips them on display. Without
+    `exif_transpose` a vertical iPhone photo reads as landscape here and
+    skips the letterbox path.
     """
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         with Image.open(path) as img:
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:  # noqa: BLE001 — defensive: any malformed exif
+                pass
             return img.size
     except (OSError, ValueError, ImportError):
         return None

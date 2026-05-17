@@ -49,6 +49,18 @@ def analyze_clip(path: Path) -> ClipInfo | None:
         fps = 30.0
     width = int(vstream.get("width", 1920))
     height = int(vstream.get("height", 1080))
+    # iPhone Live Photo MOVs store sensor dimensions and a rotation tag.
+    # ffprobe's `side_data_list[i].rotation` is the angle in degrees;
+    # ±90 means the display dimensions are transposed.
+    for sd in vstream.get("side_data_list") or []:
+        rot = sd.get("rotation")
+        if isinstance(rot, (int, float)) and int(abs(rot)) % 180 == 90:
+            width, height = height, width
+            break
+    else:
+        rot_tag = (vstream.get("tags") or {}).get("rotate")
+        if rot_tag and int(rot_tag) % 180 == 90:
+            width, height = height, width
 
     is_short_form = duration < 4.0
 

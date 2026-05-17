@@ -94,7 +94,21 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         vfilter.append(reframe_filter)
         vfilter.append(f"scale={target_w}:{target_h}")
     else:
-        vfilter.append(aspect_filter(aspect, target_res))
+        # Letterbox when the source is meaningfully narrower than the target
+        # frame (vertical / near-vertical videos on 16:9 output). Same rule
+        # as analyze/still_filters.py:_should_letterbox so video + photo
+        # behaviour matches.
+        src_w = int(entry.get("source_width", 0) or 0)
+        src_h = int(entry.get("source_height", 0) or 0)
+        if (src_w > 0 and src_h > 0
+                and (src_w / src_h) < (target_w / target_h) * 0.85):
+            # Pillarbox/letterbox with literal black bars.
+            vfilter.append(
+                f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+            )
+        else:
+            vfilter.append(aspect_filter(aspect, target_res))
 
     if speed != 1.0:
         vfilter.append(f"setpts={1.0/speed:.4f}*PTS")

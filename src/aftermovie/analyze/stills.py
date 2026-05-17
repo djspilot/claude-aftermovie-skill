@@ -127,11 +127,18 @@ def find_stills_excluding_live_pairs(folder: Path) -> list[Path]:
 
 
 def _decode_to_png(src: Path) -> Path | None:
-    """Decode any PIL-readable image to a temp PNG (caller unlinks). None on failure."""
-    from PIL import Image
+    """Decode any PIL-readable image to a temp PNG (caller unlinks). None on failure.
+
+    Applies EXIF orientation, then a face-detection-based auto-orient
+    fallback for cases where EXIF is missing or wrong.
+    """
+    from PIL import Image, ImageOps
+    from aftermovie.analyze.orient import auto_orient
 
     try:
         with Image.open(src) as img:
+            img = ImageOps.exif_transpose(img)
+            img = auto_orient(img, source_path=src)
             img = img.convert("RGB")
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
@@ -155,7 +162,8 @@ def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
     the image can't be decoded.
     """
     cache_dir = _stills_cache_dir()
-    key = _cache_key(path, duration_s, target_res)
+    # Cache key suffix bumped to invalidate when orientation logic changes.
+    key = _cache_key(path, duration_s, target_res) + "_o1"
     out = cache_dir / f"{key}.mp4"
     if out.is_file() and not force:
         return out

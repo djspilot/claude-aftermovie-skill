@@ -323,7 +323,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                chronological: bool = True,
                burst_window_s: float = DEFAULT_BURST_WINDOW_S,
                hook: bool = True,
-               climax: bool = True) -> list[dict[str, Any]]:
+               climax: bool = True,
+               stretch_stills: bool = True) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure.
 
     Orchestrates three seams:
@@ -430,6 +431,26 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "source_height": int(src_clip.get("height", 1080)),
             "face_bboxes": src_faces[start_i:end_i] if src_faces else [],
         })
+
+    # Stretch-stills: if there are unfilled beat slots after this entry (the
+    # allocator ran out of unique sources), extend this entry's slot to cover
+    # the gap. The renderer's tpad/apad logic already holds the last frame
+    # for still-derived clips, so a stretched still looks like a Ken Burns
+    # that settles instead of a duplicated cut.
+    if stretch_stills and plan_entries:
+        # If the LAST plan_entry doesn't reach target_len, extend it.
+        target_end = float(target_len)
+        # Walk in pairs and absorb skipped slots into the predecessor.
+        for i, e in enumerate(plan_entries):
+            this_beat = float(e["beat_time_s"])
+            if i + 1 < len(plan_entries):
+                next_beat = float(plan_entries[i + 1]["beat_time_s"])
+            else:
+                next_beat = target_end
+            true_gap = next_beat - this_beat
+            if true_gap > e["out_duration_s"] + 1e-6:
+                e["out_duration_s"] = true_gap
+
     return plan_entries
 
 
@@ -454,6 +475,7 @@ def cmd_score(args: argparse.Namespace) -> None:
                               or DEFAULT_BURST_WINDOW_S),
         hook=bool(getattr(args, "hook", True)),
         climax=bool(getattr(args, "climax", True)),
+        stretch_stills=bool(getattr(args, "stretch_stills", True)),
     )
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):

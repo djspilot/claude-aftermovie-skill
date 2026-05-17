@@ -65,19 +65,23 @@ class FilterSpec:
 
 
 def _image_dims(path: Path) -> tuple[int, int] | None:
-    """Return (width, height) as the image *displays*, respecting EXIF orientation.
+    """Return (width, height) as the image *displays*.
 
-    iPhone photos are stored with raw sensor dimensions (e.g. 4032×3024) plus
-    an EXIF Orientation tag that flips them on display. Without
-    `exif_transpose` a vertical iPhone photo reads as landscape here and
-    skips the letterbox path.
+    Applies EXIF orientation first, then the face-based auto-orient fallback
+    so the letterbox decision matches what _decode_to_png will actually
+    produce in the rendered output.
     """
     try:
         from PIL import Image, ImageOps
+        from aftermovie.analyze.orient import auto_orient
         with Image.open(path) as img:
             try:
                 img = ImageOps.exif_transpose(img)
             except Exception:  # noqa: BLE001 — defensive: any malformed exif
+                pass
+            try:
+                img = auto_orient(img, source_path=path)
+            except Exception:  # noqa: BLE001 — never crash a render on this
                 pass
             return img.size
     except (OSError, ValueError, ImportError):

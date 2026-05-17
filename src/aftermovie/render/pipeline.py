@@ -315,7 +315,7 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
             last = "0:a"
             for i in range(1, n_clips):
                 tdur = float(entries[i].get("transition_in", {}).get("duration_s") or 0.1)
-                tdur = max(0.05, min(0.7, tdur))
+                tdur = max(0.05, min(0.9, tdur))
                 label = f"axf{i}" if i < n_clips - 1 else "a_out"
                 parts.append(
                     f"[{last}][{i}:a]acrossfade=d={tdur:.3f}:c1=tri:c2=tri[{label}]"

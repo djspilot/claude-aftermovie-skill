@@ -39,7 +39,9 @@ def analyze_song(song_path: Path) -> dict[str, Any]:
             onset_envelope=onset_env, sr=sr, units="frames",
         )
         if len(peak_frames):
-            strong_thr = float(np.percentile(onset_env, 92))
+            # 98th percentile is much stricter than 92 — keeps only the
+            # genuine snare/kick hits, not every beat with a transient.
+            strong_thr = float(np.percentile(onset_env, 98))
             peak_frames_arr = np.asarray(peak_frames, dtype=int)
             strong_mask = onset_env[peak_frames_arr] > strong_thr
             strong_frames = peak_frames_arr[strong_mask]

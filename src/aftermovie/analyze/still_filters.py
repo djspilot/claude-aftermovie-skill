@@ -30,10 +30,9 @@ from pathlib import Path
 _FILL_VARIANTS = ("live", "push", "pull", "pan_h", "shake")
 
 # Variants that show the entire source image (no cropping). Narrow-aspect
-# sources are forced into this set. fit_pad is weighted ~3:1 over blurred_bg
-# because the user has specifically asked for literal black borders rather
-# than the blurred-self look (which still reads as "zoomed in").
-_PORTRAIT_VARIANTS = ("fit_pad", "fit_pad", "fit_pad", "blurred_bg")
+# sources are forced into this set. User wanted literal black borders only —
+# blurred_bg was confusing because the blurred-self bg still reads as zoomed.
+_PORTRAIT_VARIANTS = ("fit_pad",)
 
 # Full ordered tuple for general (landscape / square-ish) sources. live is
 # weighted by listing it twice so the historical look stays the most common.

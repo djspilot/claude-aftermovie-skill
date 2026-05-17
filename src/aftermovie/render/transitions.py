@@ -101,9 +101,10 @@ def _decide_soft(entries: list[dict[str, Any]],
         score = float(e.get("score", 0))
         reasons = set(e.get("reasons", []) or [])
 
-        # Hard cut if a strong onset hits within ±0.1s of the beat — lines the
-        # visual cut up with a snare/kick/vocal entrance.
-        if any(abs(beat_t - p) < 0.10 for p in onset_peaks):
+        # Hard cut if a strong onset hits within ±60ms of the beat — lines
+        # the visual cut up with a snare/kick/vocal entrance. Tight window
+        # because onsets are common; only the closest hits should trigger.
+        if any(abs(beat_t - p) < 0.06 for p in onset_peaks):
             e["transition_in"] = {"kind": "cut", "duration_s": 0.0}
             continue
 
@@ -119,17 +120,17 @@ def _decide_soft(entries: list[dict[str, Any]],
 
         on_downbeat = any(abs(beat_t - db) < 0.15 for db in downbeats)
 
-        # Durations bumped ~1.5x from the original mix: the user explicitly
-        # asked for slower transitions. Still well within the audio
-        # acrossfade clamp (0.05–0.5) in pipeline.py.
+        # Durations bumped ~2x from the original mix: the user kept
+        # asking for slower transitions. Audio acrossfade clamp in
+        # pipeline.py was widened to 0.7 to match.
         if on_downbeat and e_val >= 0.6:
-            tdur = 0.45   # structural-beat marker
+            tdur = 0.65   # structural-beat marker
         elif e_val < 0.35:
-            tdur = 0.60   # calm dissolve
+            tdur = 0.85   # calm dissolve
         elif e_val >= 0.75:
-            tdur = 0.15   # tight glide in loud sections
+            tdur = 0.30   # tight glide in loud sections (was 0.15)
         else:
-            tdur = 0.28   # default mid-tempo
+            tdur = 0.45   # default mid-tempo
         e["transition_in"] = {"kind": "crossfade", "duration_s": tdur}
 
 

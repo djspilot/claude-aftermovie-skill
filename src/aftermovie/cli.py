@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import tempfile
 from pathlib import Path
 
 from aftermovie.analyze.clip import cmd_analyze
@@ -22,50 +21,14 @@ from aftermovie.env_config import (
     env_str,
     load_env_file,
 )
-from aftermovie.ffmpeg_cmd import log
+from aftermovie.pipeline_runner import opts_from_namespace, run_auto
 from aftermovie.render.pipeline import cmd_render
 from aftermovie.score.scorer import cmd_score
 
 
 def cmd_auto(args: argparse.Namespace) -> None:
-    workdir = Path(tempfile.mkdtemp(prefix="aftermovie_auto_"))
-    log(f"Working dir: {workdir}")
-    catalog_path = workdir / "catalog.json"
-    plan_path = workdir / "plan.json"
-
-    a = argparse.Namespace(
-        clips=args.clips,
-        out=str(catalog_path),
-        still_duration=getattr(args, "still_duration", 2.5),
-        no_stills=getattr(args, "no_stills", False),
-    )
-    cmd_analyze(a)
-
-    s = argparse.Namespace(
-        catalog=str(catalog_path),
-        song=args.song,
-        out=str(plan_path),
-        max_length=args.max_length,
-        aspect=args.aspect,
-        res=args.res,
-        fps=args.fps,
-        lut=args.lut,
-        music_db=args.music_db,
-        clip_db=args.clip_db,
-        no_speed_ramp=args.no_speed_ramp,
-        audio_mix=getattr(args, "audio_mix", "ducked"),
-        pace=getattr(args, "pace", "medium"),
-        transitions=getattr(args, "transitions", "cut"),
-        titles=getattr(args, "titles", None),
-        title_text=getattr(args, "title_text", None),
-        no_reframe=getattr(args, "no_reframe", False),
-    )
-    cmd_score(s)
-
-    r = argparse.Namespace(plan=str(plan_path), output=args.output)
-    cmd_render(r)
-
-    log(f"Intermediate files preserved in: {workdir}")
+    opts = opts_from_namespace(args)
+    run_auto(Path(args.clips), Path(args.song), Path(args.output), opts)
 
 
 def _add_score_flags(p: argparse.ArgumentParser) -> None:
@@ -257,34 +220,8 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 def main() -> None:
     # Load user config first so env-backed argparse defaults pick it up.
+    # Theme expansion happens inside `run_auto` for the `auto` subcommand;
+    # other subcommands don't take a theme.
     load_env_file()
     args = build_parser().parse_args()
-    if getattr(args, "theme", None):
-        _apply_theme(args)
     args.func(args)
-
-
-# Per-flag "is this the built-in default?" check — used to decide whether the
-# theme's value should override. Anything the user explicitly set on the CLI
-# (or via the env file) stays untouched.
-_THEME_DEFAULTS = {
-    "lut": None,
-    "music_db": DEFAULT_MUSIC_DB,
-    "no_speed_ramp": False,
-    "transitions": "cut",
-    "audio_mix": "ducked",
-    "pace": "medium",
-}
-
-
-def _apply_theme(args: argparse.Namespace) -> None:
-    preset = THEMES.get(args.theme, {})
-    for k, v in preset.items():
-        if k == "description":
-            continue
-        cur = getattr(args, k, None)
-        baseline = _THEME_DEFAULTS.get(k)
-        # Only override when the field is still at the built-in default — that
-        # means the user did not set it on the CLI or in the env file.
-        if cur == baseline:
-            setattr(args, k, v)

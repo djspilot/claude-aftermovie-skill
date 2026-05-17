@@ -21,6 +21,7 @@ from aftermovie.config import (
     list_luts,
 )
 from aftermovie.mcp_server import jobs
+from aftermovie.pipeline_runner import AutoOpts, run_auto
 from aftermovie.render.pipeline import cmd_render
 from aftermovie.render.transitions import decide_transitions
 from aftermovie.score.scorer import build_plan
@@ -310,6 +311,79 @@ def render_plan(plan_id: str, output_path: str) -> dict[str, Any]:
         }
 
     job_id = jobs.start_job("render_plan", _work)
+    return {"job_id": job_id}
+
+
+# ---- one-shot auto --------------------------------------------------------
+
+@mcp.tool(description="One-shot analyze → score → render for a clips folder + song. "
+                      "Same orchestration as the CLI's `aftermovie auto`. "
+                      "Returns a job_id; poll with get_job. Theme bundles override "
+                      "only the knobs the caller left at their built-in defaults.")
+def auto(
+    clips: str,
+    song: str,
+    output: str,
+    theme: str | None = None,
+    aspect: str = "16:9",
+    res: str = "1920x1080",
+    fps: int = 30,
+    max_length: float | None = None,
+    still_duration: float = 2.5,
+    no_stills: bool = False,
+    audio_mix: str = "ducked",
+    music_db: float = -8.0,
+    clip_db: float = -18.0,
+    pace: str = "medium",
+    transitions: str = "cut",
+    no_speed_ramp: bool = False,
+    no_reframe: bool = False,
+    lut: str | None = None,
+    titles: str | None = None,
+    title_text: str | None = None,
+) -> dict[str, Any]:
+    clips_path = Path(clips).expanduser().resolve()
+    song_path = Path(song).expanduser().resolve()
+    output_path = Path(output).expanduser().resolve()
+    if not clips_path.is_dir():
+        raise FileNotFoundError(f"not a directory: {clips_path}")
+    if not song_path.is_file():
+        raise FileNotFoundError(f"song not found: {song_path}")
+
+    opts = AutoOpts(
+        aspect=aspect,
+        res=res,
+        fps=fps,
+        max_length=max_length,
+        still_duration=still_duration,
+        no_stills=no_stills,
+        audio_mix=audio_mix,
+        music_db=music_db,
+        clip_db=clip_db,
+        pace=pace,
+        transitions=transitions,
+        no_speed_ramp=no_speed_ramp,
+        no_reframe=no_reframe,
+        lut=lut,
+        theme=theme,
+        titles=titles,
+        title_text=title_text,
+    )
+
+    def _work(cancel):
+        run_auto(clips_path, song_path, output_path, opts)
+        from aftermovie.ffmpeg_cmd import ffprobe_json
+        info = ffprobe_json(output_path)
+        return {
+            "output_path": str(output_path),
+            "duration_s": float(info.get("format", {}).get("duration", 0)),
+            "streams": [
+                {"codec_type": s.get("codec_type"), "codec_name": s.get("codec_name")}
+                for s in info.get("streams", [])
+            ],
+        }
+
+    job_id = jobs.start_job("auto", _work)
     return {"job_id": job_id}
 
 

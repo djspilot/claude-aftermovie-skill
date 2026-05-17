@@ -166,6 +166,7 @@ def propose_plan(
         "transitions": transitions,
         "titles": titles or [],
         "reframe": reframe,
+        "song_start_s": float(song["intro_end_s"]),
         "entries": entries,
     }
     save_plan(plan_id, plan)

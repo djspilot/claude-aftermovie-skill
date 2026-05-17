@@ -247,10 +247,23 @@ def _final_mux(intermediate: Path, plan: dict, output: Path,
     music_db = plan.get("music_db", -8)
     a_filter = audio_filtergraph(audio_mix, music_db)
 
+    # Where in the song do the cuts actually live? The planner places the
+    # first cut at song_meta.intro_end_s, so we seek the music there so
+    # output t=0 lines up with the part of the song that's synced to.
+    song_start_s = float(
+        plan.get("song_start_s",
+                 plan.get("song_meta", {}).get("intro_end_s", 0.0))
+    )
+
+    song_inputs: list[str] = []
+    if song_start_s > 0.05:
+        song_inputs += ["-ss", f"{song_start_s:.3f}"]
+    song_inputs += ["-i", song]
+
     cmd = [
         "ffmpeg", "-y", "-v", "warning", "-stats",
         "-i", str(intermediate),
-        "-i", song,
+        *song_inputs,
         "-filter_complex", a_filter,
         "-map", "0:v",
         "-map", "[a_out]",

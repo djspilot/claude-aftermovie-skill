@@ -210,6 +210,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         "song": str(Path(args.song).expanduser().resolve()),
         "song_meta": song,
         "target_length_s": target_len,
+        "song_start_s": float(song["intro_end_s"]),
         "aspect": args.aspect,
         "resolution": args.res,
         "fps": args.fps,

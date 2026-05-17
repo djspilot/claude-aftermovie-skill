@@ -13,7 +13,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from aftermovie.analyze.clip import analyze_clip
+from aftermovie.analyze.clip import analyze_clip, discover_sources
 from aftermovie.config import (
     DEFAULT_TARGET_LEN_S,
     THEMES,
@@ -69,9 +69,16 @@ def get_plan(plan_id: str, include_entries: bool = True) -> dict[str, Any]:
 
 # ---- jobs ------------------------------------------------------------------
 
-@mcp.tool(description="Scan a folder of video clips, extract per-clip features, "
-                      "and store the catalog. Returns a job_id; poll with get_job.")
-def analyze_folder(path: str, force_reanalyze: bool = False) -> dict[str, Any]:
+@mcp.tool(description="Scan a folder for video clips + standalone stills "
+                      "(HEIC/JPG/PNG materialized as 2.5s Ken-Burns clips). "
+                      "Live Photo pairs (HEIC + same-stem MOV) keep only the MOV. "
+                      "Returns a job_id; poll with get_job.")
+def analyze_folder(
+    path: str,
+    force_reanalyze: bool = False,
+    still_duration_s: float = 2.5,
+    include_stills: bool = True,
+) -> dict[str, Any]:
     folder = Path(path).expanduser().resolve()
     if not folder.is_dir():
         raise FileNotFoundError(f"not a directory: {folder}")
@@ -84,9 +91,13 @@ def analyze_folder(path: str, force_reanalyze: bool = False) -> dict[str, Any]:
         except FileNotFoundError:
             pass
 
-    files = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix in VIDEO_EXTS)
+    files = discover_sources(folder, still_duration_s=still_duration_s,
+                             include_stills=include_stills)
     if not files:
-        raise FileNotFoundError(f"no video files in {folder} (looking for {sorted(VIDEO_EXTS)})")
+        raise FileNotFoundError(
+            f"no usable files in {folder} "
+            f"(videos: {sorted(VIDEO_EXTS)}; stills: heic/jpg/png — toggle with include_stills)"
+        )
 
     def _work(cancel):
         clips: list[dict[str, Any]] = []

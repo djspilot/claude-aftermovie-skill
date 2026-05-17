@@ -12,6 +12,11 @@ from aftermovie.analyze.audio import measure_audio_energy
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
+from aftermovie.analyze.stills import (
+    DEFAULT_STILL_DURATION_S,
+    find_stills_excluding_live_pairs,
+    materialize_still,
+)
 from aftermovie.config import VIDEO_EXTS
 from aftermovie.ffmpeg_cmd import ffprobe_json, log
 from aftermovie.telemetry.gpmf import extract_gpmf_track, parse_gpmf_motion
@@ -87,17 +92,48 @@ def analyze_clip(path: Path) -> ClipInfo | None:
     )
 
 
+def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURATION_S,
+                     include_stills: bool = True) -> list[Path]:
+    """Return the analyzable clip paths for a folder.
+
+    Includes:
+        * Native video files (VIDEO_EXTS) — used directly.
+        * Standalone stills (HEIC/JPG/PNG with no same-stem MOV) — materialized
+          to short mp4 clips in the cache and returned in their place.
+
+    Live-Photo pairs (still + same-stem MOV) keep only the MOV.
+    """
+    videos = sorted(
+        p for p in folder.rglob("*")
+        if p.is_file() and p.suffix in VIDEO_EXTS and not p.name.startswith(".")
+    )
+    sources: list[Path] = list(videos)
+    if include_stills:
+        stills = find_stills_excluding_live_pairs(folder)
+        if stills:
+            log(f"Materializing {len(stills)} stills ({still_duration_s}s each, "
+                f"Ken Burns zoom)...")
+            for s in stills:
+                mp4 = materialize_still(s, duration_s=still_duration_s)
+                if mp4 is not None:
+                    sources.append(mp4)
+    return sources
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     folder = Path(args.clips).expanduser().resolve()
     if not folder.is_dir():
         sys.exit(f"Not a directory: {folder}")
-    files = sorted(
-        p for p in folder.rglob("*")
-        if p.is_file() and p.suffix in VIDEO_EXTS
-    )
+    still_duration = float(getattr(args, "still_duration", DEFAULT_STILL_DURATION_S))
+    include_stills = not getattr(args, "no_stills", False)
+    files = discover_sources(folder, still_duration_s=still_duration,
+                             include_stills=include_stills)
     if not files:
-        sys.exit(f"No video files found in {folder} "
-                 f"(looking for: {', '.join(sorted(VIDEO_EXTS))})")
+        sys.exit(
+            f"No usable files found in {folder} "
+            f"(videos: {', '.join(sorted(VIDEO_EXTS))}; "
+            f"stills: .heic .heif .jpg .png — disable with --no-stills)"
+        )
     log(f"Analyzing {len(files)} clips in {folder}")
     catalog = []
     for f in files:

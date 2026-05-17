@@ -86,6 +86,18 @@ Ask up-front ONLY if missing:
 
 Everything else has a sensible default. Show the plan summary (n_cuts, total_length_s, bpm, sources_used) before rendering so the user can intervene. Don't ask "should I render now?" — propose, summarize, render.
 
+## Stills + Live Photos
+
+iPhone photo dumps mix video clips, Live Photos, and still HEIC/JPG. The analyzer handles all three:
+
+- **Native video** (`.mp4 .mov .m4v .insv .lrv`) — used directly.
+- **Live Photo pairs** — when a `*.HEIC`/`*.JPG` has a same-stem `*.MOV` next to it, the still is dropped (the MOV already carries the motion).
+- **Standalone stills** (`.heic .heif .jpg .jpeg .png`) — auto-materialized to 2.5-second mp4 clips with a subtle Ken Burns zoom, cached under `~/.skills-data/aftermovie/cache/stills/`. They participate in scoring like any other short clip.
+
+Pass `include_stills: false` (MCP) or `--no-stills` (CLI) to ignore photos. `--still-duration N` controls the per-still clip length.
+
+> Single-file Live Photos (HEIC with the MOV embedded as a metadata box) currently degrade to the first frame as a still. Extracting the embedded MOV needs `exiftool` and isn't wired up yet — mention this if a user's "Live Photo" looks frozen in the edit.
+
 ## Iterating on the plan
 
 If the user pushes back on the proposal — "too many cuts from clip_07.mp4" or "make it shorter" — apply tweak ops and re-render:

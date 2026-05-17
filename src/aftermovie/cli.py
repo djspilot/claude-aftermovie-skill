@@ -24,7 +24,12 @@ def cmd_auto(args: argparse.Namespace) -> None:
     catalog_path = workdir / "catalog.json"
     plan_path = workdir / "plan.json"
 
-    a = argparse.Namespace(clips=args.clips, out=str(catalog_path))
+    a = argparse.Namespace(
+        clips=args.clips,
+        out=str(catalog_path),
+        still_duration=getattr(args, "still_duration", 2.5),
+        no_stills=getattr(args, "no_stills", False),
+    )
     cmd_analyze(a)
 
     s = argparse.Namespace(
@@ -85,6 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
     pa = sub.add_parser("analyze", help="Scan a folder of clips and extract features.")
     pa.add_argument("--clips", required=True)
     pa.add_argument("--out", required=True)
+    pa.add_argument("--still-duration", type=float, default=2.5,
+                    help="Per-still clip duration (s) for HEIC/JPG/PNG materials.")
+    pa.add_argument("--no-stills", action="store_true",
+                    help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
     pa.set_defaults(func=cmd_analyze)
 
     ps = sub.add_parser("score", help="Build an edit plan from a catalog and song.")
@@ -103,6 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--clips", required=True)
     pu.add_argument("--song", required=True)
     pu.add_argument("--output", required=True)
+    pu.add_argument("--still-duration", type=float, default=2.5,
+                    help="Per-still clip duration (s) for HEIC/JPG/PNG materials.")
+    pu.add_argument("--no-stills", action="store_true",
+                    help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
     _add_score_flags(pu)
     pu.add_argument("--theme", default=None,
                     choices=sorted(THEMES.keys()),

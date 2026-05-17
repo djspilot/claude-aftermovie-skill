@@ -113,17 +113,67 @@ def build_candidates(catalog: dict[str, Any]) -> list[Candidate]:
     return candidates
 
 
+PACE_TO_FACTOR = {"fast": 1, "medium": 2, "slow": 4}
+
+
+def _auto_cut_points(beats: list[float], intro_end_s: float, target_len: float,
+                     energy_per_s: list[float]) -> list[float]:
+    """Energy-aware beat selection: pack cuts tighter during loud sections,
+    space them out during quiet ones. Targets ~1.5–2.5s per cut, never tighter
+    than 2 beats (so high-BPM songs don't strobe). Mirrors Quik's pacing arc.
+    """
+    out: list[float] = []
+    last_kept = -10**9
+    for i, t in enumerate(beats):
+        if t < intro_end_s or t >= target_len:
+            continue
+        idx = min(int(t), len(energy_per_s) - 1) if energy_per_s else 0
+        e = energy_per_s[idx] if energy_per_s else 0.5
+        # Higher numbers = sparser cuts. Floor at 2 so cuts always last
+        # at least ~1s on a typical 100-130 BPM song.
+        if e >= 0.8:
+            factor = 2
+        elif e >= 0.55:
+            factor = 3
+        elif e >= 0.3:
+            factor = 4
+        else:
+            factor = 6
+        if i - last_kept >= factor:
+            out.append(t)
+            last_kept = i
+    return out
+
+
 def build_plan(catalog: dict[str, Any], song: dict[str, Any],
-               target_len: float, no_speed_ramp: bool) -> list[dict[str, Any]]:
-    """Greedy-fill plan entries against the song's beat structure."""
+               target_len: float, no_speed_ramp: bool,
+               pace: str = "medium") -> list[dict[str, Any]]:
+    """Greedy-fill plan entries against the song's beat structure.
+
+    pace: "fast" (every beat) / "medium" (every 2nd beat) /
+          "slow" (every 4th beat — downbeats only) /
+          "auto" (energy-aware — fast on loud sections, slow on quiet ones).
+    """
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
     candidates = build_candidates(catalog)
 
-    cut_points = [b for b in song["beats"] if b >= song["intro_end_s"]]
-    if not cut_points:
-        cut_points = song["beats"]
-    cut_points = [t for t in cut_points if t < target_len]
+    if pace == "auto":
+        cut_points = _auto_cut_points(
+            song["beats"], song["intro_end_s"], target_len,
+            song.get("energy_per_s", []),
+        )
+        if not cut_points:
+            cut_points = [b for b in song["beats"]
+                          if song["intro_end_s"] <= b < target_len][::2]
+    else:
+        factor = PACE_TO_FACTOR.get(pace, 2)
+        cut_points = [b for b in song["beats"] if b >= song["intro_end_s"]]
+        if not cut_points:
+            cut_points = song["beats"]
+        if factor > 1:
+            cut_points = cut_points[::factor]
+        cut_points = [t for t in cut_points if t < target_len]
     cut_points.append(target_len)
 
     candidates.sort(key=lambda c: c.score, reverse=True)
@@ -160,9 +210,11 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
         )
         speed = 0.5 if wants_slowmo else 1.0
         src_time_needed = gap * speed
-        actual_end = min(pick.end_s, pick.start_s + src_time_needed)
-
         src_clip = by_source.get(pick.source, {})
+        # Extend up to the source's full duration when filling the slot — the
+        # candidate window is only the scoring centroid, not a usage cap.
+        src_dur = float(src_clip.get("duration_s", pick.end_s))
+        actual_end = min(src_dur, pick.start_s + src_time_needed)
         start_i = int(pick.start_s)
         end_i = max(start_i + 1, int(actual_end + 0.999))
         src_faces = src_clip.get("face_bboxes") or []
@@ -193,9 +245,13 @@ def cmd_score(args: argparse.Namespace) -> None:
         float(args.max_length) if args.max_length else DEFAULT_TARGET_LEN_S,
     )
 
-    entries = build_plan(catalog, song, target_len, args.no_speed_ramp)
-    if getattr(args, "transitions", "cut") == "auto":
-        decide_transitions(entries, song)
+    entries = build_plan(
+        catalog, song, target_len, args.no_speed_ramp,
+        pace=getattr(args, "pace", "medium"),
+    )
+    tmode = getattr(args, "transitions", "cut")
+    if tmode in ("auto", "soft"):
+        decide_transitions(entries, song, mode=tmode)
     log(f"Built {len(entries)} cuts over {target_len:.1f}s")
 
     titles: list[dict] = []

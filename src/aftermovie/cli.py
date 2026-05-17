@@ -13,6 +13,15 @@ from aftermovie.config import (
     DEFAULT_RES,
     THEMES,
 )
+from aftermovie.env_config import (
+    DEFAULT_CONFIG_TEMPLATE,
+    config_path,
+    env_bool,
+    env_float,
+    env_int,
+    env_str,
+    load_env_file,
+)
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.pipeline import cmd_render
 from aftermovie.score.scorer import cmd_score
@@ -44,7 +53,8 @@ def cmd_auto(args: argparse.Namespace) -> None:
         music_db=args.music_db,
         clip_db=args.clip_db,
         no_speed_ramp=args.no_speed_ramp,
-        audio_mix=getattr(args, "audio_mix", "music_only"),
+        audio_mix=getattr(args, "audio_mix", "ducked"),
+        pace=getattr(args, "pace", "medium"),
         transitions=getattr(args, "transitions", "cut"),
         titles=getattr(args, "titles", None),
         title_text=getattr(args, "title_text", None),
@@ -59,27 +69,44 @@ def cmd_auto(args: argparse.Namespace) -> None:
 
 
 def _add_score_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--max-length", "--length", dest="max_length", type=float, default=None,
+    p.add_argument("--max-length", "--length", dest="max_length", type=float,
+                   default=env_float("AFTERMOVIE_MAX_LENGTH", None),
                    help="Target output length in seconds (default: min(song, 90)). "
-                        "Pass an explicit value to cap shorter — the full song does NOT have "
-                        "to be used.")
-    p.add_argument("--aspect", default="16:9", choices=["16:9", "9:16", "1:1"])
-    p.add_argument("--res", default=DEFAULT_RES)
-    p.add_argument("--fps", type=int, default=DEFAULT_FPS)
-    p.add_argument("--lut", default=None)
-    p.add_argument("--music-db", type=float, default=DEFAULT_MUSIC_DB)
-    p.add_argument("--clip-db", type=float, default=DEFAULT_CLIP_DB)
-    p.add_argument("--no-speed-ramp", action="store_true")
-    p.add_argument("--audio-mix", default="music_only",
+                        "Env: AFTERMOVIE_MAX_LENGTH.")
+    p.add_argument("--aspect", default=env_str("AFTERMOVIE_ASPECT", "16:9"),
+                   choices=["16:9", "9:16", "1:1"])
+    p.add_argument("--res", default=env_str("AFTERMOVIE_RES", DEFAULT_RES))
+    p.add_argument("--fps", type=int, default=env_int("AFTERMOVIE_FPS", DEFAULT_FPS))
+    p.add_argument("--lut", default=env_str("AFTERMOVIE_LUT", None))
+    p.add_argument("--music-db", type=float,
+                   default=env_float("AFTERMOVIE_MUSIC_DB", DEFAULT_MUSIC_DB))
+    p.add_argument("--clip-db", type=float,
+                   default=env_float("AFTERMOVIE_CLIP_DB", DEFAULT_CLIP_DB))
+    p.add_argument("--no-speed-ramp", action="store_true",
+                   default=env_bool("AFTERMOVIE_NO_SPEED_RAMP", False))
+    p.add_argument("--audio-mix", default=env_str("AFTERMOVIE_AUDIO_MIX", "ducked"),
                    choices=["music_only", "ducked", "clip_only"],
-                   help="How to mix audio: music only, music+clip ducked, or clip only.")
-    p.add_argument("--transitions", default="cut", choices=["cut", "auto"],
-                   help="cut = hard cuts only; auto = let the scorer pick crossfade/whip.")
+                   help="How to mix audio: ducked (default — music + clip with "
+                        "voice-band sidechain), music_only, or clip_only. "
+                        "Env: AFTERMOVIE_AUDIO_MIX.")
+    p.add_argument("--pace", default=env_str("AFTERMOVIE_PACE", "medium"),
+                   choices=["fast", "medium", "slow", "auto"],
+                   help="fast = every beat (~0.5s cuts at 100bpm), "
+                        "medium (default) = every 2nd beat, "
+                        "slow = every 4th beat (downbeats only), "
+                        "auto = energy-aware (Quik-style: tight on drops, breathes on verses). "
+                        "Env: AFTERMOVIE_PACE.")
+    p.add_argument("--transitions", default=env_str("AFTERMOVIE_TRANSITIONS", "cut"),
+                   choices=["cut", "auto", "soft"],
+                   help="cut = hard cuts only; auto = scorer-picked crossfade/whip; "
+                        "soft = short crossfade on every cut. "
+                        "Env: AFTERMOVIE_TRANSITIONS.")
     p.add_argument("--titles", default=None,
                    help="Comma-separated list of title kinds (intro,outro).")
     p.add_argument("--title-text", default=None,
                    help="Title text applied to intro/outro cards.")
     p.add_argument("--no-reframe", action="store_true",
+                   default=env_bool("AFTERMOVIE_NO_REFRAME", False),
                    help="Disable face-aware reframing on 9:16 output.")
 
 
@@ -93,9 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     pa = sub.add_parser("analyze", help="Scan a folder of clips and extract features.")
     pa.add_argument("--clips", required=True)
     pa.add_argument("--out", required=True)
-    pa.add_argument("--still-duration", type=float, default=2.5,
+    pa.add_argument("--still-duration", type=float,
+                    default=env_float("AFTERMOVIE_STILL_DURATION", 2.5),
                     help="Per-still clip duration (s) for HEIC/JPG/PNG materials.")
     pa.add_argument("--no-stills", action="store_true",
+                    default=env_bool("AFTERMOVIE_NO_STILLS", False),
                     help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
     pa.set_defaults(func=cmd_analyze)
 
@@ -120,15 +149,71 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--no-stills", action="store_true",
                     help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
     _add_score_flags(pu)
-    pu.add_argument("--theme", default=None,
+    pu.add_argument("--theme", default=env_str("AFTERMOVIE_THEME", None),
                     choices=sorted(THEMES.keys()),
-                    help="Preset bundle (cinematic, punchy, chill, nostalgic).")
+                    help="Preset bundle (cinematic, punchy, chill, nostalgic). "
+                         "Env: AFTERMOVIE_THEME.")
     pu.set_defaults(func=cmd_auto)
 
     pd = sub.add_parser("doctor", help="Check environment (ffmpeg, deps, LUTs).")
     pd.set_defaults(func=cmd_doctor)
 
+    pc = sub.add_parser("init-config",
+                        help="Write a default env file at ~/.aftermovie/aftermovie.env.")
+    pc.add_argument("--force", action="store_true",
+                    help="Overwrite an existing config file.")
+    pc.set_defaults(func=cmd_init_config)
+
+    pl = sub.add_parser("show-config",
+                        help="Print the effective defaults (from env file + builtins).")
+    pl.set_defaults(func=cmd_show_config)
+
     return p
+
+
+def cmd_init_config(args: argparse.Namespace) -> None:
+    target = config_path()
+    if target.exists() and not args.force:
+        print(f"Config already exists at {target} (pass --force to overwrite).")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(DEFAULT_CONFIG_TEMPLATE)
+    print(f"Wrote default config to {target}")
+    print("Edit it to change defaults for `aftermovie auto`. CLI flags still win.")
+
+
+def cmd_show_config(args: argparse.Namespace) -> None:
+    p = config_path()
+    print(f"Config file: {p} ({'present' if p.is_file() else 'missing — run `aftermovie init-config`'})")
+    print()
+    print("Effective defaults (env file + builtins, before CLI flags):")
+    rows = [
+        ("AFTERMOVIE_THEME",          env_str("AFTERMOVIE_THEME", "(none)")),
+        ("AFTERMOVIE_ASPECT",         env_str("AFTERMOVIE_ASPECT", "16:9")),
+        ("AFTERMOVIE_RES",            env_str("AFTERMOVIE_RES", DEFAULT_RES)),
+        ("AFTERMOVIE_FPS",            env_int("AFTERMOVIE_FPS", DEFAULT_FPS)),
+        ("AFTERMOVIE_MAX_LENGTH",     env_float("AFTERMOVIE_MAX_LENGTH", None)),
+        ("AFTERMOVIE_STILL_DURATION", env_float("AFTERMOVIE_STILL_DURATION", 2.5)),
+        ("AFTERMOVIE_AUDIO_MIX",      env_str("AFTERMOVIE_AUDIO_MIX", "ducked")),
+        ("AFTERMOVIE_MUSIC_DB",       env_float("AFTERMOVIE_MUSIC_DB", DEFAULT_MUSIC_DB)),
+        ("AFTERMOVIE_CLIP_DB",        env_float("AFTERMOVIE_CLIP_DB", DEFAULT_CLIP_DB)),
+        ("AFTERMOVIE_PACE",           env_str("AFTERMOVIE_PACE", "medium")),
+        ("AFTERMOVIE_TRANSITIONS",    env_str("AFTERMOVIE_TRANSITIONS", "cut")),
+        ("AFTERMOVIE_NO_SPEED_RAMP",  env_bool("AFTERMOVIE_NO_SPEED_RAMP", False)),
+        ("AFTERMOVIE_NO_STILLS",      env_bool("AFTERMOVIE_NO_STILLS", False)),
+        ("AFTERMOVIE_NO_REFRAME",     env_bool("AFTERMOVIE_NO_REFRAME", False)),
+    ]
+    for k, v in rows:
+        print(f"  {k:30s} {v}")
+    theme = env_str("AFTERMOVIE_THEME", None)
+    if theme and theme in THEMES:
+        print()
+        print(f"Theme bundle for '{theme}' (each value only applied if user didn't override):")
+        for k, v in THEMES[theme].items():
+            if k == "description":
+                continue
+            print(f"  {k:30s} {v}")
+        print(f"  -- {THEMES[theme].get('description', '')}")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
@@ -141,8 +226,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     print("-----------------")
     ff = shutil.which("ffmpeg")
     fp = shutil.which("ffprobe")
+    et = shutil.which("exiftool")
     print(f"  ffmpeg:        {'OK ' + ff if ff else 'MISSING'}")
     print(f"  ffprobe:       {'OK ' + fp if fp else 'MISSING'}")
+    print(f"  exiftool:      {'OK ' + et if et else 'not installed (single-file Live Photos will be used as stills only)'}")
 
     for mod in ("librosa", "numpy", "soundfile", "scipy"):
         try:
@@ -169,19 +256,35 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Load user config first so env-backed argparse defaults pick it up.
+    load_env_file()
     args = build_parser().parse_args()
     if getattr(args, "theme", None):
-        preset = THEMES.get(args.theme, {})
-        for k, v in preset.items():
-            if k == "description":
-                continue
-            cur = getattr(args, k, None)
-            # Apply preset only if the user didn't explicitly set the flag.
-            # `lut` defaults to None; `music_db` defaults to DEFAULT_MUSIC_DB.
-            if k == "lut" and cur is None:
-                setattr(args, k, v)
-            elif k == "music_db" and cur == DEFAULT_MUSIC_DB:
-                setattr(args, k, v)
-            elif k == "no_speed_ramp" and cur is False:
-                setattr(args, k, v)
+        _apply_theme(args)
     args.func(args)
+
+
+# Per-flag "is this the built-in default?" check — used to decide whether the
+# theme's value should override. Anything the user explicitly set on the CLI
+# (or via the env file) stays untouched.
+_THEME_DEFAULTS = {
+    "lut": None,
+    "music_db": DEFAULT_MUSIC_DB,
+    "no_speed_ramp": False,
+    "transitions": "cut",
+    "audio_mix": "ducked",
+    "pace": "medium",
+}
+
+
+def _apply_theme(args: argparse.Namespace) -> None:
+    preset = THEMES.get(args.theme, {})
+    for k, v in preset.items():
+        if k == "description":
+            continue
+        cur = getattr(args, k, None)
+        baseline = _THEME_DEFAULTS.get(k)
+        # Only override when the field is still at the built-in default — that
+        # means the user did not set it on the CLI or in the env file.
+        if cur == baseline:
+            setattr(args, k, v)

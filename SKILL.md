@@ -86,6 +86,14 @@ Ask up-front ONLY if missing:
 
 Everything else has a sensible default. Show the plan summary (n_cuts, total_length_s, bpm, sources_used) before rendering so the user can intervene. Don't ask "should I render now?" — propose, summarize, render.
 
+## User-editable defaults (env file)
+
+`aftermovie init-config` writes `~/.aftermovie/aftermovie.env` with every knob the user might want to set as a default: theme, aspect, pace, transitions, audio_mix, music_db, etc. The CLI loads this file at startup so bare `aftermovie auto --clips ... --song ... --output ...` uses the user's preferences.
+
+CLI flags always win over the env file; the env file wins over built-in defaults. Run `aftermovie show-config` to inspect the effective values.
+
+If the user says "make all my auto edits ..." (e.g. "always vertical", "always punchy"), point them at this file — that's the right place to set it.
+
 ## Output length
 
 The full song does NOT have to be used. Default is `min(song_duration, 90s)` — pass `target_length_s` (MCP) or `--length`/`--max-length` (CLI) to cap shorter. Typical good lengths:

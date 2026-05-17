@@ -29,6 +29,19 @@ from aftermovie.render.titles import (
 from aftermovie.render.transitions import build_xfade_graph, has_non_cut
 
 
+def _source_has_audio(src: Path) -> bool:
+    """ffprobe whether the source has at least one audio stream."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", str(src)],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        return bool(out)
+    except subprocess.CalledProcessError:
+        return False
+
+
 def _aspect_dims(aspect: str, target_res: str) -> tuple[int, int]:
     w, h = (int(x) for x in target_res.split("x"))
     if aspect == "9:16":
@@ -47,6 +60,10 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     src = Path(entry["source"])
     duration = entry["end_s"] - entry["start_s"]
     speed = entry.get("speed", 1.0)
+    # The slot the planner wanted to fill. If the source ran short we still
+    # want the prerendered clip to be `out_duration_s` long so beat-sync holds
+    # — we hold the last frame (tpad) and silence-pad audio.
+    slot_dur = float(entry.get("out_duration_s", duration / max(speed, 0.0001)))
 
     target_w, target_h = _aspect_dims(aspect, target_res)
     vfilter: list[str] = []
@@ -74,25 +91,60 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     if lut:
         vfilter.append(f"lut3d={lut.as_posix()}")
     vfilter.append(f"fps={target_fps}")
+    # Hold the last frame if we couldn't read enough source to fill the slot.
+    native_out_dur = duration / max(speed, 0.0001)
+    pad_dur = max(0.0, slot_dur - native_out_dur)
+    if pad_dur > 0.05:
+        vfilter.append(f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}")
     vf = ",".join(vfilter)
 
-    cmd = [
-        "ffmpeg", "-y", "-v", "error",
+    final_dur = slot_dur
+    fade = min(0.04, final_dur / 4) if final_dur > 0 else 0.0
+
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    audio_input_idx = None
+    if keep_audio and not _source_has_audio(src):
+        # Inject a silent stereo track matched to the source duration so every
+        # prerendered clip carries an audio stream — keeps concat/sidechain stable.
+        cmd += ["-f", "lavfi", "-t", f"{duration:.3f}",
+                "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        audio_input_idx = 0
+    cmd += [
         "-ss", f"{entry['start_s']:.3f}",
         "-i", str(src),
-        "-t", f"{duration:.3f}",
         "-vf", vf,
     ]
+    video_input_idx = 1 if audio_input_idx is not None else 0
     if keep_audio:
-        cmd += [
-            "-af", f"atempo={max(0.5, min(2.0, speed)):.4f}" if speed != 1.0 else "anull",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2",
-        ]
+        a_steps: list[str] = []
+        if speed != 1.0:
+            a_steps.append(f"atempo={max(0.5, min(2.0, speed)):.4f}")
+        if pad_dur > 0.05:
+            # Pad audio with silence so it matches the tpad'd video length.
+            a_steps.append(f"apad=pad_dur={pad_dur:.3f}")
+        if fade > 0:
+            a_steps.append(f"afade=t=in:st=0:d={fade:.3f}")
+            a_steps.append(f"afade=t=out:st={max(0.0, final_dur - fade):.3f}:d={fade:.3f}")
+        # Hard-cap audio length so apad doesn't run on indefinitely.
+        a_steps.append(f"atrim=duration={final_dur:.3f}")
+        a_steps.append("asetpts=N/SR/TB")
+        a_filter = ",".join(a_steps) if a_steps else "anull"
+        if audio_input_idx is not None:
+            cmd += ["-filter_complex",
+                    f"[{video_input_idx}:v]{vf}[v];[{audio_input_idx}:a]{a_filter}[a]",
+                    "-map", "[v]", "-map", "[a]"]
+            # remove the -vf flag we already moved into filter_complex
+            vf_idx = cmd.index("-vf")
+            del cmd[vf_idx:vf_idx + 2]
+        else:
+            cmd += ["-af", a_filter]
+        cmd += ["-c:a", "aac", "-ar", "48000", "-ac", "2"]
     else:
         cmd += ["-an"]
     cmd += [
         "-c:v", "libx264", "-preset", "fast", "-crf", "20",
         "-pix_fmt", "yuv420p",
+        "-t", f"{slot_dur:.3f}",
         str(out_clip),
     ]
     try:
@@ -143,7 +195,10 @@ def cmd_render(args: argparse.Namespace) -> None:
             if not ok:
                 continue
             clip_paths.append(out_clip)
-            durations.append((entry["end_s"] - entry["start_s"]) / entry.get("speed", 1.0))
+            # The prerender pads to `out_duration_s` so beat-sync holds even
+            # when the source ran short. Use that as the authoritative duration.
+            native = (entry["end_s"] - entry["start_s"]) / entry.get("speed", 1.0)
+            durations.append(float(entry.get("out_duration_s", native)))
 
         if not clip_paths:
             sys.exit("No clips rendered. Aborting.")
@@ -202,7 +257,9 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
         inputs += ["-loop", "1", "-i", str(p)]
 
     n_clips = len(clip_paths)
-    xfade_graph, video_label = build_xfade_graph(n_clips, durations, entries)
+    xfade_graph, video_label = build_xfade_graph(
+        n_clips, durations, entries, target_fps=target_fps,
+    )
 
     parts: list[str] = []
     if xfade_graph:
@@ -217,16 +274,34 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
             final_v = "v_out"
 
     if keep_audio:
-        a_concat = "".join(f"[{i}:a]" for i in range(n_clips))
-        parts.append(f"{a_concat}concat=n={n_clips}:v=0:a=1[a_out]")
+        # If any soft/auto crossfade transitions are active, glue audio with
+        # acrossfade so seams match the video xfade. Otherwise plain concat.
+        soft_audio = any(
+            (e.get("transition_in", {}).get("kind") or "cut") != "cut"
+            for e in entries
+        )
+        if soft_audio and n_clips > 1:
+            last = "0:a"
+            for i in range(1, n_clips):
+                tdur = float(entries[i].get("transition_in", {}).get("duration_s") or 0.1)
+                tdur = max(0.05, min(0.5, tdur))
+                label = f"axf{i}" if i < n_clips - 1 else "a_out"
+                parts.append(
+                    f"[{last}][{i}:a]acrossfade=d={tdur:.3f}:c1=tri:c2=tri[{label}]"
+                )
+                last = label
+        else:
+            a_concat = "".join(f"[{i}:a]" for i in range(n_clips))
+            parts.append(f"{a_concat}concat=n={n_clips}:v=0:a=1[a_out]")
 
     filter_complex = ";".join(parts) if parts else ""
 
     cmd = ["ffmpeg", "-y", "-v", "error"] + inputs
     if filter_complex:
         cmd += ["-filter_complex", filter_complex]
-    map_v = "0:v" if final_v == "0:v" else f"[{final_v}]"
-    cmd += ["-map", map_v]
+    # build_xfade_graph now normalizes the single-input case too, so final_v
+    # is always a labeled stream (e.g. "v0"/"seg0"/"x42").
+    cmd += ["-map", f"[{final_v}]"]
     if keep_audio:
         cmd += ["-map", "[a_out]", "-c:a", "aac", "-b:a", "192k"]
     else:
@@ -246,6 +321,25 @@ def _final_mux(intermediate: Path, plan: dict, output: Path,
     song = plan["song"]
     music_db = plan.get("music_db", -8)
     a_filter = audio_filtergraph(audio_mix, music_db)
+
+    # Probe intermediate duration so we can fade the final audio out at the tail.
+    try:
+        dur = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(intermediate)],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        dur = 0.0
+    # Scale the fade to the output length: 1.5s tail for normal-length edits,
+    # shorter when the output is very short. Always at least 200ms.
+    fade_out_d = max(0.2, min(1.5, dur * 0.05))
+    if dur > fade_out_d + 0.1:
+        fade_start = max(0.0, dur - fade_out_d)
+        a_filter = (
+            a_filter.replace("[a_out]", "[a_pre]")
+            + f";[a_pre]afade=t=out:st={fade_start:.3f}:d={fade_out_d:.3f}[a_out]"
+        )
 
     # Where in the song do the cuts actually live? The planner places the
     # first cut at song_meta.intro_end_s, so we seek the music there so

@@ -15,7 +15,8 @@ from aftermovie.analyze.motion import measure_motion_energy
 from aftermovie.analyze.stills import (
     DEFAULT_STILL_DURATION_S,
     _is_excluded_output,
-    find_stills_excluding_live_pairs,
+    _under_skipped_dir,
+    find_live_photos_and_stills,
     materialize_still,
 )
 from aftermovie.config import VIDEO_EXTS
@@ -109,11 +110,20 @@ def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURAT
         if (p.is_file()
             and p.suffix in VIDEO_EXTS
             and not p.name.startswith(".")
-            and not _is_excluded_output(p))
+            and not _is_excluded_output(p)
+            and not _under_skipped_dir(p, folder))
     )
     sources: list[Path] = list(videos)
     if include_stills:
-        stills = find_stills_excluding_live_pairs(folder)
+        live_movs, stills, orphan_markers = find_live_photos_and_stills(folder)
+        if live_movs:
+            log(f"Extracted {len(live_movs)} Live Photo video(s) from single-file HEICs.")
+            sources.extend(live_movs)
+        if orphan_markers:
+            log(f"  ! {orphan_markers} HEIC(s) were Live Photos but the MOV portion "
+                f"wasn't in the export — they'll be used as stills. To keep the "
+                f"motion, re-export from Photos.app with 'Keep Originals' or "
+                f"AirDrop the Live Photo directly.")
         if stills:
             log(f"Materializing {len(stills)} stills ({still_duration_s}s each, "
                 f"Ken Burns zoom)...")

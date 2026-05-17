@@ -24,6 +24,16 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 echo "    ffmpeg:   $(ffmpeg -version | head -n1)"
 
+# ---- exiftool (optional — for single-file Live Photo extraction) -------------
+if command -v exiftool >/dev/null 2>&1; then
+  echo "    exiftool: $(exiftool -ver) (enables single-file Live Photo motion)"
+else
+  echo "    exiftool: not installed — install to extract motion from single-file"
+  echo "              iPhone Live Photos / Pixel Motion Photos:"
+  echo "                brew install exiftool          (macOS)"
+  echo "                apt-get install -y libimage-exiftool-perl  (Debian/Ubuntu)"
+fi
+
 # ---- Python (3.10 - 3.12) ----------------------------------------------------
 pick_python() {
   for cand in python3.12 python3.11 python3.10 python3; do

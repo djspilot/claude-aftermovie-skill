@@ -44,6 +44,16 @@ DEFAULT_STILL_DURATION_S = 2.5
 # Matched as case-insensitive substring against the file name.
 OUTPUT_NAME_HINTS = ("aftermovie", "_aftermovie", "highlight_reel", "recap")
 
+# Subdirectories that should not be recursed into. These are workaround /
+# staging folders the user (or a prior session) created for source
+# conversions; if we ingest both the original AND the staging copy we get
+# every clip listed under two different paths and the per-source repetition
+# cap is silently doubled.
+SKIP_DIR_NAMES = {
+    "_aftermovie_src", "_aftermovie", "aftermovie_workdir",
+    "__pycache__", ".git", "node_modules", ".cache",
+}
+
 
 def _stills_cache_dir() -> Path:
     d = data_dir() / "cache" / "stills"
@@ -60,6 +70,50 @@ def _cache_key(path: Path, duration_s: float, target_res: str) -> str:
     return hashlib.sha1(seed.encode()).hexdigest()[:16]
 
 
+def _under_skipped_dir(p: Path, root: Path) -> bool:
+    """True if any ancestor between p and root is in SKIP_DIR_NAMES."""
+    try:
+        rel = p.relative_to(root)
+    except ValueError:
+        return False
+    return any(part in SKIP_DIR_NAMES for part in rel.parts[:-1])
+
+
+def find_live_photos_and_stills(folder: Path) -> tuple[list[Path], list[Path], int]:
+    """Split a folder's still files into (extracted_live_photo_movs, stills, n_orphan_live_marker).
+
+    For each HEIC/JPG that has no same-stem MOV sibling, probe for an embedded
+    Live Photo / Motion Photo video and extract it into the cache. Successful
+    extractions are returned as MOV paths the analyzer should treat as video.
+    Failed extractions (or non-Live-Photo files) fall through to the stills list.
+
+    `n_orphan_live_marker` counts HEICs that have an Apple ContentIdentifier
+    but no extractable video — i.e. were Live Photos whose motion portion was
+    dropped during export. The caller surfaces this as a hint to re-export.
+    """
+    from aftermovie.analyze.live_photo import (
+        exiftool_available,
+        has_live_photo_marker,
+        live_photo_video_path,
+    )
+
+    stills = find_stills_excluding_live_pairs(folder)
+    movs: list[Path] = []
+    real_stills: list[Path] = []
+    orphan_markers = 0
+    et_ok = exiftool_available()
+
+    for s in stills:
+        mov = live_photo_video_path(s) if et_ok else None
+        if mov is not None:
+            movs.append(mov)
+            continue
+        if et_ok and s.suffix.lower() in (".heic", ".heif") and has_live_photo_marker(s):
+            orphan_markers += 1
+        real_stills.append(s)
+    return movs, real_stills, orphan_markers
+
+
 def find_stills_excluding_live_pairs(folder: Path) -> list[Path]:
     """Return the still files that have NO same-stem video sibling.
 
@@ -70,7 +124,9 @@ def find_stills_excluding_live_pairs(folder: Path) -> list[Path]:
         return []
     by_stem: dict[str, list[Path]] = {}
     for p in folder.rglob("*"):
-        if p.is_file() and not p.name.startswith("."):
+        if (p.is_file()
+                and not p.name.startswith(".")
+                and not _under_skipped_dir(p, folder)):
             by_stem.setdefault(p.stem, []).append(p)
     out: list[Path] = []
     for stem, files in by_stem.items():

@@ -131,7 +131,8 @@ def propose_plan(
     theme: str | None = None,
     target_length_s: float | None = None,
     aspect: str = "16:9",
-    audio_mix: str = "music_only",
+    audio_mix: str = "ducked",
+    pace: str = "medium",
     transitions: str = "cut",
     titles: list[dict[str, Any]] | None = None,
     reframe: bool = True,
@@ -144,7 +145,8 @@ def propose_plan(
     theme_cfg = THEMES.get(theme, {}) if theme else {}
     no_speed_ramp = bool(theme_cfg.get("no_speed_ramp", False))
 
-    entries = build_plan(catalog, song, target_len=target, no_speed_ramp=no_speed_ramp)
+    entries = build_plan(catalog, song, target_len=target,
+                          no_speed_ramp=no_speed_ramp, pace=pace)
     if transitions == "auto":
         decide_transitions(entries, song)
 
@@ -163,6 +165,7 @@ def propose_plan(
         "music_db": theme_cfg.get("music_db", -8.0),
         "clip_db": -18.0,
         "audio_mix": audio_mix,
+        "pace": pace,
         "transitions": transitions,
         "titles": titles or [],
         "reframe": reframe,

@@ -31,10 +31,27 @@ def analyze_song(song_path: Path) -> dict[str, Any]:
     else:
         intro_end = 0.0
 
+    # Per-second RMS energy — used for pace=auto so cuts pack tighter during
+    # loud sections and breathe during quieter ones. Normalised to [0, 1].
+    hop = 512
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
+    rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
+    sec_count = int(np.ceil(duration))
+    energy_per_s = np.zeros(sec_count, dtype=float)
+    if sec_count > 0 and len(rms) > 0:
+        for i in range(sec_count):
+            mask = (rms_times >= i) & (rms_times < i + 1)
+            if mask.any():
+                energy_per_s[i] = float(rms[mask].mean())
+        emax = float(energy_per_s.max())
+        if emax > 0:
+            energy_per_s = energy_per_s / emax
+
     return {
         "duration_s": duration,
         "tempo_bpm": tempo_val,
         "beats": beats,
         "downbeats": downbeats,
         "intro_end_s": intro_end,
+        "energy_per_s": energy_per_s.tolist(),
     }

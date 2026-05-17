@@ -20,14 +20,26 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".insv", ".lrv", ".MP4", ".MOV", ".M4V"}
 # ---- Theme presets -----------------------------------------------------------
 
 THEMES: dict[str, dict] = {
-    "cinematic": {"lut": "cinematic", "music_db": -10.0, "no_speed_ramp": False,
-                  "description": "Neutral cool LUT, lifted blacks, music -10dB"},
-    "punchy":    {"lut": "punchy",    "music_db": -6.0,  "no_speed_ramp": False,
-                  "description": "High-contrast, saturated, music -6dB"},
-    "chill":     {"lut": "chill",     "music_db": -10.0, "no_speed_ramp": True,
-                  "description": "Desaturated, warm, no speed ramps"},
-    "nostalgic": {"lut": "nostalgic", "music_db": -10.0, "no_speed_ramp": False,
-                  "description": "Film-look fade, yellow highlights"},
+    "cinematic": {
+        "lut": "cinematic", "music_db": -9.0, "no_speed_ramp": False,
+        "transitions": "soft", "audio_mix": "ducked", "pace": "medium",
+        "description": "Glide-y crossfades, ducked audio — looks like a Quik edit.",
+    },
+    "punchy": {
+        "lut": "punchy", "music_db": -6.0, "no_speed_ramp": False,
+        "transitions": "auto", "audio_mix": "ducked", "pace": "fast",
+        "description": "Fast cuts, whips on peaks, hot music — hype mode.",
+    },
+    "chill": {
+        "lut": "chill", "music_db": -10.0, "no_speed_ramp": True,
+        "transitions": "soft", "audio_mix": "ducked", "pace": "slow",
+        "description": "Slow downbeat pacing, soft crossfades, no ramps.",
+    },
+    "nostalgic": {
+        "lut": "nostalgic", "music_db": -10.0, "no_speed_ramp": False,
+        "transitions": "soft", "audio_mix": "ducked", "pace": "medium",
+        "description": "Film-look LUT, warm fades, ducked voice-aware audio.",
+    },
 }
 
 # ---- Paths -------------------------------------------------------------------

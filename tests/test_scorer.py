@@ -90,7 +90,7 @@ def test_speed_ramp_fires_when_all_three_conditions_hold():
     }
     plan = build_plan(catalog, song, target_len=6.0, no_speed_ramp=False)
     assert plan, "plan should have at least one entry"
-    assert any(e["speed"] == 0.5 for e in plan), \
+    assert any(e["speed_start"] == 0.4 for e in plan), \
         f"expected at least one slow-mo cut, got speeds {[e['speed'] for e in plan]}"
 
 

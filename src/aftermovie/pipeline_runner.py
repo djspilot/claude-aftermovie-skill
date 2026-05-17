@@ -54,6 +54,29 @@ class AutoOpts:
     title_text: str | None = None
     source_cap: int = 1
     chronological: bool = True
+    preview: bool = False
+    reveal: bool = True
+
+
+# Preview-mode overrides — applied after theme expansion so --preview wins.
+_PREVIEW_RES_BY_ASPECT = {
+    "16:9": "854x480",
+    "9:16": "480x854",
+    "1:1":  "480x480",
+}
+PREVIEW_FPS = 24
+PREVIEW_MARKER = "[PREVIEW MODE — quarter-res, no LUT]"
+
+
+def _apply_preview_overrides(opts: "AutoOpts") -> "AutoOpts":
+    """Knock down resolution / fps / LUT / reframe for a fast iteration render."""
+    if not opts.preview:
+        return opts
+    opts.res = _PREVIEW_RES_BY_ASPECT.get(opts.aspect, "854x480")
+    opts.fps = PREVIEW_FPS
+    opts.lut = None
+    opts.no_reframe = True
+    return opts
 
 
 # Per-field "is this still the built-in default?" snapshot. The theme bundle
@@ -108,6 +131,9 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
     (logged on completion).
     """
     opts = _apply_theme(opts)
+    opts = _apply_preview_overrides(opts)
+    if opts.preview:
+        log(PREVIEW_MARKER)
 
     clips_path = Path(clips).expanduser().resolve()
     song_path = Path(song).expanduser().resolve()
@@ -157,4 +183,40 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
     cmd_render(r)
 
     log(f"Intermediate files preserved in: {workdir}")
+    if opts.reveal:
+        _notify_and_reveal(output_path)
     return output_path
+
+
+def _notify_and_reveal(output_path: Path) -> None:
+    """macOS-only: post a notification and reveal the file in Finder.
+
+    No-op on non-tty / non-macOS / when osascript isn't available, so the MCP
+    server and CI runs stay quiet.
+    """
+    import shutil
+    import subprocess
+    import sys
+
+    if not sys.stdout.isatty():
+        return
+    if sys.platform != "darwin":
+        return
+    osa = shutil.which("osascript")
+    if osa:
+        try:
+            subprocess.run(
+                [osa, "-e",
+                 f'display notification "{output_path.name} ready" '
+                 f'with title "aftermovie"'],
+                check=False, capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    op = shutil.which("open")
+    if op:
+        try:
+            subprocess.run([op, "-R", str(output_path)],
+                           check=False, capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass

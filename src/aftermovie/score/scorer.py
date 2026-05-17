@@ -12,6 +12,8 @@ from aftermovie.render.transitions import decide_transitions
 from aftermovie.score.song import analyze_song
 from aftermovie.types import Candidate
 
+DEFAULT_BURST_WINDOW_S = 3.0
+
 
 def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, list[str]]:
     """
@@ -113,6 +115,67 @@ def build_candidates(catalog: dict[str, Any]) -> list[Candidate]:
     return candidates
 
 
+def _source_captured_at(src_clip: dict[str, Any]) -> float | None:
+    """Best-effort capture timestamp for a source clip. Returns None when
+    missing — caller leaves the source in place."""
+    ts = src_clip.get("captured_at")
+    if ts is None:
+        return None
+    try:
+        return float(ts)
+    except (TypeError, ValueError):
+        return None
+
+
+def _suppress_bursts(candidates: list[Candidate],
+                     by_source: dict[str, dict[str, Any]],
+                     window_s: float = DEFAULT_BURST_WINDOW_S) -> list[Candidate]:
+    """Drop candidates from sources whose capture time is within `window_s`
+    of a higher-scored sibling. Clustering is at the SOURCE level; only the
+    cluster's best-scored source keeps its candidates. `window_s <= 0` disables."""
+    if window_s <= 0 or not candidates:
+        return candidates
+
+    max_score: dict[str, float] = {}
+    for c in candidates:
+        if c.score > max_score.get(c.source, float("-inf")):
+            max_score[c.source] = c.score
+
+    timed: list[tuple[float, str]] = []
+    for src in max_score:
+        ts = _source_captured_at(by_source.get(src, {"path": src}))
+        if ts is not None:
+            timed.append((ts, src))
+    timed.sort()
+
+    suppressed: set[str] = set()
+    cluster: list[str] = []
+    last_ts: float | None = None
+    for ts, src in timed:
+        if last_ts is None or (ts - last_ts) <= window_s:
+            cluster.append(src)
+        else:
+            if len(cluster) > 1:
+                best = max(cluster, key=lambda s: max_score[s])
+                suppressed.update(s for s in cluster if s != best)
+            cluster = [src]
+        last_ts = ts
+    if len(cluster) > 1:
+        best = max(cluster, key=lambda s: max_score[s])
+        suppressed.update(s for s in cluster if s != best)
+
+    if not suppressed:
+        return candidates
+    # Safety: if we'd drop > 70% of timed sources, the timestamps are almost
+    # certainly bogus (e.g. all-from-mtime after `cp -r` collapsed them into
+    # the same second). Skip suppression rather than gut the catalog.
+    if len(timed) >= 3 and len(suppressed) / max(len(timed), 1) > 0.50:
+        return candidates
+    log(f"burst-suppress: dropped {len(suppressed)} source(s) within "
+        f"{window_s:.1f}s of a higher-scored sibling")
+    return [c for c in candidates if c.source not in suppressed]
+
+
 PACE_TO_FACTOR = {"fast": 1, "medium": 2, "slow": 4}
 
 
@@ -212,33 +275,33 @@ def allocate_candidates(candidates: list[Candidate],
 
 
 def decide_speed(pick: Candidate, beat_t: float,
-                 song: dict[str, Any], no_speed_ramp: bool) -> float:
-    """Return 0.5 for a slow-mo ramp, 1.0 otherwise.
+                 song: dict[str, Any], no_speed_ramp: bool) -> tuple[float, float]:
+    """Return (start_speed, end_speed) for a candidate cut.
 
-    A speed ramp fires only when ALL hold:
-    - `no_speed_ramp` is False
-    - the source is shot at >= 90 fps (so 0.5x stays smooth)
-    - the cut lands within 50ms of a downbeat
-    - the candidate scored on an action reason
-      (`high_accel_jump`, `motion_peak`, or `hilight_tag`)
+    Beat-anchored ramp: when a high-fps source lands on a downbeat with an
+    action-peak reason, we ramp 0.4x → 1.0x across the slot so the cut
+    "lands" on the beat at full speed. Otherwise flat (1.0, 1.0).
     """
     if no_speed_ramp:
-        return 1.0
+        return (1.0, 1.0)
     if pick.src_fps < 90:
-        return 1.0
+        return (1.0, 1.0)
     on_downbeat = any(abs(beat_t - db) < 0.05 for db in song["downbeats"])
     if not on_downbeat:
-        return 1.0
+        return (1.0, 1.0)
     if not any(r in ("high_accel_jump", "motion_peak", "hilight_tag") for r in pick.reasons):
-        return 1.0
-    return 0.5
+        return (1.0, 1.0)
+    return (0.4, 1.0)
 
 
 def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                target_len: float, no_speed_ramp: bool,
                pace: str = "medium",
                source_cap: int = 3,
-               chronological: bool = True) -> list[dict[str, Any]]:
+               chronological: bool = True,
+               burst_window_s: float = DEFAULT_BURST_WINDOW_S,
+               hook: bool = True,
+               climax: bool = True) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure.
 
     Orchestrates three seams:
@@ -260,6 +323,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
     candidates = build_candidates(catalog)
+    candidates = _suppress_bursts(candidates, by_source, window_s=burst_window_s)
     cut_points = select_cut_points(song, target_len, pace)
     picks = allocate_candidates(candidates, cut_points, source_cap=source_cap)
 
@@ -269,11 +333,34 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             ts = src.get("captured_at")
             return float(ts) if ts is not None else float("inf")
 
-        # Re-bind picks to beat anchors in capture-time order. Anchors stay
-        # at their original times; only the (anchor → pick) pairing changes.
         beats = [b for b, _ in picks]
         sorted_picks = sorted([p for _, p in picks], key=_captured)
-        picks = list(zip(beats, sorted_picks))
+        n = len(sorted_picks)
+        # Skip the trailer arc on very short plans (<8 cuts) — the curve has
+        # no room to breathe and ends up dropping entries.
+        if n < 8 or (not hook and not climax):
+            picks = list(zip(beats, sorted_picks))
+        else:
+            by_score = sorted([p for _, p in picks],
+                              key=lambda p: p.score, reverse=True)
+            climax_n = max(1, n // 4) if climax else 0
+            hook_pick = by_score[0] if hook else None
+            # Hook is removed from climax_set FIRST, then climax_tail is
+            # padded from the next-best non-hook picks so we never shrink.
+            climax_pool = [p for p in by_score
+                           if hook_pick is None or id(p) is not id(hook_pick)]
+            climax_tail = climax_pool[:climax_n]
+            climax_ids = {id(p) for p in climax_tail}
+            if hook_pick is not None:
+                climax_ids.add(id(hook_pick))
+            body = [p for p in sorted_picks if id(p) not in climax_ids]
+            new_order = ([hook_pick] if hook_pick else []) + body + climax_tail
+            # Guarantee we fill every beat anchor — if hook+climax math
+            # under-fills (rare edge), pad from sorted_picks tail.
+            if len(new_order) < n:
+                used = {id(p) for p in new_order}
+                new_order += [p for p in sorted_picks if id(p) not in used]
+            picks = list(zip(beats, new_order[:n]))
 
     # Map beat_t → next cut so we can recover the slot duration per pick.
     next_cut: dict[float, float] = {}
@@ -283,7 +370,10 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     plan_entries: list[dict[str, Any]] = []
     for beat_t, pick in picks:
         gap = next_cut[beat_t] - beat_t
-        speed = decide_speed(pick, beat_t, song, no_speed_ramp)
+        speed_start, speed_end = decide_speed(pick, beat_t, song, no_speed_ramp)
+        # Use start-speed for slot-fill math (matches the legacy single-speed
+        # behaviour); the renderer applies the ramp internally.
+        speed = speed_start
         src_time_needed = gap * speed
         src_clip = by_source.get(pick.source, {})
         # Extend up to the source's full duration when filling the slot — the
@@ -308,6 +398,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "end_s": actual_end,
             "out_duration_s": gap,
             "speed": speed,
+            "speed_start": speed_start,
+            "speed_end": speed_end,
             "beat_time_s": beat_t,
             "score": pick.score,
             "reasons": pick.reasons,
@@ -335,6 +427,11 @@ def cmd_score(args: argparse.Namespace) -> None:
         pace=getattr(args, "pace", "medium"),
         source_cap=int(getattr(args, "source_cap", 1) or 1),
         chronological=bool(getattr(args, "chronological", True)),
+        burst_window_s=float(getattr(args, "burst_window_s",
+                                      DEFAULT_BURST_WINDOW_S)
+                              or DEFAULT_BURST_WINDOW_S),
+        hook=bool(getattr(args, "hook", True)),
+        climax=bool(getattr(args, "climax", True)),
     )
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):

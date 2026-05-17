@@ -90,6 +90,7 @@ def _decide_soft(entries: list[dict[str, Any]],
         return
     energy: list[float] = list(song_meta.get("energy_per_s") or [])
     downbeats: list[float] = list(song_meta.get("downbeats") or [])
+    onset_peaks: list[float] = list(song_meta.get("onset_peaks") or [])
     scores = sorted(float(e.get("score", 0)) for e in entries)
     top_idx = max(0, int(0.85 * len(scores)) - 1)
     top_score = scores[top_idx] if scores else 0.0
@@ -99,6 +100,12 @@ def _decide_soft(entries: list[dict[str, Any]],
         beat_t = float(e.get("beat_time_s", 0.0))
         score = float(e.get("score", 0))
         reasons = set(e.get("reasons", []) or [])
+
+        # Hard cut if a strong onset hits within ±0.1s of the beat — lines the
+        # visual cut up with a snare/kick/vocal entrance.
+        if any(abs(beat_t - p) < 0.10 for p in onset_peaks):
+            e["transition_in"] = {"kind": "cut", "duration_s": 0.0}
+            continue
 
         # Hard cut on real action peaks — lands harder than a dissolve.
         if reasons & _PEAK_REASONS and score >= top_score:

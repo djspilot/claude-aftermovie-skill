@@ -31,6 +31,22 @@ def analyze_song(song_path: Path) -> dict[str, Any]:
     else:
         intro_end = 0.0
 
+    # Strong onset peaks — used by the soft-transition heuristic to force a
+    # hard cut on snare/kick hits so the visual cut lands with the song.
+    onset_peaks: list[float] = []
+    if len(onset_env) > 0:
+        peak_frames = librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=sr, units="frames",
+        )
+        if len(peak_frames):
+            strong_thr = float(np.percentile(onset_env, 92))
+            peak_frames_arr = np.asarray(peak_frames, dtype=int)
+            strong_mask = onset_env[peak_frames_arr] > strong_thr
+            strong_frames = peak_frames_arr[strong_mask]
+            if len(strong_frames):
+                peak_times = onset_times[strong_frames]
+                onset_peaks = sorted(float(t) for t in peak_times.tolist())
+
     # Per-second RMS energy — used for pace=auto so cuts pack tighter during
     # loud sections and breathe during quieter ones. Normalised to [0, 1].
     hop = 512
@@ -54,4 +70,5 @@ def analyze_song(song_path: Path) -> dict[str, Any]:
         "downbeats": downbeats,
         "intro_end_s": intro_end,
         "energy_per_s": energy_per_s.tolist(),
+        "onset_peaks": onset_peaks,
     }

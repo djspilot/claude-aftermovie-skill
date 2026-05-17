@@ -97,15 +97,15 @@ def test_decide_speed_requires_high_fps():
     # 30fps with every other condition satisfied → must stay 1.0.
     low = Candidate(source="/a.mp4", start_s=0.0, end_s=2.0,
                     src_fps=30.0, reasons=["high_accel_jump"])
-    assert decide_speed(low, 0.0, song, no_speed_ramp=False) == 1.0
+    assert decide_speed(low, 0.0, song, no_speed_ramp=False) == (1.0, 1.0)
     # Just below threshold.
     sub = Candidate(source="/b.mp4", start_s=0.0, end_s=2.0,
                     src_fps=89.0, reasons=["motion_peak"])
-    assert decide_speed(sub, 2.0, song, no_speed_ramp=False) == 1.0
+    assert decide_speed(sub, 2.0, song, no_speed_ramp=False) == (1.0, 1.0)
     # Exactly 90fps with all conditions satisfied → slowmo fires.
     high = Candidate(source="/c.mp4", start_s=0.0, end_s=2.0,
                      src_fps=90.0, reasons=["hilight_tag"])
-    assert decide_speed(high, 0.0, song, no_speed_ramp=False) == 0.5
+    assert decide_speed(high, 0.0, song, no_speed_ramp=False) == (0.4, 1.0)
 
 
 def test_decide_speed_requires_downbeat():
@@ -114,7 +114,7 @@ def test_decide_speed_requires_downbeat():
     high = Candidate(source="/c.mp4", start_s=0.0, end_s=2.0,
                      src_fps=240.0, reasons=["high_accel_jump"])
     # 2.0 is not within 0.05s of any downbeat (0.0 or 4.0).
-    assert decide_speed(high, 2.0, song, no_speed_ramp=False) == 1.0
+    assert decide_speed(high, 2.0, song, no_speed_ramp=False) == (1.0, 1.0)
 
 
 def test_decide_speed_requires_action_reason():
@@ -122,7 +122,7 @@ def test_decide_speed_requires_action_reason():
     song = {"downbeats": [0.0]}
     boring = Candidate(source="/c.mp4", start_s=0.0, end_s=2.0,
                        src_fps=240.0, reasons=["face_present", "loud_audio"])
-    assert decide_speed(boring, 0.0, song, no_speed_ramp=False) == 1.0
+    assert decide_speed(boring, 0.0, song, no_speed_ramp=False) == (1.0, 1.0)
 
 
 def test_decide_speed_no_speed_ramp_flag_forces_one():
@@ -130,4 +130,4 @@ def test_decide_speed_no_speed_ramp_flag_forces_one():
     song = {"downbeats": [0.0]}
     high = Candidate(source="/c.mp4", start_s=0.0, end_s=2.0,
                      src_fps=240.0, reasons=["high_accel_jump"])
-    assert decide_speed(high, 0.0, song, no_speed_ramp=True) == 1.0
+    assert decide_speed(high, 0.0, song, no_speed_ramp=True) == (1.0, 1.0)

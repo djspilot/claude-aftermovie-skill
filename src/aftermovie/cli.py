@@ -38,7 +38,7 @@ def _cli_overrides_from(args: argparse.Namespace) -> dict[str, object]:
         "aspect", "res", "fps", "max_length", "still_duration", "no_stills",
         "audio_mix", "music_db", "clip_db", "pace", "transitions",
         "no_speed_ramp", "no_reframe", "lut",
-        "source_cap", "chronological",
+        "source_cap", "chronological", "preview",
     )
     out: dict[str, object] = {}
     for k in keys:
@@ -80,6 +80,8 @@ def cmd_auto(args: argparse.Namespace) -> None:
         args.output = str(out_dir / f"aftermovie-{clips_name}.mp4")
         log(f"Output → {args.output}")
     opts = opts_from_namespace(args)
+    if getattr(args, "no_reveal", None):
+        opts.reveal = False
     run_auto(Path(args.clips), Path(args.song), Path(args.output), opts)
 
 
@@ -196,6 +198,14 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=sorted(THEMES.keys()),
                     help="Preset bundle (cinematic, punchy, chill, nostalgic). "
                          "Env: AFTERMOVIE_THEME.")
+    pu.add_argument("--preview", dest="preview",
+                    action="store_const", const=True, default=None,
+                    help="Fast-iteration render: quarter-res, 24fps, no LUT, "
+                         "no reframe. ~5-8s per render. "
+                         "Env: AFTERMOVIE_PREVIEW.")
+    pu.add_argument("--no-reveal", dest="no_reveal",
+                    action="store_const", const=True, default=None,
+                    help="Skip the macOS notification + Finder reveal at end.")
     pu.set_defaults(func=cmd_auto)
 
     pd = sub.add_parser("doctor", help="Check environment (ffmpeg, deps, LUTs).")

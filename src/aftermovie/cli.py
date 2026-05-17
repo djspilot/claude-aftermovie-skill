@@ -208,6 +208,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip the macOS notification + Finder reveal at end.")
     pu.set_defaults(func=cmd_auto)
 
+    psl = sub.add_parser("select",
+                         help="Open a browser UI to pick clips before rendering.")
+    psl.add_argument("--clips", required=True,
+                     help="Folder of source clips. The chosen selection is "
+                          "saved as <clips>/.aftermovie-selection.json.")
+    psl.add_argument("--song", default=None,
+                     help="Optional song path used when the GUI starts a render.")
+    psl.add_argument("--port", type=int, default=8765,
+                     help="HTTP port to bind locally (default: 8765).")
+    psl.add_argument("--no-open", dest="no_open", action="store_true",
+                     help="Don't auto-open the browser to the server URL.")
+    psl.set_defaults(func=cmd_select)
+
     pd = sub.add_parser("doctor", help="Check environment (ffmpeg, deps, LUTs).")
     pd.set_defaults(func=cmd_doctor)
 
@@ -222,6 +235,23 @@ def build_parser() -> argparse.ArgumentParser:
     pl.set_defaults(func=cmd_show_config)
 
     return p
+
+
+def cmd_select(args: argparse.Namespace) -> None:
+    """Boot the `aftermovie select` web GUI and block until Ctrl-C.
+
+    The server is local-only (127.0.0.1) so the user's mixed-media folder
+    never leaves the machine. Browsers auto-open via `open <url>` on macOS
+    unless `--no-open` is passed (useful for headless testing).
+    """
+    from aftermovie.select.server import run as run_server
+
+    clips = Path(args.clips).expanduser().resolve()
+    if not clips.is_dir():
+        raise SystemExit(f"--clips path is not a directory: {clips}")
+    song = Path(args.song).expanduser().resolve() if args.song else None
+    run_server(clips, port=args.port, song=song,
+               open_browser=not args.no_open)
 
 
 def cmd_init_config(args: argparse.Namespace) -> None:

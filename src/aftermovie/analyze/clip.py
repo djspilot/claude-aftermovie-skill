@@ -13,6 +13,7 @@ from aftermovie.analyze.capture_time import captured_at_for
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
+from aftermovie.analyze.selection import is_excluded
 from aftermovie.analyze.stills import (
     DEFAULT_STILL_DURATION_S,
     _is_excluded_output,
@@ -120,18 +121,36 @@ def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURAT
           to short mp4 clips in the cache and returned in their place.
 
     Live-Photo pairs (still + same-stem MOV) keep only the MOV.
+
+    If `<folder>/.aftermovie-selection.json` is present (written by the
+    `aftermovie select` GUI), any source listed under its `excluded` array
+    is silently dropped before analysis. This applies to both the raw video
+    list and the still / Live-Photo sources.
     """
+    # Build the per-folder selection filter once. Returning a callable lets us
+    # apply the same predicate to the video list AND the stills/Live-Photo
+    # list without re-reading the sidecar per item.
+    def selection_filter(p: Path) -> bool:
+        return not is_excluded(p, folder)
+
     videos = sorted(
         p for p in folder.rglob("*")
         if (p.is_file()
             and p.suffix in VIDEO_EXTS
             and not p.name.startswith(".")
             and not _is_excluded_output(p)
-            and not _under_skipped_dir(p, folder))
+            and not _under_skipped_dir(p, folder)
+            and selection_filter(p))
     )
     sources: list[Path] = list(videos)
     if include_stills:
         live_movs, stills, orphan_markers = find_live_photos_and_stills(folder)
+        # Drop Live-Photo MOVs whose original HEIC was excluded by the user.
+        # The MOV path is the cached extracted file (under ~/.skills-data/...)
+        # so we filter on stills/MOV pair-stem: if either the source HEIC
+        # path or the extracted MOV path is listed, both are skipped.
+        live_movs = [m for m in live_movs if selection_filter(m)]
+        stills = [s for s in stills if selection_filter(s)]
         if live_movs:
             log(f"Extracted {len(live_movs)} Live Photo video(s) from single-file HEICs.")
             sources.extend(live_movs)

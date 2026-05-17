@@ -37,6 +37,7 @@ def _cli_overrides_from(args: argparse.Namespace) -> dict[str, object]:
         "aspect", "res", "fps", "max_length", "still_duration", "no_stills",
         "audio_mix", "music_db", "clip_db", "pace", "transitions",
         "no_speed_ramp", "no_reframe", "lut",
+        "source_cap", "chronological",
     )
     out: dict[str, object] = {}
     for k in keys:
@@ -133,6 +134,13 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-reframe", dest="no_reframe",
                    action="store_const", const=True, default=None,
                    help="Disable face-aware reframing on 9:16 output.")
+    p.add_argument("--source-cap", dest="source_cap", type=int, default=None,
+                   help="Max times a source file may appear in the plan. "
+                        "1 = no duplicates (default). Env: AFTERMOVIE_SOURCE_CAP.")
+    p.add_argument("--no-chronological", dest="chronological",
+                   action="store_const", const=False, default=None,
+                   help="Don't re-order picks by EXIF/creation time. "
+                        "Env: AFTERMOVIE_CHRONOLOGICAL.")
 
 
 def build_parser() -> argparse.ArgumentParser:

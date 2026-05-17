@@ -52,6 +52,8 @@ BUILTIN_DEFAULTS: dict[str, Any] = {
     "lut": None,
     "theme": None,
     "audio_interest_threshold": 0.35,
+    "source_cap": 1,
+    "chronological": True,
 }
 
 
@@ -101,6 +103,8 @@ ENV_KEYS: dict[str, tuple[str, Any]] = {
     "theme":                    ("AFTERMOVIE_THEME", _parse_str),
     "audio_interest_threshold": ("AFTERMOVIE_AUDIO_INTEREST_THRESHOLD",
                                  _parse_float),
+    "source_cap":               ("AFTERMOVIE_SOURCE_CAP", _parse_int),
+    "chronological":            ("AFTERMOVIE_CHRONOLOGICAL", _parse_bool),
 }
 
 
@@ -123,6 +127,8 @@ class EffectiveConfig:
     lut: str | None
     theme: str | None
     audio_interest_threshold: float
+    source_cap: int
+    chronological: bool
 
 
 def _read_env_file(path: Path | None) -> dict[str, str]:

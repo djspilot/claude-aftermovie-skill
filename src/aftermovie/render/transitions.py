@@ -112,14 +112,17 @@ def _decide_soft(entries: list[dict[str, Any]],
 
         on_downbeat = any(abs(beat_t - db) < 0.15 for db in downbeats)
 
+        # Durations bumped ~1.5x from the original mix: the user explicitly
+        # asked for slower transitions. Still well within the audio
+        # acrossfade clamp (0.05–0.5) in pipeline.py.
         if on_downbeat and e_val >= 0.6:
-            tdur = 0.30   # structural-beat marker
+            tdur = 0.45   # structural-beat marker
         elif e_val < 0.35:
-            tdur = 0.40   # calm dissolve
+            tdur = 0.60   # calm dissolve
         elif e_val >= 0.75:
-            tdur = 0.10   # tight glide in loud sections
+            tdur = 0.15   # tight glide in loud sections
         else:
-            tdur = 0.18   # default mid-tempo
+            tdur = 0.28   # default mid-tempo
         e["transition_in"] = {"kind": "crossfade", "duration_s": tdur}
 
 

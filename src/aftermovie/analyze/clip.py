@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from aftermovie.analyze.audio import measure_audio_energy, measure_voice_energy
+from aftermovie.analyze.capture_time import captured_at_for
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
@@ -92,6 +93,7 @@ def analyze_clip(path: Path) -> ClipInfo | None:
         accl_peaks=per_second(motion["accl_mag"], n_sec),
         gps_speed=per_second(motion["gps_speed"], n_sec),
         is_short_form=is_short_form,
+        captured_at=captured_at_for(path),
         face_bboxes=face_bboxes,
     )
 

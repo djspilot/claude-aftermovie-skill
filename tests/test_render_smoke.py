@@ -33,6 +33,9 @@ def test_auto_produces_valid_mp4(tmp_path: Path, fixtures_dir: Path, tone: Path)
         "--max-length", "6",
         "--res", "320x240",
         "--fps", "24",
+        # Smoke fixture only has 3 clips; allow reuse so the planner can
+        # fill ~6s without running out under the default source_cap=1.
+        "--source-cap", "3",
     ])
     args.func(args)
 

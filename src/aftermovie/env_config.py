@@ -109,4 +109,8 @@ AFTERMOVIE_TRANSITIONS=soft           # cut | auto | soft
 AFTERMOVIE_NO_SPEED_RAMP=false        # true = disable slow-mo ramps on action peaks
 AFTERMOVIE_NO_STILLS=false            # true = ignore photos, video only
 AFTERMOVIE_NO_REFRAME=false           # true = center-crop instead of face-track in 9:16
+
+# ---- Selection ----
+AFTERMOVIE_SOURCE_CAP=1               # max times a source can appear; 1 = no duplicates
+AFTERMOVIE_CHRONOLOGICAL=true         # order entries by EXIF/creation_time after allocation
 """

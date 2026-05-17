@@ -52,6 +52,8 @@ class AutoOpts:
     theme: str | None = None
     titles: str | None = None
     title_text: str | None = None
+    source_cap: int = 1
+    chronological: bool = True
 
 
 # Per-field "is this still the built-in default?" snapshot. The theme bundle
@@ -145,6 +147,8 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
         titles=opts.titles,
         title_text=opts.title_text,
         no_reframe=opts.no_reframe,
+        source_cap=opts.source_cap,
+        chronological=opts.chronological,
     )
     cmd_score(s)
 

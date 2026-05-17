@@ -32,6 +32,7 @@ class ClipInfo:
     accl_peaks: list[float]
     gps_speed: list[float]
     is_short_form: bool
+    captured_at: float | None = None
     face_bboxes: list[dict | None] = field(default_factory=list)
 
 

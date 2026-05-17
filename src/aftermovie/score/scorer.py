@@ -236,7 +236,9 @@ def decide_speed(pick: Candidate, beat_t: float,
 
 def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                target_len: float, no_speed_ramp: bool,
-               pace: str = "medium") -> list[dict[str, Any]]:
+               pace: str = "medium",
+               source_cap: int = 3,
+               chronological: bool = True) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure.
 
     Orchestrates three seams:
@@ -246,12 +248,32 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
 
     Then for each pick we expand the source window up to the source's
     duration, stamp voice-band `audio_interest`, and slice face boxes.
+
+    `source_cap` is the max times a single source file may appear in the
+    plan. Pass 1 to forbid duplicates.
+
+    When `chronological` is True (default), the picks are re-ordered by
+    capture time (EXIF / ffprobe creation_time / mtime fallback) before
+    being bound to beat anchors. Scoring still controls *which* clips win
+    a slot; this only controls their order in the timeline.
     """
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
     candidates = build_candidates(catalog)
     cut_points = select_cut_points(song, target_len, pace)
-    picks = allocate_candidates(candidates, cut_points)
+    picks = allocate_candidates(candidates, cut_points, source_cap=source_cap)
+
+    if chronological and picks:
+        def _captured(pick) -> float:
+            src = by_source.get(pick.source, {}) or {}
+            ts = src.get("captured_at")
+            return float(ts) if ts is not None else float("inf")
+
+        # Re-bind picks to beat anchors in capture-time order. Anchors stay
+        # at their original times; only the (anchor → pick) pairing changes.
+        beats = [b for b, _ in picks]
+        sorted_picks = sorted([p for _, p in picks], key=_captured)
+        picks = list(zip(beats, sorted_picks))
 
     # Map beat_t → next cut so we can recover the slot duration per pick.
     next_cut: dict[float, float] = {}
@@ -311,6 +333,8 @@ def cmd_score(args: argparse.Namespace) -> None:
     entries = build_plan(
         catalog, song, target_len, args.no_speed_ramp,
         pace=getattr(args, "pace", "medium"),
+        source_cap=int(getattr(args, "source_cap", 1) or 1),
+        chronological=bool(getattr(args, "chronological", True)),
     )
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):

@@ -176,6 +176,18 @@ def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
            "-pix_fmt", "yuv420p", str(out)]
     try:
         run(cmd, check=True)
+        # Stamp the materialized clip's mtime with the source still's capture
+        # time so downstream code that asks "when was this clip captured?"
+        # via the cached mp4 gets a meaningful answer (and chronological
+        # sorting Just Works).
+        try:
+            import os
+            from aftermovie.analyze.capture_time import captured_at_for
+            ts = captured_at_for(path)
+            if ts is not None:
+                os.utime(out, (ts, ts))
+        except Exception:  # noqa: BLE001
+            pass
         return out
     except subprocess.CalledProcessError:
         log(f"  ! ffmpeg failed on materialized PNG for {path.name}")

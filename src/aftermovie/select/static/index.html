@@ -1,27 +1,71 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
+  <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>aftermovie select</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-           background: #111; color: #eee; margin: 0; padding: 1.5rem; }
-    h1 { margin: 0 0 0.5rem; }
-    .hint { color: #888; margin-bottom: 1rem; }
-    code { background: #222; padding: 0.1rem 0.3rem; border-radius: 3px; }
-  </style>
+  <title>Aftermovie — pick your clips</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h1>aftermovie select</h1>
-  <p class="hint">
-    Backend is live. The visual frontend ships separately — until then,
-    the JSON API is reachable at
-    <code>GET /api/sources</code>,
-    <code>POST /api/selection</code>,
-    <code>POST /api/render</code>,
-    <code>GET /api/status/&lt;job_id&gt;</code>.
-  </p>
-  <p class="hint">Thumbnails: <code>GET /thumbs/&lt;hash&gt;.jpg</code>.</p>
+  <header class="topbar">
+    <h1 class="title">Aftermovie — pick your clips</h1>
+    <div class="toolbar" role="toolbar" aria-label="Render controls">
+      <label class="ctrl">
+        <span>Length</span>
+        <input id="length" type="number" min="10" max="600" step="5" value="90" aria-label="Target length in seconds">
+        <span class="suffix">s</span>
+      </label>
+      <label class="ctrl">
+        <span>Pace</span>
+        <select id="pace" aria-label="Pace">
+          <option value="auto" selected>auto</option>
+          <option value="slow">slow</option>
+          <option value="medium">medium</option>
+          <option value="fast">fast</option>
+        </select>
+      </label>
+      <button id="select-all" class="btn ghost" type="button">Select all</button>
+      <button id="deselect-all" class="btn ghost" type="button">Deselect all</button>
+      <span id="counter" class="counter" aria-live="polite">0 of 0 selected</span>
+      <button id="render" class="btn primary" type="button">▶ Render</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="status" class="status" role="status" aria-live="polite">Loading sources…</div>
+    <div id="grid" class="grid" aria-label="Clip thumbnails"></div>
+  </main>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card">
+      <h2 id="modal-title">Rendering…</h2>
+      <div id="modal-state" class="modal-state">starting…</div>
+      <pre id="modal-log" class="modal-log" aria-label="Render log"></pre>
+      <div id="modal-result" class="modal-result hidden">
+        <p>Output:</p>
+        <code id="modal-path" class="path"></code>
+        <div class="modal-actions">
+          <button id="copy-path" class="btn ghost" type="button">Copy path</button>
+          <a id="reveal-link" class="btn ghost" href="#" target="_blank" rel="noopener">Reveal in Finder</a>
+        </div>
+      </div>
+      <div class="modal-actions modal-close-row">
+        <button id="modal-close" class="btn ghost" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <template id="cell-template">
+    <div class="cell selected" tabindex="0" role="button" aria-pressed="true">
+      <div class="thumb-wrap">
+        <img class="thumb" alt="" loading="lazy">
+        <span class="badge"></span>
+        <span class="x-overlay" aria-hidden="true">✕</span>
+      </div>
+      <div class="name" title=""></div>
+    </div>
+  </template>
+
+  <script src="app.js" defer></script>
 </body>
 </html>

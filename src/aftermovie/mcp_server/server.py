@@ -20,6 +20,8 @@ from aftermovie.config import (
     VIDEO_EXTS,
     list_luts,
 )
+from aftermovie.effective_config import resolve as resolve_config
+from aftermovie.env_config import load_env_file
 from aftermovie.mcp_server import jobs
 from aftermovie.pipeline_runner import AutoOpts, run_auto
 from aftermovie.render.pipeline import cmd_render
@@ -34,6 +36,12 @@ from aftermovie.state import (
     save_catalog,
     save_plan,
 )
+
+# Match the CLI: load the env file into the process env on import so render-
+# time code paths that read os.environ.get(...) (e.g. AUDIO_INTEREST_THRESHOLD)
+# see user-configured values. The actual config-resolution still happens
+# through `resolve_config(...)` per tool call, so MCP and CLI cannot diverge.
+load_env_file()
 
 mcp = FastMCP("aftermovie")
 
@@ -77,9 +85,18 @@ def get_plan(plan_id: str, include_entries: bool = True) -> dict[str, Any]:
 def analyze_folder(
     path: str,
     force_reanalyze: bool = False,
-    still_duration_s: float = 2.5,
-    include_stills: bool = True,
+    still_duration_s: float | None = None,
+    include_stills: bool | None = None,
 ) -> dict[str, Any]:
+    # Resolve still-handling knobs through the same chain the CLI uses.
+    # None means "caller didn't pass a value" -> fall back to env/builtin.
+    cfg = resolve_config(cli_overrides={
+        "still_duration": still_duration_s,
+        "no_stills": (not include_stills) if include_stills is not None else None,
+    })
+    still_duration_s = cfg.still_duration
+    include_stills = not cfg.no_stills
+
     folder = Path(path).expanduser().resolve()
     if not folder.is_dir():
         raise FileNotFoundError(f"not a directory: {folder}")
@@ -131,45 +148,59 @@ def propose_plan(
     song_path: str,
     theme: str | None = None,
     target_length_s: float | None = None,
-    aspect: str = "16:9",
-    audio_mix: str = "ducked",
-    pace: str = "medium",
-    transitions: str = "cut",
+    aspect: str | None = None,
+    audio_mix: str | None = None,
+    pace: str | None = None,
+    transitions: str | None = None,
     titles: list[dict[str, Any]] | None = None,
-    reframe: bool = True,
+    reframe: bool | None = None,
     seed: int = 0,
 ) -> dict[str, Any]:
+    # Resolve through the same precedence chain as the CLI: defaults -> env
+    # file -> theme bundle -> caller-supplied kwargs. None kwargs fall
+    # through to lower layers (so an MCP caller can lean on the env file).
+    cfg = resolve_config(
+        cli_overrides={
+            "aspect": aspect,
+            "audio_mix": audio_mix,
+            "pace": pace,
+            "transitions": transitions,
+            "max_length": target_length_s,
+            "no_reframe": (not reframe) if reframe is not None else None,
+        },
+        theme=theme,
+    )
+
     catalog = load_catalog(catalog_id)
     song = analyze_song(Path(song_path).expanduser().resolve())
-    target = min(song["duration_s"], target_length_s or DEFAULT_TARGET_LEN_S)
-
-    theme_cfg = THEMES.get(theme, {}) if theme else {}
-    no_speed_ramp = bool(theme_cfg.get("no_speed_ramp", False))
+    requested = cfg.max_length or DEFAULT_TARGET_LEN_S
+    target = min(song["duration_s"], requested)
 
     entries = build_plan(catalog, song, target_len=target,
-                          no_speed_ramp=no_speed_ramp, pace=pace)
-    if transitions == "auto":
-        decide_transitions(entries, song)
+                         no_speed_ramp=cfg.no_speed_ramp, pace=cfg.pace)
+    if cfg.transitions in ("auto", "soft"):
+        decide_transitions(entries, song, mode=cfg.transitions)
 
-    plan_id = plan_id_for(catalog_id, Path(song_path), theme, target, aspect, seed)
+    plan_id = plan_id_for(catalog_id, Path(song_path), cfg.theme, target,
+                          cfg.aspect, seed)
     plan = {
         "plan_id": plan_id,
         "catalog_id": catalog_id,
         "song": str(Path(song_path).expanduser().resolve()),
         "song_meta": song,
-        "theme": theme or "cinematic",
+        "theme": cfg.theme or "cinematic",
         "target_length_s": target,
-        "aspect": aspect,
-        "resolution": "1920x1080",
-        "fps": 30,
-        "lut": theme_cfg.get("lut"),
-        "music_db": theme_cfg.get("music_db", -8.0),
-        "clip_db": -18.0,
-        "audio_mix": audio_mix,
-        "pace": pace,
-        "transitions": transitions,
+        "aspect": cfg.aspect,
+        "resolution": cfg.res,
+        "fps": cfg.fps,
+        "lut": cfg.lut,
+        "music_db": cfg.music_db,
+        "clip_db": cfg.clip_db,
+        "audio_mix": cfg.audio_mix,
+        "pace": cfg.pace,
+        "transitions": cfg.transitions,
         "titles": titles or [],
-        "reframe": reframe,
+        "reframe": not cfg.no_reframe,
         "song_start_s": float(song["intro_end_s"]),
         "entries": entries,
     }

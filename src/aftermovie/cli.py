@@ -1,24 +1,22 @@
-"""Argparse CLI — dispatcher for analyze/score/render/auto."""
+"""Argparse CLI — dispatcher for analyze/score/render/auto.
+
+The CLI is intentionally thin: argparse gathers user-supplied values, then
+`effective_config.resolve(...)` composes them with the env file, the chosen
+theme bundle, and built-in defaults. Both this module and the MCP server use
+the same `EffectiveConfig`, so they can't drift.
+"""
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from pathlib import Path
 
 from aftermovie.analyze.clip import cmd_analyze
-from aftermovie.config import (
-    DEFAULT_CLIP_DB,
-    DEFAULT_FPS,
-    DEFAULT_MUSIC_DB,
-    DEFAULT_RES,
-    THEMES,
-)
+from aftermovie.config import THEMES
+from aftermovie.effective_config import EffectiveConfig, resolve
 from aftermovie.env_config import (
     DEFAULT_CONFIG_TEMPLATE,
     config_path,
-    env_bool,
-    env_float,
-    env_int,
-    env_str,
     load_env_file,
 )
 from aftermovie.pipeline_runner import opts_from_namespace, run_auto
@@ -26,40 +24,104 @@ from aftermovie.render.pipeline import cmd_render
 from aftermovie.score.scorer import cmd_score
 
 
+def _cli_overrides_from(args: argparse.Namespace) -> dict[str, object]:
+    """Pluck argparse-set fields into a `cli_overrides` dict for `resolve()`.
+
+    Argparse defaults are None across the board (see `_add_score_flags`),
+    so anything non-None here was set explicitly on the command line. Boolean
+    flags use `store_const(True)` with default=None so an unset flag stays
+    None (i.e. 'fall through to lower layer'), while `--no-speed-ramp` /
+    `--no-reframe` on the command line shows up as True.
+    """
+    keys = (
+        "aspect", "res", "fps", "max_length", "still_duration", "no_stills",
+        "audio_mix", "music_db", "clip_db", "pace", "transitions",
+        "no_speed_ramp", "no_reframe", "lut",
+    )
+    out: dict[str, object] = {}
+    for k in keys:
+        if hasattr(args, k):
+            v = getattr(args, k)
+            if v is not None:
+                out[k] = v
+    return out
+
+
+def _resolved_namespace(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply `EffectiveConfig.resolve` and project the result back onto a
+    Namespace, preserving subparser-specific fields (clips/song/output/etc.).
+    """
+    theme = getattr(args, "theme", None)
+    overrides = _cli_overrides_from(args)
+    cfg = resolve(cli_overrides=overrides, theme=theme)
+
+    # Copy through the resolved fields onto args so downstream cmd_* funcs,
+    # which read from args, see the fully-composed values. We don't mutate
+    # `clips`, `song`, `output`, etc.
+    resolved = asdict(cfg)
+    for k, v in resolved.items():
+        setattr(args, k, v)
+    # `theme` is also part of EffectiveConfig — preserve it on args too.
+    setattr(args, "theme", cfg.theme)
+    return args
+
+
 def cmd_auto(args: argparse.Namespace) -> None:
+    # Resolve env file + theme + CLI flags into a single config first,
+    # then delegate to the shared pipeline_runner so the CLI and MCP
+    # surfaces drive the same code path.
+    args = _resolved_namespace(args)
     opts = opts_from_namespace(args)
     run_auto(Path(args.clips), Path(args.song), Path(args.output), opts)
 
 
+def _cmd_score_resolved(args: argparse.Namespace) -> None:
+    """Wraps `cmd_score` so direct `score` invocations also get resolution."""
+    args = _resolved_namespace(args)
+    cmd_score(args)
+
+
+def _cmd_analyze_resolved(args: argparse.Namespace) -> None:
+    """Resolve still_duration / no_stills before delegating to cmd_analyze."""
+    cfg = resolve(cli_overrides={
+        "still_duration": getattr(args, "still_duration", None),
+        "no_stills": getattr(args, "no_stills", None),
+    })
+    args.still_duration = cfg.still_duration
+    args.no_stills = cfg.no_stills
+    cmd_analyze(args)
+
+
 def _add_score_flags(p: argparse.ArgumentParser) -> None:
+    # All argparse defaults are None so they don't masquerade as user input
+    # in `_cli_overrides_from`. The real defaults live in
+    # `effective_config.BUILTIN_DEFAULTS` and flow through `resolve()`.
     p.add_argument("--max-length", "--length", dest="max_length", type=float,
-                   default=env_float("AFTERMOVIE_MAX_LENGTH", None),
+                   default=None,
                    help="Target output length in seconds (default: min(song, 90)). "
                         "Env: AFTERMOVIE_MAX_LENGTH.")
-    p.add_argument("--aspect", default=env_str("AFTERMOVIE_ASPECT", "16:9"),
+    p.add_argument("--aspect", default=None,
                    choices=["16:9", "9:16", "1:1"])
-    p.add_argument("--res", default=env_str("AFTERMOVIE_RES", DEFAULT_RES))
-    p.add_argument("--fps", type=int, default=env_int("AFTERMOVIE_FPS", DEFAULT_FPS))
-    p.add_argument("--lut", default=env_str("AFTERMOVIE_LUT", None))
-    p.add_argument("--music-db", type=float,
-                   default=env_float("AFTERMOVIE_MUSIC_DB", DEFAULT_MUSIC_DB))
-    p.add_argument("--clip-db", type=float,
-                   default=env_float("AFTERMOVIE_CLIP_DB", DEFAULT_CLIP_DB))
-    p.add_argument("--no-speed-ramp", action="store_true",
-                   default=env_bool("AFTERMOVIE_NO_SPEED_RAMP", False))
-    p.add_argument("--audio-mix", default=env_str("AFTERMOVIE_AUDIO_MIX", "ducked"),
+    p.add_argument("--res", default=None)
+    p.add_argument("--fps", type=int, default=None)
+    p.add_argument("--lut", default=None)
+    p.add_argument("--music-db", type=float, default=None)
+    p.add_argument("--clip-db", type=float, default=None)
+    p.add_argument("--no-speed-ramp", dest="no_speed_ramp",
+                   action="store_const", const=True, default=None)
+    p.add_argument("--audio-mix", default=None,
                    choices=["music_only", "ducked", "clip_only"],
                    help="How to mix audio: ducked (default — music + clip with "
                         "voice-band sidechain), music_only, or clip_only. "
                         "Env: AFTERMOVIE_AUDIO_MIX.")
-    p.add_argument("--pace", default=env_str("AFTERMOVIE_PACE", "medium"),
+    p.add_argument("--pace", default=None,
                    choices=["fast", "medium", "slow", "auto"],
                    help="fast = every beat (~0.5s cuts at 100bpm), "
                         "medium (default) = every 2nd beat, "
                         "slow = every 4th beat (downbeats only), "
                         "auto = energy-aware (Quik-style: tight on drops, breathes on verses). "
                         "Env: AFTERMOVIE_PACE.")
-    p.add_argument("--transitions", default=env_str("AFTERMOVIE_TRANSITIONS", "cut"),
+    p.add_argument("--transitions", default=None,
                    choices=["cut", "auto", "soft"],
                    help="cut = hard cuts only; auto = scorer-picked crossfade/whip; "
                         "soft = short crossfade on every cut. "
@@ -68,8 +130,8 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
                    help="Comma-separated list of title kinds (intro,outro).")
     p.add_argument("--title-text", default=None,
                    help="Title text applied to intro/outro cards.")
-    p.add_argument("--no-reframe", action="store_true",
-                   default=env_bool("AFTERMOVIE_NO_REFRAME", False),
+    p.add_argument("--no-reframe", dest="no_reframe",
+                   action="store_const", const=True, default=None,
                    help="Disable face-aware reframing on 9:16 output.")
 
 
@@ -83,20 +145,19 @@ def build_parser() -> argparse.ArgumentParser:
     pa = sub.add_parser("analyze", help="Scan a folder of clips and extract features.")
     pa.add_argument("--clips", required=True)
     pa.add_argument("--out", required=True)
-    pa.add_argument("--still-duration", type=float,
-                    default=env_float("AFTERMOVIE_STILL_DURATION", 2.5),
+    pa.add_argument("--still-duration", type=float, default=None,
                     help="Per-still clip duration (s) for HEIC/JPG/PNG materials.")
-    pa.add_argument("--no-stills", action="store_true",
-                    default=env_bool("AFTERMOVIE_NO_STILLS", False),
+    pa.add_argument("--no-stills", dest="no_stills",
+                    action="store_const", const=True, default=None,
                     help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
-    pa.set_defaults(func=cmd_analyze)
+    pa.set_defaults(func=_cmd_analyze_resolved)
 
     ps = sub.add_parser("score", help="Build an edit plan from a catalog and song.")
     ps.add_argument("--catalog", required=True)
     ps.add_argument("--song", required=True)
     ps.add_argument("--out", required=True)
     _add_score_flags(ps)
-    ps.set_defaults(func=cmd_score)
+    ps.set_defaults(func=_cmd_score_resolved)
 
     pr = sub.add_parser("render", help="Execute a plan via ffmpeg.")
     pr.add_argument("--plan", required=True)
@@ -107,12 +168,13 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--clips", required=True)
     pu.add_argument("--song", required=True)
     pu.add_argument("--output", required=True)
-    pu.add_argument("--still-duration", type=float, default=2.5,
+    pu.add_argument("--still-duration", type=float, default=None,
                     help="Per-still clip duration (s) for HEIC/JPG/PNG materials.")
-    pu.add_argument("--no-stills", action="store_true",
+    pu.add_argument("--no-stills", dest="no_stills",
+                    action="store_const", const=True, default=None,
                     help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
     _add_score_flags(pu)
-    pu.add_argument("--theme", default=env_str("AFTERMOVIE_THEME", None),
+    pu.add_argument("--theme", default=None,
                     choices=sorted(THEMES.keys()),
                     help="Preset bundle (cinematic, punchy, chill, nostalgic). "
                          "Env: AFTERMOVIE_THEME.")
@@ -149,26 +211,28 @@ def cmd_show_config(args: argparse.Namespace) -> None:
     p = config_path()
     print(f"Config file: {p} ({'present' if p.is_file() else 'missing — run `aftermovie init-config`'})")
     print()
-    print("Effective defaults (env file + builtins, before CLI flags):")
-    rows = [
-        ("AFTERMOVIE_THEME",          env_str("AFTERMOVIE_THEME", "(none)")),
-        ("AFTERMOVIE_ASPECT",         env_str("AFTERMOVIE_ASPECT", "16:9")),
-        ("AFTERMOVIE_RES",            env_str("AFTERMOVIE_RES", DEFAULT_RES)),
-        ("AFTERMOVIE_FPS",            env_int("AFTERMOVIE_FPS", DEFAULT_FPS)),
-        ("AFTERMOVIE_MAX_LENGTH",     env_float("AFTERMOVIE_MAX_LENGTH", None)),
-        ("AFTERMOVIE_STILL_DURATION", env_float("AFTERMOVIE_STILL_DURATION", 2.5)),
-        ("AFTERMOVIE_AUDIO_MIX",      env_str("AFTERMOVIE_AUDIO_MIX", "ducked")),
-        ("AFTERMOVIE_MUSIC_DB",       env_float("AFTERMOVIE_MUSIC_DB", DEFAULT_MUSIC_DB)),
-        ("AFTERMOVIE_CLIP_DB",        env_float("AFTERMOVIE_CLIP_DB", DEFAULT_CLIP_DB)),
-        ("AFTERMOVIE_PACE",           env_str("AFTERMOVIE_PACE", "medium")),
-        ("AFTERMOVIE_TRANSITIONS",    env_str("AFTERMOVIE_TRANSITIONS", "cut")),
-        ("AFTERMOVIE_NO_SPEED_RAMP",  env_bool("AFTERMOVIE_NO_SPEED_RAMP", False)),
-        ("AFTERMOVIE_NO_STILLS",      env_bool("AFTERMOVIE_NO_STILLS", False)),
-        ("AFTERMOVIE_NO_REFRAME",     env_bool("AFTERMOVIE_NO_REFRAME", False)),
+    # Resolve with no overrides + no explicit theme to see what env+builtins compose to.
+    cfg_env_only = resolve(cli_overrides=None, theme=None)
+    print("Effective defaults (env file + builtins, before CLI flags or theme):")
+    rows: list[tuple[str, object]] = [
+        ("AFTERMOVIE_THEME",          cfg_env_only.theme or "(none)"),
+        ("AFTERMOVIE_ASPECT",         cfg_env_only.aspect),
+        ("AFTERMOVIE_RES",            cfg_env_only.res),
+        ("AFTERMOVIE_FPS",            cfg_env_only.fps),
+        ("AFTERMOVIE_MAX_LENGTH",     cfg_env_only.max_length),
+        ("AFTERMOVIE_STILL_DURATION", cfg_env_only.still_duration),
+        ("AFTERMOVIE_AUDIO_MIX",      cfg_env_only.audio_mix),
+        ("AFTERMOVIE_MUSIC_DB",       cfg_env_only.music_db),
+        ("AFTERMOVIE_CLIP_DB",        cfg_env_only.clip_db),
+        ("AFTERMOVIE_PACE",           cfg_env_only.pace),
+        ("AFTERMOVIE_TRANSITIONS",    cfg_env_only.transitions),
+        ("AFTERMOVIE_NO_SPEED_RAMP",  cfg_env_only.no_speed_ramp),
+        ("AFTERMOVIE_NO_STILLS",      cfg_env_only.no_stills),
+        ("AFTERMOVIE_NO_REFRAME",     cfg_env_only.no_reframe),
     ]
     for k, v in rows:
         print(f"  {k:30s} {v}")
-    theme = env_str("AFTERMOVIE_THEME", None)
+    theme = cfg_env_only.theme
     if theme and theme in THEMES:
         print()
         print(f"Theme bundle for '{theme}' (each value only applied if user didn't override):")
@@ -219,9 +283,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    # Load user config first so env-backed argparse defaults pick it up.
-    # Theme expansion happens inside `run_auto` for the `auto` subcommand;
-    # other subcommands don't take a theme.
+    # Load user config first so env-backed defaults (and any code that still
+    # reads os.environ at render time) pick it up. EffectiveConfig also reads
+    # the file directly, but this keeps backwards-compat for anything that
+    # calls os.environ.get(...) downstream (e.g. render.pipeline).
     load_env_file()
     args = build_parser().parse_args()
     args.func(args)
+
+
+__all__ = [
+    "EffectiveConfig",
+    "build_parser",
+    "cmd_auto",
+    "cmd_init_config",
+    "cmd_show_config",
+    "main",
+]

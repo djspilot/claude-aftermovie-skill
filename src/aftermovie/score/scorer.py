@@ -145,19 +145,16 @@ def _auto_cut_points(beats: list[float], intro_end_s: float, target_len: float,
     return out
 
 
-def build_plan(catalog: dict[str, Any], song: dict[str, Any],
-               target_len: float, no_speed_ramp: bool,
-               pace: str = "medium") -> list[dict[str, Any]]:
-    """Greedy-fill plan entries against the song's beat structure.
+def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> list[float]:
+    """Pick beat times that anchor cuts, respecting `pace`.
 
     pace: "fast" (every beat) / "medium" (every 2nd beat) /
           "slow" (every 4th beat — downbeats only) /
           "auto" (energy-aware — fast on loud sections, slow on quiet ones).
-    """
-    # Map source path → original clip dict so we can attach face data + dims.
-    by_source = {c["path"]: c for c in catalog["clips"]}
-    candidates = build_candidates(catalog)
 
+    Returns the list of beat times in [intro_end_s, target_len), with
+    `target_len` appended as the terminating sentinel.
+    """
     if pace == "auto":
         cut_points = _auto_cut_points(
             song["beats"], song["intro_end_s"], target_len,
@@ -175,10 +172,21 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             cut_points = cut_points[::factor]
         cut_points = [t for t in cut_points if t < target_len]
     cut_points.append(target_len)
+    return cut_points
 
-    candidates.sort(key=lambda c: c.score, reverse=True)
+
+def allocate_candidates(candidates: list[Candidate],
+                        cut_points: list[float],
+                        source_cap: int = 3) -> list[tuple[float, Candidate]]:
+    """Greedy fill: walk cut points, pick the highest-scoring unused candidate
+    that hasn't already hit `source_cap` reuses of the same source file.
+
+    Returns `[(beat_t, picked_candidate), ...]` in cut order. The final
+    sentinel cut point (used only as the gap terminator) is not yielded.
+    """
+    candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
     used_sources: dict[str, int] = {}
-    plan_entries: list[dict[str, Any]] = []
+    picks: list[tuple[float, Candidate]] = []
 
     for i in range(len(cut_points) - 1):
         beat_t = cut_points[i]
@@ -191,7 +199,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             clip_len = c.end_s - c.start_s
             if clip_len < MIN_CLIP_S:
                 continue
-            if used_sources.get(c.source, 0) >= 3:
+            if used_sources.get(c.source, 0) >= source_cap:
                 continue
             pick = c
             break
@@ -199,16 +207,61 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             continue
         candidates.remove(pick)
         used_sources[pick.source] = used_sources.get(pick.source, 0) + 1
+        picks.append((beat_t, pick))
+    return picks
 
-        on_downbeat = any(abs(beat_t - db) < 0.05 for db in song["downbeats"])
-        is_high_fps = pick.src_fps >= 90
-        wants_slowmo = (
-            is_high_fps
-            and on_downbeat
-            and any(r in ("high_accel_jump", "motion_peak", "hilight_tag") for r in pick.reasons)
-            and not no_speed_ramp
-        )
-        speed = 0.5 if wants_slowmo else 1.0
+
+def decide_speed(pick: Candidate, beat_t: float,
+                 song: dict[str, Any], no_speed_ramp: bool) -> float:
+    """Return 0.5 for a slow-mo ramp, 1.0 otherwise.
+
+    A speed ramp fires only when ALL hold:
+    - `no_speed_ramp` is False
+    - the source is shot at >= 90 fps (so 0.5x stays smooth)
+    - the cut lands within 50ms of a downbeat
+    - the candidate scored on an action reason
+      (`high_accel_jump`, `motion_peak`, or `hilight_tag`)
+    """
+    if no_speed_ramp:
+        return 1.0
+    if pick.src_fps < 90:
+        return 1.0
+    on_downbeat = any(abs(beat_t - db) < 0.05 for db in song["downbeats"])
+    if not on_downbeat:
+        return 1.0
+    if not any(r in ("high_accel_jump", "motion_peak", "hilight_tag") for r in pick.reasons):
+        return 1.0
+    return 0.5
+
+
+def build_plan(catalog: dict[str, Any], song: dict[str, Any],
+               target_len: float, no_speed_ramp: bool,
+               pace: str = "medium") -> list[dict[str, Any]]:
+    """Greedy-fill plan entries against the song's beat structure.
+
+    Orchestrates three seams:
+    - `select_cut_points` chooses the beat anchors
+    - `allocate_candidates` picks the best clip per anchor
+    - `decide_speed` decides 1.0 vs 0.5 per pick
+
+    Then for each pick we expand the source window up to the source's
+    duration, stamp voice-band `audio_interest`, and slice face boxes.
+    """
+    # Map source path → original clip dict so we can attach face data + dims.
+    by_source = {c["path"]: c for c in catalog["clips"]}
+    candidates = build_candidates(catalog)
+    cut_points = select_cut_points(song, target_len, pace)
+    picks = allocate_candidates(candidates, cut_points)
+
+    # Map beat_t → next cut so we can recover the slot duration per pick.
+    next_cut: dict[float, float] = {}
+    for i in range(len(cut_points) - 1):
+        next_cut[cut_points[i]] = cut_points[i + 1]
+
+    plan_entries: list[dict[str, Any]] = []
+    for beat_t, pick in picks:
+        gap = next_cut[beat_t] - beat_t
+        speed = decide_speed(pick, beat_t, song, no_speed_ramp)
         src_time_needed = gap * speed
         src_clip = by_source.get(pick.source, {})
         # Extend up to the source's full duration when filling the slot — the
@@ -218,6 +271,15 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
         start_i = int(pick.start_s)
         end_i = max(start_i + 1, int(actual_end + 0.999))
         src_faces = src_clip.get("face_bboxes") or []
+        # Mean voice-band energy over the cut's source window. The renderer
+        # gates clip audio against this so wind / silence / mumble don't pollute
+        # the duck mix; voices and impacts surface through.
+        voice = src_clip.get("voice_energy") or []
+        if voice:
+            window = voice[start_i:end_i] or voice[:1]
+            audio_interest = float(sum(window) / max(len(window), 1))
+        else:
+            audio_interest = 0.0
         plan_entries.append({
             "source": pick.source,
             "start_s": pick.start_s,
@@ -227,6 +289,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "beat_time_s": beat_t,
             "score": pick.score,
             "reasons": pick.reasons,
+            "audio_interest": audio_interest,
             "source_width": int(src_clip.get("width", 1920)),
             "source_height": int(src_clip.get("height", 1080)),
             "face_bboxes": src_faces[start_i:end_i] if src_faces else [],

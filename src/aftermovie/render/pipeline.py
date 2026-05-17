@@ -29,6 +29,16 @@ from aftermovie.render.titles import (
 from aftermovie.render.transitions import build_xfade_graph, has_non_cut
 
 
+def _audio_interest_threshold() -> float:
+    """Threshold [0..1] below which a cut's clip audio is muted at render time."""
+    import os
+    raw = os.environ.get("AFTERMOVIE_AUDIO_INTEREST_THRESHOLD", "")
+    try:
+        return max(0.0, min(1.0, float(raw))) if raw else 0.35
+    except ValueError:
+        return 0.35
+
+
 def _source_has_audio(src: Path) -> bool:
     """ffprobe whether the source has at least one audio stream."""
     try:
@@ -117,6 +127,13 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     video_input_idx = 1 if audio_input_idx is not None else 0
     if keep_audio:
         a_steps: list[str] = []
+        # Intelligent-audio gate: when this cut has little voice-band content,
+        # mute it pre-mix so the duck sidechain stays clean and the music
+        # plays unencumbered. Threshold from env (default 0.35).
+        threshold = _audio_interest_threshold()
+        interest = float(entry.get("audio_interest", 1.0))
+        if threshold > 0 and interest < threshold:
+            a_steps.append("volume=0")
         if speed != 1.0:
             a_steps.append(f"atempo={max(0.5, min(2.0, speed)):.4f}")
         if pad_dur > 0.05:

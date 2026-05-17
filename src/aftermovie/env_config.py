@@ -101,6 +101,7 @@ AFTERMOVIE_STILL_DURATION=2.5         # seconds per HEIC/JPG photo (Ken Burns)
 AFTERMOVIE_AUDIO_MIX=ducked           # music_only | ducked | clip_only
 AFTERMOVIE_MUSIC_DB=-9                # music level in dB (negative = quieter)
 AFTERMOVIE_CLIP_DB=-12                # clip-audio level when ducked/clip_only (closer to 0 = louder voices)
+AFTERMOVIE_AUDIO_INTEREST_THRESHOLD=0.35  # mute clip audio below this voice-band energy [0..1]; 0 = keep everything
 
 # ---- Edit feel (the Quik-style knobs) ----
 AFTERMOVIE_PACE=auto                  # fast | medium | slow | auto (energy-aware, Quik-style)

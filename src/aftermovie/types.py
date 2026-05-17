@@ -28,6 +28,7 @@ class ClipInfo:
     hilight_tags_ms: list[int]
     motion_energy: list[float]
     audio_energy: list[float]
+    voice_energy: list[float]
     accl_peaks: list[float]
     gps_speed: list[float]
     is_short_form: bool

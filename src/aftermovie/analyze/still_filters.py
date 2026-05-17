@@ -24,17 +24,25 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-# All variants that crop / zoom into the source. Portrait images shouldn't
-# land in this set; the picker swaps them for a "show the whole image" variant.
+# All variants that crop / zoom into the source. Narrow-aspect images
+# shouldn't land in this set; the picker swaps them for a "show the whole
+# image" variant so heads / feet don't get cropped off.
 _FILL_VARIANTS = ("live", "push", "pull", "pan_h", "shake")
 
-# Variants that show the entire source image (no cropping). Portrait images
-# are forced into this set.
-_PORTRAIT_VARIANTS = ("fit_pad", "blurred_bg")
+# Variants that show the entire source image (no cropping). Narrow-aspect
+# sources are forced into this set. fit_pad is weighted ~3:1 over blurred_bg
+# because the user has specifically asked for literal black borders rather
+# than the blurred-self look (which still reads as "zoomed in").
+_PORTRAIT_VARIANTS = ("fit_pad", "fit_pad", "fit_pad", "blurred_bg")
 
-# Full ordered tuple for general (landscape / square) sources. live is
+# Full ordered tuple for general (landscape / square-ish) sources. live is
 # weighted by listing it twice so the historical look stays the most common.
 _ALL_VARIANTS = ("live", "live", "push", "pull", "pan_h", "fit_pad", "blurred_bg", "shake")
+
+# Fractional threshold: if source aspect / target aspect is below this, we
+# treat the source as "narrow" and gate it to _PORTRAIT_VARIANTS regardless
+# of whether it's strictly h > w. Catches 4:3 stills on 16:9 output too.
+_NARROW_ASPECT_RATIO = 0.85
 
 
 @dataclass(frozen=True)
@@ -57,20 +65,45 @@ class FilterSpec:
     out_label: str
 
 
-def _is_portrait(path: Path) -> bool:
-    """True if the underlying image is taller than wide.
+def _image_dims(path: Path) -> tuple[int, int] | None:
+    """Return (width, height) of the source image, or None on failure.
 
     Uses PIL so HEIC works (pillow-heif is registered by stills.py on import).
-    Falls back to False if the file can't be opened — a non-portrait guess is
-    the safer default (it just keeps the cropping variants in play).
     """
     try:
         from PIL import Image
         with Image.open(path) as img:
-            w, h = img.size
-            return h > w
+            return img.size
     except (OSError, ValueError, ImportError):
+        return None
+
+
+def _is_portrait(path: Path) -> bool:
+    """True if the underlying image is taller than wide.
+
+    Kept for backwards-compat with tests / callers. Prefer `_should_letterbox`
+    which also catches near-square sources on widescreen output.
+    """
+    dims = _image_dims(path)
+    if dims is None:
         return False
+    return dims[1] > dims[0]
+
+
+def _should_letterbox(path: Path, target_w: int, target_h: int) -> bool:
+    """True if the source is meaningfully narrower than the target frame.
+
+    Filling a 9:10 portrait into a 16:9 frame chops heads off; filling a
+    4:3 photo into 16:9 still loses noticeable top-and-bottom content. Both
+    cases benefit from letterboxing instead of cropping.
+    """
+    dims = _image_dims(path)
+    if dims is None:
+        return False
+    src_w, src_h = dims
+    if src_w <= 0 or src_h <= 0 or target_w <= 0 or target_h <= 0:
+        return False
+    return (src_w / src_h) < (target_w / target_h) * _NARROW_ASPECT_RATIO
 
 
 def _stem_seed(path: Path) -> int:
@@ -87,10 +120,12 @@ def _pick_still_variant(path: Path, target_w: int, target_h: int) -> tuple[str, 
     """Return (variant_name, seed) for a still.
 
     Deterministic — same filename → same variant on every run.
-    Portrait sources are gated to _PORTRAIT_VARIANTS so we never crop a head off.
+    Narrow-aspect sources (portrait, near-portrait, taller-than-target)
+    are gated to _PORTRAIT_VARIANTS so we never crop a head off and we
+    favour literal letterbox (`fit_pad`) over the blurred-self fill.
     """
     seed = _stem_seed(path)
-    if _is_portrait(path):
+    if _should_letterbox(path, target_w, target_h):
         choices = _PORTRAIT_VARIANTS
     else:
         choices = _ALL_VARIANTS

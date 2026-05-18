@@ -102,16 +102,48 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
     return score, reasons
 
 
-def build_candidates(catalog: dict[str, Any]) -> list[Candidate]:
-    """Turn a catalog of clips into per-second candidate sub-clips with scores."""
+def build_candidates(
+    catalog: dict[str, Any],
+    preferences: dict[str, Any] | None = None,
+) -> list[Candidate]:
+    """Turn a catalog of clips into per-second candidate sub-clips with scores.
+
+    When `preferences` is provided (from the per-folder
+    `.aftermovie-preferences.json` sidecar), the user's bans and favorites
+    influence the candidate pool:
+
+    - sources listed in `preferences["banned"]` are skipped entirely so they
+      never appear as a Candidate (and therefore never reach the plan);
+    - sources listed in `preferences["favorited"]` get a flat `+2.0` boost
+      on every Candidate from that source plus the `"user_favorite"` reason
+      tag — small enough that a strong objective signal (e.g. a HiLight tag
+      worth +10) still dominates, but big enough to break ties between
+      similarly-scored clips in the user's favor.
+    """
+    banned: set[str] = set()
+    favorited: set[str] = set()
+    if isinstance(preferences, dict):
+        raw_banned = preferences.get("banned")
+        if isinstance(raw_banned, (list, tuple, set, frozenset)):
+            banned = {str(p) for p in raw_banned}
+        raw_fav = preferences.get("favorited")
+        if isinstance(raw_fav, (list, tuple, set, frozenset)):
+            favorited = {str(p) for p in raw_fav}
+
     candidates: list[Candidate] = []
     for clip in catalog["clips"]:
         path = clip["path"]
+        if path in banned:
+            continue
         duration = clip["duration_s"]
         fps = clip.get("fps", 30.0)
         is_short = clip.get("is_short_form", False)
+        is_favorite = path in favorited
         if duration <= 4.0:
             score, reasons = score_window(clip, 0, int(duration))
+            if is_favorite:
+                score += 2.0
+                reasons = list(reasons) + ["user_favorite"]
             candidates.append(Candidate(
                 source=path,
                 start_s=0.0,
@@ -128,6 +160,9 @@ def build_candidates(catalog: dict[str, Any]) -> list[Candidate]:
         for start in range(0, max(1, n_sec - win + 1), step):
             end = min(n_sec, start + win)
             score, reasons = score_window(clip, start, end)
+            if is_favorite:
+                score += 2.0
+                reasons = list(reasons) + ["user_favorite"]
             candidates.append(Candidate(
                 source=path,
                 start_s=float(start),
@@ -400,7 +435,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                burst_window_s: float = DEFAULT_BURST_WINDOW_S,
                hook: bool = True,
                climax: bool = True,
-               stretch_stills: bool = True) -> list[dict[str, Any]]:
+               stretch_stills: bool = True,
+               preferences: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure.
 
     Orchestrates three seams:
@@ -421,7 +457,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     """
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
-    candidates = build_candidates(catalog)
+    candidates = build_candidates(catalog, preferences=preferences)
     # Filter order matters: bursts first (catches same-moment, same-camera
     # repetition where the only signal is timestamp clustering), then
     # visual-duplicate grouping (catches same-look-from-anywhere using the
@@ -533,7 +569,34 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     return plan_entries
 
 
+def _infer_clips_root(catalog: dict[str, Any]) -> Path | None:
+    """Best-effort guess at the clips folder a catalog was built from.
+
+    The Score stage (and the MCP `score_clips` tool) doesn't take a
+    `--clips` argument today — the catalog records absolute source paths
+    instead. To find the per-folder `.aftermovie-preferences.json` sidecar
+    we walk the longest common prefix of those source paths and treat the
+    deepest existing directory as the clips root. Returns None when the
+    catalog has no clips or the prefix doesn't resolve to a directory.
+    """
+    sources = [c.get("path") for c in catalog.get("clips", [])
+               if isinstance(c.get("path"), str)]
+    if not sources:
+        return None
+    import os
+    common = os.path.commonpath(sources)
+    p = Path(common)
+    # If commonpath gave us a file (e.g. a single source), walk up to its parent.
+    if p.is_file():
+        p = p.parent
+    if p.is_dir():
+        return p
+    return None
+
+
 def cmd_score(args: argparse.Namespace) -> None:
+    from aftermovie.analyze.preferences import load_preferences
+
     catalog = json.loads(Path(args.catalog).expanduser().read_text())
     song = analyze_song(Path(args.song).expanduser().resolve())
     log(f"Song: {song['tempo_bpm']:.0f} BPM, "
@@ -543,6 +606,16 @@ def cmd_score(args: argparse.Namespace) -> None:
         song["duration_s"],
         float(args.max_length) if args.max_length else DEFAULT_TARGET_LEN_S,
     )
+
+    # Preferences live in a sidecar next to the user's clips. `cmd_score`
+    # only sees the catalog (not the original clips folder) so we derive the
+    # folder from the longest common prefix of source paths and load the
+    # sidecar from there. Missing sidecar → empty prefs → scorer behavior
+    # unchanged from before this issue landed.
+    preferences: dict[str, Any] | None = None
+    clips_root = _infer_clips_root(catalog)
+    if clips_root is not None:
+        preferences = load_preferences(clips_root)
 
     entries = build_plan(
         catalog, song, target_len, args.no_speed_ramp,
@@ -555,6 +628,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         hook=bool(getattr(args, "hook", True)),
         climax=bool(getattr(args, "climax", True)),
         stretch_stills=bool(getattr(args, "stretch_stills", True)),
+        preferences=preferences,
     )
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):

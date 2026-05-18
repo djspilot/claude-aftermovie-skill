@@ -16,6 +16,11 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from aftermovie.analyze.preferences import (
+    PREFERENCES_FILENAME,
+    clear_cache as clear_preferences_cache,
+    load_preferences,
+)
 from aftermovie.analyze.selection import (
     SELECTION_FILENAME,
     clear_cache,
@@ -206,6 +211,64 @@ def test_api_plan_returns_matching_plan(
     payload = json.loads(body)
     assert payload["entries"] == plan["entries"]
     assert payload["_aftermovie"]["catalog_id"] == catalog_id
+
+
+def test_preferences_post_writes_sidecar(tmp_path: Path, fixtures_dir: Path) -> None:
+    """POST /api/preferences persists favorited+banned to the sidecar."""
+    clear_cache()
+    clear_preferences_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    fav = str((clips_dir / "clip_a.mp4").resolve())
+    ban = str((clips_dir / "clip_b.mp4").resolve())
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        status, body = _http_post(f"{srv.url}api/preferences",
+                                  {"favorited": [fav], "banned": [ban]})
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
+
+    sidecar = clips_dir / PREFERENCES_FILENAME
+    assert sidecar.is_file()
+    payload = json.loads(sidecar.read_text())
+    assert payload["favorited"] == [fav]
+    assert payload["banned"] == [ban]
+    # pinned_entries is reserved — defaults to [] when the client omits it.
+    assert payload["pinned_entries"] == []
+    assert payload["generated_by"] == "aftermovie-select"
+    assert payload["version"] == 1
+
+
+def test_preferences_get_returns_dict(tmp_path: Path, fixtures_dir: Path) -> None:
+    """GET /api/preferences returns the persisted favorited/banned/pinned dict."""
+    clear_cache()
+    clear_preferences_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    fav = str((clips_dir / "clip_a.mp4").resolve())
+    ban = str((clips_dir / "clip_b.mp4").resolve())
+
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        # First call before any POST → empty defaults, not 404.
+        status, body, _ = _http_get(f"{srv.url}api/preferences")
+        assert status == 200
+        assert json.loads(body) == {"favorited": [], "banned": [], "pinned_entries": []}
+
+        # Persist a state, then GET should reflect it.
+        _http_post(f"{srv.url}api/preferences",
+                   {"favorited": [fav], "banned": [ban]})
+        clear_preferences_cache()  # force a fresh disk read
+        status, body, _ = _http_get(f"{srv.url}api/preferences")
+    assert status == 200
+    data = json.loads(body)
+    assert data["favorited"] == [fav]
+    assert data["banned"] == [ban]
+    assert data["pinned_entries"] == []
+
+    # Sanity: the helper sees the same state we wrote.
+    clear_preferences_cache()
+    prefs = load_preferences(clips_dir)
+    assert prefs["favorited"] == [fav]
+    assert prefs["banned"] == [ban]
 
 
 def test_excluded_files_skipped_in_discover_sources(

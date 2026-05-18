@@ -469,6 +469,62 @@ main {
 }
 .modal-close-row { justify-content: flex-end; }
 
+/* Per-tile preference controls (favorite ★ / ban ⛔). Sit in the bottom-right
+   corner of the thumbnail and use stopPropagation in JS so clicking them
+   doesn't also toggle the cell's selection state. */
+.pref-controls {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+.cell:hover .pref-controls,
+.cell:focus-within .pref-controls,
+.cell.is-favorited .pref-controls,
+.cell.is-banned .pref-controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+.pref-btn {
+  background: rgba(0, 0, 0, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 120ms ease, transform 80ms ease, border-color 120ms ease;
+}
+.pref-btn:hover { background: rgba(0, 0, 0, 0.85); transform: translateY(-1px); }
+.pref-btn:active { transform: translateY(0); }
+.pref-btn[aria-pressed="true"].pref-fav {
+  background: rgba(255, 200, 80, 0.92);
+  border-color: rgba(255, 200, 80, 1);
+  color: #0b1220;
+}
+.pref-btn[aria-pressed="true"].pref-ban {
+  background: rgba(255, 77, 94, 0.92);
+  border-color: rgba(255, 77, 94, 1);
+  color: #fff;
+}
+
+.cell.is-favorited {
+  border-color: rgba(255, 200, 80, 0.9);
+  box-shadow: 0 0 0 1px rgba(255, 200, 80, 0.45), 0 4px 18px rgba(255, 200, 80, 0.18);
+}
+.cell.is-banned .thumb,
+.cell.is-banned .name {
+  opacity: 0.3;
+}
+.cell.is-banned {
+  border-color: rgba(255, 77, 94, 0.7);
+}
+
 /* Small screens */
 @media (max-width: 640px) {
   .topbar { flex-direction: column; align-items: stretch; }

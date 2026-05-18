@@ -1193,18 +1193,29 @@ def cmd_score(args: argparse.Namespace) -> None:
         log(f"  diversity: {len(entries)} cuts from {n_unique} unique sources "
             f"(avg {avg_repeats:.1f} repeats, max {max_repeats})")
 
-    # Heuristic: pace=auto produces beat anchors based on tempo + energy.
-    # If the planner emitted noticeably fewer cuts than the target window's
-    # beat density, we ran out of unique sources under the current
-    # source_cap — tell the user so they can raise it or add clips.
+    # Coverage warning. Only fires when (a) the planner emitted noticeably
+    # fewer cuts than the song's beat density would naturally support, AND
+    # (b) the resulting plan also FAILS TO COVER the target duration. Under
+    # F3 moment-budget + slot-stretch, a 53-cut plan that fills 155.8s of a
+    # 155.8s song is the correct outcome with `source_cap=1` and one moment
+    # per source — the old "wanted ~124 cuts" warning fired anyway and was
+    # alarming users for whom the plan was actually fine.
     expected_cuts_per_s = float(song.get("tempo_bpm", 100)) / 60 / 3
     expected_cuts = int(target_len * expected_cuts_per_s)
     cap = int(getattr(args, "source_cap", 1) or 1)
-    if len(entries) < expected_cuts * 0.8 and cap < 4:
+    moments_cap = getattr(args, "moments_per_source", None)
+    plan_duration = sum(float(e.get("out_duration_s", 0.0)) for e in entries)
+    duration_coverage = plan_duration / target_len if target_len > 0 else 1.0
+    cuts_short = len(entries) < expected_cuts * 0.8 and cap < 4
+    duration_short = duration_coverage < 0.95
+    if cuts_short and duration_short:
         unique = len({e["source"] for e in entries})
-        log(f"  ! only {len(entries)} cuts fit (wanted ~{expected_cuts}) — "
-            f"{unique} unique sources at source_cap={cap}. "
-            f"Add more clips or raise --source-cap (e.g. {cap+1}).")
+        hint = (f"Add more clips, raise --source-cap (e.g. {cap+1}), "
+                f"or raise --moments-per-source (currently "
+                f"{moments_cap if moments_cap else 'default 1'}, try 3).")
+        log(f"  ! only {len(entries)} cuts fit covering {plan_duration:.1f}s "
+            f"of {target_len:.1f}s — {unique} unique sources at "
+            f"source_cap={cap}. {hint}")
 
     titles: list[dict] = []
     title_flag = getattr(args, "titles", None)

@@ -703,7 +703,21 @@ STRETCH_TAIL_ENTRIES = 4            # how many trailing entries the lever 3
 # candidates from each source by score. The result: every source gets a
 # fair shot at the plan, but no single source can flood it.
 SECONDS_PER_MOMENT = 10.0      # one distinct "moment" per 10s of footage
-MAX_MOMENTS_PER_SOURCE = 8     # ceiling so no source ever dominates the plan
+# Cap on distinct sub-clips a single source contributes. Default is 1: the
+# observed UX problem is users seeing the same source repeat 4-5× in a single
+# aftermovie. With one moment per source and slot-stretch (`C3`), a 60-source
+# folder fills a 156s song at ~2.6s per cut, no repetition. Override via
+# `AFTERMOVIE_MOMENTS_PER_SOURCE` env or `--moments-per-source N` CLI flag
+# (passed through `cmd_score` / `cmd_auto`) when you want longer renders that
+# tolerate inter-source repetition.
+def _default_moments_per_source() -> int:
+    raw = os.environ.get("AFTERMOVIE_MOMENTS_PER_SOURCE", "1").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return max(1, min(n, 8))
+MAX_MOMENTS_PER_SOURCE = _default_moments_per_source()
 SHORT_SOURCE_DURATION_S = 4.0  # stills + sub-4s Live Photo MOVs → budget=1
 
 # F1 auto-bump underfill tolerance. When `allocate_candidates` would have to
@@ -715,7 +729,10 @@ AUTO_BUMP_UNDERFILL_TOLERANCE = 0.20
 
 
 def _compute_source_budgets(catalog: dict[str, Any],
-                            candidates: list[Candidate]) -> dict[str, int]:
+                            candidates: list[Candidate],
+                            *,
+                            max_moments_per_source: int | None = None,
+                            ) -> dict[str, int]:
     """Per-source moment budget — how many distinct windows from each source
     are eligible for the plan.
 
@@ -736,6 +753,7 @@ def _compute_source_budgets(catalog: dict[str, Any],
     by_source: dict[str, dict[str, Any]] = {
         c["path"]: c for c in catalog.get("clips", [])
     }
+    cap = MAX_MOMENTS_PER_SOURCE if max_moments_per_source is None else max(1, max_moments_per_source)
     present_sources = {c.source for c in candidates}
     budgets: dict[str, int] = {}
     for src in present_sources:
@@ -744,8 +762,14 @@ def _compute_source_budgets(catalog: dict[str, Any],
         if duration <= SHORT_SOURCE_DURATION_S:
             budgets[src] = 1
             continue
+        # When the cap is 1 (default), every source contributes its single
+        # best moment regardless of duration — no per-source ceiling math
+        # needed.
+        if cap <= 1:
+            budgets[src] = 1
+            continue
         n = int(math.ceil(duration / SECONDS_PER_MOMENT))
-        budgets[src] = max(1, min(n, MAX_MOMENTS_PER_SOURCE))
+        budgets[src] = max(1, min(n, cap))
     return budgets
 
 

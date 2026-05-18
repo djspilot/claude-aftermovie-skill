@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from aftermovie.score import scorer as scorer_mod  # noqa: F401 — monkeypatch target
 from aftermovie.score.scorer import (
     MAX_MOMENTS_PER_SOURCE,
     SECONDS_PER_MOMENT,
@@ -71,10 +72,12 @@ def test_compute_source_budgets_short_clip_gets_one():
 
 
 def test_compute_source_budgets_long_clip_scales_with_duration():
-    """A 60s GoPro contributes ceil(60/10)=6 distinct moments."""
+    """A 60s GoPro contributes ceil(60/10)=6 distinct moments when the cap
+    is lifted (default cap is 1, so we pass max_moments_per_source=8 here
+    to validate the scaling formula itself)."""
     catalog = {"clips": [_clip("/long.mp4", duration=60.0)]}
     candidates = build_candidates(catalog)
-    budgets = _compute_source_budgets(catalog, candidates)
+    budgets = _compute_source_budgets(catalog, candidates, max_moments_per_source=8)
     assert budgets == {"/long.mp4": 6}
 
 
@@ -87,14 +90,16 @@ def test_compute_source_budgets_caps_at_max():
 
 
 def test_compute_source_budgets_mixed_catalog():
-    """Spec example: 3s + 60s + 2.5s still → budgets = {1, 6, 1}."""
+    """Spec example: 3s + 60s + 2.5s still → budgets = {1, 6, 1} when the
+    cap is lifted. Default cap=1 collapses everything to 1; tests below
+    validate the no-repetition default."""
     catalog = {"clips": [
         _clip("/clip_short.mp4", duration=3.0),
         _clip("/clip_long.mp4", duration=60.0),
         _clip("/still.mp4", duration=2.5),
     ]}
     candidates = build_candidates(catalog)
-    budgets = _compute_source_budgets(catalog, candidates)
+    budgets = _compute_source_budgets(catalog, candidates, max_moments_per_source=8)
     assert budgets == {
         "/clip_short.mp4": 1,
         "/clip_long.mp4": 6,
@@ -200,9 +205,14 @@ def test_build_plan_user_source_cap_truncates_budget(
             f"user --source-cap, got counts {counts}"
 
 
-def test_build_plan_log_line_reports_budget_totals(capsys):
+def test_build_plan_log_line_reports_budget_totals(capsys, monkeypatch):
     """The moment-budget log line surfaces sources, sum, median, and the
-    longest-budget source so users can see catalog → plan attrition."""
+    longest-budget source so users can see catalog → plan attrition.
+
+    Default cap is 1 (no repetition); we lift it to 8 here via monkeypatch
+    to exercise the per-source scaling and the log-line aggregation.
+    """
+    monkeypatch.setattr(scorer_mod, "MAX_MOMENTS_PER_SOURCE", 8)
     # 61 sources of mixed durations: 30× 3s stills, 30× 30s clips, 1× 80s clip.
     clips = []
     for i in range(30):

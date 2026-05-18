@@ -20,21 +20,24 @@ influence scoring.
 `pinned_entries` is intentionally left unwired for now — pinning requires a
 stable plan-entry id model that doesn't exist yet. The field is reserved in
 the on-disk schema so we don't break the format when the wire-up lands.
+
+This module is a thin Adapter over `SidecarStore` (`analyze/sidecar.py`),
+which owns the mtime-aware cache, atomic write, and malformed-JSON
+recovery shared with `analyze/selection.py`.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
+
+from aftermovie.analyze.sidecar import SidecarStore
 
 PREFERENCES_FILENAME = ".aftermovie-preferences.json"
 PREFERENCES_VERSION = 1
 PREFERENCES_GENERATOR = "aftermovie-select"
 
-# Cache: folder_path_str -> (mtime_ns, dict-with-frozensets).
-# Mtime tracking lets the server and tests rewrite the sidecar mid-process
-# and have subsequent reads see the new value (same pattern as selection.py).
-_CACHE: dict[str, tuple[int, dict[str, frozenset[str]]]] = {}
+_LIST_FIELDS = ("favorited", "banned", "pinned_entries")
+_DEFAULTS: dict[str, list[str]] = {name: [] for name in _LIST_FIELDS}
 
 
 def preferences_path(folder: Path) -> Path:
@@ -42,44 +45,18 @@ def preferences_path(folder: Path) -> Path:
     return folder / PREFERENCES_FILENAME
 
 
-def _empty_prefs() -> dict[str, frozenset[str]]:
-    return {
-        "favorited": frozenset(),
-        "banned": frozenset(),
-        "pinned_entries": frozenset(),
-    }
+def _store(folder: Path) -> SidecarStore:
+    return SidecarStore(folder, PREFERENCES_FILENAME, _DEFAULTS)
 
 
-def _load_cached(folder: Path) -> dict[str, frozenset[str]]:
-    """Return the parsed sidecar as frozensets, or empty defaults.
+def _read_sets(folder: Path) -> dict[str, frozenset[str]]:
+    """Parse the sidecar into frozensets, one per documented list field.
 
-    A missing file, malformed JSON, or unexpected schema all yield empty
-    sets — preferences are opt-in and failing closed is the safe default.
+    The store hands back a raw dict (or the defaults on missing/malformed);
+    we just project the three list fields into frozensets and drop any
+    non-string entries.
     """
-    sidecar = preferences_path(folder)
-    key = str(folder.resolve())
-    try:
-        st = sidecar.stat()
-    except OSError:
-        _CACHE.pop(key, None)
-        return _empty_prefs()
-
-    cached = _CACHE.get(key)
-    if cached is not None and cached[0] == st.st_mtime_ns:
-        return cached[1]
-
-    try:
-        raw = sidecar.read_text()
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        prefs = _empty_prefs()
-        _CACHE[key] = (st.st_mtime_ns, prefs)
-        return prefs
-
-    if not isinstance(data, dict):
-        prefs = _empty_prefs()
-        _CACHE[key] = (st.st_mtime_ns, prefs)
-        return prefs
+    data = _store(folder).read()
 
     def _field(name: str) -> frozenset[str]:
         items = data.get(name)
@@ -87,13 +64,7 @@ def _load_cached(folder: Path) -> dict[str, frozenset[str]]:
             return frozenset()
         return frozenset(str(p) for p in items if isinstance(p, str))
 
-    prefs = {
-        "favorited": _field("favorited"),
-        "banned": _field("banned"),
-        "pinned_entries": _field("pinned_entries"),
-    }
-    _CACHE[key] = (st.st_mtime_ns, prefs)
-    return prefs
+    return {name: _field(name) for name in _LIST_FIELDS}
 
 
 def load_preferences(folder: Path) -> dict[str, list[str]]:
@@ -103,12 +74,8 @@ def load_preferences(folder: Path) -> dict[str, list[str]]:
     malformed sidecars yield empty lists, never an exception. The lists are
     fresh copies — mutating them does not affect the in-process cache.
     """
-    prefs = _load_cached(folder)
-    return {
-        "favorited": sorted(prefs["favorited"]),
-        "banned": sorted(prefs["banned"]),
-        "pinned_entries": sorted(prefs["pinned_entries"]),
-    }
+    prefs = _read_sets(folder)
+    return {name: sorted(prefs[name]) for name in _LIST_FIELDS}
 
 
 def save_preferences(folder: Path, prefs: dict[str, Any]) -> Path:
@@ -118,28 +85,16 @@ def save_preferences(folder: Path, prefs: dict[str, Any]) -> Path:
     fields are persisted as empty lists. Non-string entries are dropped.
     Duplicates are removed while preserving first-seen order.
     """
-    folder = folder.resolve()
-    folder.mkdir(parents=True, exist_ok=True)
-    sidecar = preferences_path(folder)
-
     def _clean(name: str) -> list[str]:
         raw = prefs.get(name) if isinstance(prefs, dict) else None
         if not isinstance(raw, list):
             return []
         return list(dict.fromkeys(str(p) for p in raw if isinstance(p, str)))
 
-    payload = {
-        "favorited": _clean("favorited"),
-        "banned": _clean("banned"),
-        "pinned_entries": _clean("pinned_entries"),
-        "generated_by": PREFERENCES_GENERATOR,
-        "version": PREFERENCES_VERSION,
-    }
-    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(sidecar)
-    _CACHE.pop(str(folder), None)
-    return sidecar
+    payload: dict[str, Any] = {name: _clean(name) for name in _LIST_FIELDS}
+    payload["generated_by"] = PREFERENCES_GENERATOR
+    payload["version"] = PREFERENCES_VERSION
+    return _store(folder).write(payload)
 
 
 def _abs(path: Path) -> str:
@@ -151,7 +106,7 @@ def _abs(path: Path) -> str:
 
 def is_favorited(folder: Path, path: Path | str) -> bool:
     """True if `path` is in the favorited list for `folder`."""
-    favorited = _load_cached(folder)["favorited"]
+    favorited = _read_sets(folder)["favorited"]
     if not favorited:
         return False
     p = Path(path) if not isinstance(path, Path) else path
@@ -160,7 +115,7 @@ def is_favorited(folder: Path, path: Path | str) -> bool:
 
 def is_banned(folder: Path, path: Path | str) -> bool:
     """True if `path` is in the banned list for `folder`."""
-    banned = _load_cached(folder)["banned"]
+    banned = _read_sets(folder)["banned"]
     if not banned:
         return False
     p = Path(path) if not isinstance(path, Path) else path
@@ -169,4 +124,6 @@ def is_banned(folder: Path, path: Path | str) -> bool:
 
 def clear_cache() -> None:
     """Drop the in-process cache. Tests call this between runs."""
-    _CACHE.clear()
+    from aftermovie.analyze.sidecar import clear_all_caches
+
+    clear_all_caches()

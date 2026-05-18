@@ -42,6 +42,8 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **GPMF** — GoPro Metadata Format: per-frame telemetry (accel, gyro, GPS speed) embedded in the MP4. Parsed at analyze time and contributes to scoring.
 
+- **Sidecar** — a small JSON file the `select` GUI writes at the root of the Source folder to influence later renders without mutating the clips themselves. Two of them today: `.aftermovie-selection.json` (the exclusion list) and `.aftermovie-preferences.json` (favorites / bans / reserved pins). Both go through the `SidecarStore` Module (`analyze/sidecar.py`), which owns mtime-aware caching, atomic writes, and malformed-input recovery so the per-file Adapters stay thin.
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

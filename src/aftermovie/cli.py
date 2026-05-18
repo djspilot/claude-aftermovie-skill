@@ -466,6 +466,7 @@ def cmd_show_config(args: argparse.Namespace) -> None:
 
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Self-check for ffmpeg, python deps, LUTs, optional MCP/mediapipe."""
+    import os
     import shutil
 
     from aftermovie.analyze.live_photo import _EXIFTOOL
@@ -473,6 +474,8 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     from aftermovie.analyze.faces import _MEDIAPIPE, available as faces_available
     from aftermovie.config import lut_dir
     from aftermovie.optional_dep import optional_import
+    from aftermovie.render.chip import detect_chip
+    from aftermovie.render.encoder import select_from_env
     from aftermovie.score import components as sc
 
     print("aftermovie doctor")
@@ -484,6 +487,24 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     print(f"  ffmpeg:        {'OK ' + ff if ff else 'MISSING'}")
     print(f"  ffprobe:       {'OK ' + fp if fp else 'MISSING'}")
     print(f"  exiftool:      {'OK ' + et if et else 'not installed (single-file Live Photos will be used as stills only)'}")
+
+    # B3: chip + encoder report. Surfaces the autoselected codec so users
+    # can confirm hardware encoding is in play before queuing a long render.
+    chip = detect_chip()
+    encoder = select_from_env(chip)
+    env_override = (os.environ.get("AFTERMOVIE_VIDEO_CODEC") or "").strip().lower()
+    selection_note = (
+        f"(from AFTERMOVIE_VIDEO_CODEC={env_override})"
+        if env_override and env_override != "auto"
+        else "(selected automatically)"
+    )
+    cores_blurb = (
+        f"{chip.eff_cores} efficiency + {chip.perf_cores} performance, "
+        f"est. {chip.media_engines} media engine{'s' if chip.media_engines != 1 else ''}"
+    )
+    print(f"  chip:          {chip.brand} ({cores_blurb})")
+    print(f"  encoder:       {encoder.video_args[1]} {selection_note}")
+    print(f"  decode hw:     {'videotoolbox' if encoder.is_hardware else 'cpu'}")
 
     for mod in ("librosa", "numpy", "soundfile", "scipy"):
         try:

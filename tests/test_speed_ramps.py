@@ -16,6 +16,7 @@ import pytest
 
 from aftermovie.ffmpeg_cmd import ffprobe_json
 from aftermovie.render import pipeline as render_pipeline
+from aftermovie.render.encoder import X264
 
 
 def test_ramp_speeds_collapses_when_endpoints_close():
@@ -68,7 +69,7 @@ def test_prerender_emits_time_varying_setpts(tmp_path, monkeypatch):
     ok = render_pipeline._prerender_clip(
         entry, tmp_path / "out.mp4",
         aspect="16:9", target_res="320x240", target_fps=24,
-        lut=None, keep_audio=False,
+        lut=None, keep_audio=False, encoder=X264,
     )
     assert ok
     cmd = captured[-1]
@@ -98,7 +99,7 @@ def test_prerender_no_ramp_uses_constant_setpts(tmp_path, monkeypatch):
     ok = render_pipeline._prerender_clip(
         entry, tmp_path / "out.mp4",
         aspect="16:9", target_res="320x240", target_fps=24,
-        lut=None, keep_audio=False,
+        lut=None, keep_audio=False, encoder=X264,
     )
     assert ok
     vf = captured[-1][captured[-1].index("-vf") + 1]
@@ -122,7 +123,7 @@ def test_prerender_subtle_ramp_collapses_to_constant(tmp_path, monkeypatch):
     ok = render_pipeline._prerender_clip(
         entry, tmp_path / "out.mp4",
         aspect="16:9", target_res="320x240", target_fps=24,
-        lut=None, keep_audio=False,
+        lut=None, keep_audio=False, encoder=X264,
     )
     assert ok
     vf = captured[-1][captured[-1].index("-vf") + 1]
@@ -145,7 +146,7 @@ def test_prerender_ramp_pad_dur_uses_ramp_native_duration(tmp_path, monkeypatch)
     ok = render_pipeline._prerender_clip(
         entry, tmp_path / "out.mp4",
         aspect="16:9", target_res="320x240", target_fps=24,
-        lut=None, keep_audio=False,
+        lut=None, keep_audio=False, encoder=X264,
     )
     assert ok
     vf = captured[-1][captured[-1].index("-vf") + 1]
@@ -208,6 +209,8 @@ def test_ramp_plan_renders_to_expected_duration(tmp_path: Path, fixtures_dir: Pa
     # slot is 3.0s and the renderer hard-caps with `-t 3.000`; allow ±0.1s
     # for container/frame quantisation.
     assert 2.9 <= dur <= 3.1, f"expected ~3.0s output, got {dur}"
-    # Output must be h264 video.
+    # Output must be a recognised mp4 codec. After B1 the default encoder
+    # is chip-dependent (libx264 on Linux, hevc_videotoolbox on Apple
+    # Silicon), so accept either.
     codecs = {s.get("codec_name") for s in info.get("streams", [])}
-    assert "h264" in codecs, f"expected h264, got {codecs}"
+    assert codecs & {"h264", "hevc"}, f"expected h264 or hevc, got {codecs}"

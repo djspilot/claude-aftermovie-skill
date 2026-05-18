@@ -116,4 +116,10 @@ AFTERMOVIE_CHRONOLOGICAL=true         # order entries by EXIF/creation_time afte
 
 # ---- Output ----
 AFTERMOVIE_OUTPUT_DIR=~/Downloads     # `auto` writes here when --output is omitted
+
+# ---- Render encoder ----
+# auto = pick best for the chip (hevc_videotoolbox on Apple Silicon, x264 elsewhere).
+# x264 forces CPU encode (universal, slower).
+# h264_vt / hevc_vt force VideoToolbox (Apple Silicon only; falls back to auto if unavailable).
+AFTERMOVIE_VIDEO_CODEC=auto
 """

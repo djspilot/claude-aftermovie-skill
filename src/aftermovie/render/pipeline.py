@@ -19,6 +19,14 @@ from aftermovie.config import DEFAULT_FPS, DEFAULT_RES, resolve_lut
 from aftermovie.ffmpeg_cmd import log, run
 from aftermovie.render.audio_mix import filtergraph as audio_filtergraph
 from aftermovie.render.audio_mix import needs_clip_audio
+from aftermovie.render.chip import detect_chip
+from aftermovie.render.encoder import (
+    EncoderProfile,
+    hwaccel_input_flags,
+    select_from_env,
+    vfilter_input_shim,
+    vfilter_output_guard,
+)
 from aftermovie.render.filters import aspect_filter
 from aftermovie.render.reframe import crop_x_expr_for_entry
 from aftermovie.render.titles import (
@@ -82,6 +90,7 @@ def _ramp_speeds(entry: dict) -> tuple[float, float]:
 def _prerender_clip(entry: dict, out_clip: Path, *,
                     aspect: str, target_res: str, target_fps: int,
                     lut: Path | None, keep_audio: bool,
+                    encoder: EncoderProfile,
                     enable_reframe: bool = True) -> bool:
     src = Path(entry["source"])
     duration = entry["end_s"] - entry["start_s"]
@@ -99,6 +108,14 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
 
     target_w, target_h = _aspect_dims(aspect, target_res)
     vfilter: list[str] = []
+
+    # B2: when -hwaccel videotoolbox is in effect, decoded frames arrive as
+    # VT hardware surfaces. The first filter must hwdownload them to NV12 so
+    # the rest of the chain (scale/crop/setpts/lut3d/tpad) can run on the
+    # CPU. SW profiles return None and we skip the shim entirely.
+    input_shim = vfilter_input_shim(encoder)
+    if input_shim:
+        vfilter.append(input_shim)
 
     reframe_filter = None
     if (enable_reframe and aspect == "9:16"
@@ -162,6 +179,12 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     pad_dur = max(0.0, slot_dur - native_out_dur)
     if pad_dur > 0.05:
         vfilter.append(f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}")
+    # B5: VT encoders are picky about input pixel formats. Re-assert the
+    # encoder's target pixfmt at the tail of the chain so setpts/tpad/lut3d
+    # outputs don't fall through to a format VT rejects.
+    output_guard = vfilter_output_guard(encoder)
+    if output_guard:
+        vfilter.append(output_guard)
     vf = ",".join(vfilter)
 
     final_dur = slot_dur
@@ -175,6 +198,10 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         cmd += ["-f", "lavfi", "-t", f"{duration:.3f}",
                 "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
         audio_input_idx = 0
+    # B2: HW-decode the source when the encoder is a VT variant. The flags
+    # must come *before* the `-i` for the input they apply to; the silent
+    # anullsrc input above stays SW (CPU-side lavfi), which is what we want.
+    cmd += hwaccel_input_flags(encoder)
     cmd += [
         "-ss", f"{entry['start_s']:.3f}",
         "-i", str(src),
@@ -220,8 +247,8 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     else:
         cmd += ["-an"]
     cmd += [
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-pix_fmt", "yuv420p",
+        *encoder.video_args,
+        "-pix_fmt", encoder.pix_fmt,
         "-t", f"{slot_dur:.3f}",
         str(out_clip),
     ]
@@ -274,10 +301,17 @@ def cmd_render(args: argparse.Namespace) -> None:
     keep_audio = needs_clip_audio(audio_mix)
     use_filter_complex = transitions_active or bool(titles)
 
+    # B1+B3: resolve the encoder profile once per render. detect_chip() is
+    # cheap (one sysctl on darwin, nothing elsewhere) and select_from_env
+    # honours AFTERMOVIE_VIDEO_CODEC while falling back gracefully when an
+    # env value asks for a profile ffmpeg doesn't ship.
+    encoder = select_from_env(detect_chip())
+
     log(f"Rendering {len(entries)} cuts → {output.name}")
     log(f"  res={target_res} fps={target_fps} aspect={aspect}"
         f" audio={audio_mix} transitions={'yes' if transitions_active else 'no'}"
         f" titles={'yes' if titles else 'no'}"
+        f" encoder={encoder.name}"
         f"{' lut=' + lut.name if lut else ''}")
 
     with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmpdir:
@@ -297,6 +331,7 @@ def cmd_render(args: argparse.Namespace) -> None:
                 render_entry, out_clip,
                 aspect=aspect, target_res=target_res, target_fps=target_fps,
                 lut=lut, keep_audio=keep_audio,
+                encoder=encoder,
                 enable_reframe=enable_reframe,
             )
             if not ok:
@@ -330,6 +365,7 @@ def cmd_render(args: argparse.Namespace) -> None:
                 total_duration_s=planned_total,
                 target_fps=target_fps,
                 keep_audio=keep_audio,
+                encoder=encoder,
                 out=intermediate,
             )
         else:
@@ -356,9 +392,13 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
                            *, title_pngs: list[Path], title_times: list[dict],
                            total_duration_s: float,
                            target_fps: int, keep_audio: bool,
+                           encoder: EncoderProfile,
                            out: Path) -> None:
     """Build a single ffmpeg call with xfade transitions and PNG-overlay titles."""
     inputs: list[str] = []
+    # Prerendered clips are already in the encoder's pixfmt, so we don't add
+    # `-hwaccel videotoolbox` here — the HW-decode win lives in _prerender_clip
+    # where the inputs are the heavy original sources (HEVC GoPro etc.).
     for p in clip_paths:
         inputs += ["-i", str(p)]
     for p in title_pngs:
@@ -415,8 +455,8 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
     else:
         cmd += ["-an"]
     cmd += [
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-pix_fmt", "yuv420p",
+        *encoder.video_args,
+        "-pix_fmt", encoder.pix_fmt,
         "-r", str(target_fps),
         "-t", f"{total_duration_s:.3f}",
         str(out),

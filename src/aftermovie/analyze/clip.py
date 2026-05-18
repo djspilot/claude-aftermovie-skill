@@ -8,12 +8,14 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from aftermovie.analyze.analyze_cache import analyze_cache
 from aftermovie.analyze.audio import measure_audio_energy, measure_voice_energy
 from aftermovie.analyze.capture_time import captured_at_for
 from aftermovie.analyze.duplicates import compute_phash, group_duplicates
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
+from aftermovie.analyze.parallel import choose_max_workers, parallel_analyze
 from aftermovie.analyze.quality import (
     exposure_for_image,
     exposure_per_second,
@@ -30,6 +32,7 @@ from aftermovie.analyze.stills import (
 )
 from aftermovie.config import VIDEO_EXTS
 from aftermovie.ffmpeg_cmd import ffprobe_json, log
+from aftermovie.render.chip import detect_chip
 from aftermovie.telemetry.gpmf import extract_gpmf_track, parse_gpmf_motion
 from aftermovie.telemetry.hilight import read_hilight_tags
 from aftermovie.types import ClipInfo
@@ -38,11 +41,21 @@ from aftermovie.types import ClipInfo
 # original HEIC/JPG/PNG so the quality analyzer can read the source image
 # instead of the synthetic mp4 (which has constant frames and would yield a
 # flat sharpness/exposure curve).
+#
+# Lives on the main process only. ProcessPool workers receive `origin_still`
+# explicitly through `_analyze_clip_for_pool` because subprocesses don't
+# inherit this dict after `discover_sources` populates it.
 _STILL_ORIGIN: dict[str, Path] = {}
 
 
-def analyze_clip(path: Path) -> ClipInfo | None:
-    """Run full feature extraction on a single video file."""
+def analyze_clip(path: Path, origin_still: Path | None = None) -> ClipInfo | None:
+    """Run full feature extraction on a single video file.
+
+    `origin_still` overrides the module-level `_STILL_ORIGIN` lookup —
+    pass it explicitly when calling from a ProcessPool worker (where the
+    module-level dict isn't populated). The sequential / in-process
+    callers still get the legacy behaviour with `origin_still=None`.
+    """
     try:
         info = ffprobe_json(path)
     except subprocess.CalledProcessError:
@@ -93,7 +106,8 @@ def analyze_clip(path: Path) -> ClipInfo | None:
     face_bboxes: list[dict | None] = (
         detect_per_second(path, duration) if faces_available() else []
     )
-    origin_still = _STILL_ORIGIN.get(str(path))
+    if origin_still is None:
+        origin_still = _STILL_ORIGIN.get(str(path))
     if origin_still is not None:
         # Stills are sampled from the original image, not the synthetic mp4.
         # Single-element lists by convention — the renderer treats stills as
@@ -142,6 +156,22 @@ def analyze_clip(path: Path) -> ClipInfo | None:
         # duplicate_group is stamped in after the whole catalog is built
         # (we need every clip's phash before we can cluster them).
     )
+
+
+def _analyze_clip_for_pool(arg: tuple[str, str | None]) -> ClipInfo | None:
+    """Picklable worker entry point for `parallel_analyze`.
+
+    Takes a `(path_str, origin_still_str_or_None)` tuple so the worker
+    process — which doesn't see `_STILL_ORIGIN` — knows whether this
+    clip was materialized from a still and where the original lives.
+
+    Returns the same `ClipInfo | None` as `analyze_clip`. Must remain a
+    module-level function (not a closure) so ProcessPoolExecutor can
+    pickle it.
+    """
+    path_str, origin_str = arg
+    origin = Path(origin_str) if origin_str else None
+    return analyze_clip(Path(path_str), origin_still=origin)
 
 
 def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURATION_S,
@@ -220,11 +250,78 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             f"stills: .heic .heif .jpg .png — disable with --no-stills)"
         )
     log(f"Analyzing {len(files)} clips in {folder}")
-    catalog = []
-    for f in files:
-        info = analyze_clip(f)
-        if info:
-            catalog.append(asdict(info))
+
+    # Two-layer cache pass: ask `analyze_cache` for each clip's prior result
+    # before spinning up the worker pool. Cache keys are SHA1(path|mtime|size)
+    # so a single mtime change busts only that one clip — not the whole
+    # folder, the way the higher-level `CatalogRepository` cache does.
+    catalog: list[dict] = [None] * len(files)  # type: ignore[list-item]
+    to_compute: list[tuple[int, Path]] = []
+    n_cached = 0
+    for i, f in enumerate(files):
+        try:
+            key = analyze_cache.key_for(f)
+        except OSError:
+            # File vanished between discovery and stat — let analyze_clip
+            # produce its own "skip (probe failed)" log.
+            to_compute.append((i, f))
+            continue
+        hit = analyze_cache.get(key)
+        if hit is not None:
+            catalog[i] = hit
+            n_cached += 1
+        else:
+            to_compute.append((i, f))
+
+    n_misses = len(to_compute)
+    if n_misses == 0:
+        log(f"  analyze: {n_cached} cached, 0 to compute")
+    else:
+        # Build (path_str, origin_still_str_or_None) tuples so the pool
+        # workers — which don't see `_STILL_ORIGIN` — know whether a clip
+        # was materialized from a still.
+        chip = detect_chip()
+        max_workers = choose_max_workers(chip)
+        # `parallel_analyze` further short-circuits to inline-sequential
+        # for `max_workers=1` (the AFTERMOVIE_ANALYZE_WORKERS=1 path).
+        n_workers = max(1, min(max_workers, n_misses))
+        log(f"  analyze: {n_cached} cached, {n_misses} to compute "
+            f"({n_workers} worker{'s' if n_workers != 1 else ''})")
+
+        work_items: list[tuple[str, str | None]] = []
+        for _slot, p in to_compute:
+            origin = _STILL_ORIGIN.get(str(p))
+            work_items.append((str(p), str(origin) if origin else None))
+
+        def _on_done(idx: int, total: int, item: tuple[str, str | None], elapsed: float) -> None:
+            path_str, _origin = item
+            name = Path(path_str).name
+            log(f"  analyzed {name} ({elapsed:.1f}s)  [{idx}/{total}]")
+
+        results = parallel_analyze(
+            work_items, _analyze_clip_for_pool,
+            max_workers=n_workers, progress_cb=_on_done,
+        )
+
+        for (slot, path), info in zip(to_compute, results):
+            if info is None:
+                continue
+            catalog[slot] = asdict(info)
+            # Cache the fresh result so the next run skips re-analysis.
+            # Failed analyses (info is None) deliberately don't land here.
+            try:
+                key = analyze_cache.key_for(path)
+                analyze_cache.put(key, info)
+            except OSError:
+                # Stat failed — file vanished between dispatch and cache
+                # write. Skip the cache update; the catalog still has the
+                # result, just not the cache speedup next time.
+                pass
+
+    # Drop empty slots (failed analyses) without disturbing the order of
+    # the rest. The downstream phash/duplicate clustering then only sees
+    # successful clips.
+    catalog = [c for c in catalog if c is not None]
 
     # Visual-duplicate grouping: once every clip has a phash we can cluster
     # near-identical shots across the whole folder. Singletons and clips

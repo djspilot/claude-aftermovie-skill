@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import socket
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -145,6 +146,66 @@ def test_thumbnail_is_jpeg(tmp_path: Path) -> None:
         assert status == 200
         assert headers.get("Content-Type") == "image/jpeg"
         assert body[:2] == b"\xff\xd8"
+
+
+def test_api_plan_returns_404_when_no_plan(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """`GET /api/plan` returns 404 + `{"error":"no_plan"}` when nothing in
+    state.plan_dir() is tagged with the current clips_root's catalog_id."""
+    clear_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+
+    # Point state's data_dir at an empty tmp dir so we don't see leftovers
+    # from other test runs on this machine.
+    from aftermovie import config, state
+    fake_data = tmp_path / "state"
+    fake_data.mkdir()
+    monkeypatch.setattr(config, "data_dir", lambda: fake_data)
+    monkeypatch.setattr(state, "data_dir", lambda: fake_data)
+
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        req = urllib.request.Request(f"{srv.url}api/plan", method="GET")
+        try:
+            urllib.request.urlopen(req, timeout=5.0)
+            raise AssertionError("expected 404 from /api/plan with no plans on disk")
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+            body = json.loads(e.read())
+            assert body == {"error": "no_plan"}
+
+
+def test_api_plan_returns_matching_plan(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """When a plan tagged with the current catalog_id is on disk, /api/plan
+    returns its JSON verbatim."""
+    clear_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+
+    # Redirect state dirs into tmp_path so this test is hermetic.
+    from aftermovie import config, state
+    fake_data = tmp_path / "state"
+    fake_data.mkdir()
+    monkeypatch.setattr(config, "data_dir", lambda: fake_data)
+    monkeypatch.setattr(state, "data_dir", lambda: fake_data)
+
+    catalog_id = state.catalog_id_for(clips_dir)
+    plan = {
+        "entries": [{"source": "x.mp4", "start_s": 0.0, "end_s": 1.0}],
+        "aspect": "16:9",
+        "_aftermovie": {"catalog_id": catalog_id},
+    }
+    state.save_plan("test-plan-1234", plan)
+
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        status, body, _ = _http_get(f"{srv.url}api/plan")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["entries"] == plan["entries"]
+    assert payload["_aftermovie"]["catalog_id"] == catalog_id
 
 
 def test_excluded_files_skipped_in_discover_sources(

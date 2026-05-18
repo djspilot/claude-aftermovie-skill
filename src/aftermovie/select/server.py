@@ -207,6 +207,71 @@ class _LogCapture(io.TextIOBase):
                 pass
 
 
+def _persist_render_artifacts(clips: Path, job: RenderJob) -> None:
+    """After a successful render, copy the per-job catalog + plan from the
+    temp workdir into `state.catalog_dir()` / `state.plan_dir()` so the
+    `/api/plan` endpoint has a stable place to find them on next request.
+
+    Best-effort: if the temp workdir was already cleaned or `run_auto` didn't
+    leave artifacts on disk (e.g. the `--from-plan` short-circuit path), the
+    fallback is to leave state unchanged. Errors here are swallowed onto the
+    job's log_tail — they must NOT mark the render as failed.
+    """
+    try:
+        import json as _json
+        import re as _re
+
+        from aftermovie import state
+
+        # `run_auto` logs `Working dir: <path>` to stderr (captured into
+        # `log_tail`). Scan from the tail backwards for the most recent one.
+        workdir: Path | None = None
+        for line in reversed(list(job.log_tail)):
+            m = _re.match(r"Working dir:\s*(.+)$", line)
+            if m:
+                workdir = Path(m.group(1).strip())
+                break
+        if workdir is None or not workdir.is_dir():
+            return
+
+        catalog_src = workdir / "catalog.json"
+        plan_src = workdir / "plan.json"
+        catalog_id = state.catalog_id_for(clips)
+        if catalog_src.is_file():
+            try:
+                catalog = _json.loads(catalog_src.read_text())
+                state.save_catalog(catalog_id, catalog)
+            except (OSError, ValueError):
+                pass
+        if plan_src.is_file():
+            try:
+                plan = _json.loads(plan_src.read_text())
+                # Stamp the catalog_id onto the plan so /api/plan can match
+                # plans back to a clips folder without re-parsing every plan.
+                if isinstance(plan, dict):
+                    plan.setdefault("_aftermovie", {})["catalog_id"] = catalog_id
+                # Plan IDs are content-hashed; if we can't derive a richer id
+                # from plan metadata, fall back to a hash of the file bytes.
+                song_path = plan.get("song") if isinstance(plan, dict) else None
+                theme = plan.get("theme") if isinstance(plan, dict) else None
+                target_length = plan.get("max_length") if isinstance(plan, dict) else None
+                aspect = plan.get("aspect", "16:9") if isinstance(plan, dict) else "16:9"
+                if song_path:
+                    plan_id = state.plan_id_for(
+                        catalog_id, Path(song_path), theme, target_length, aspect, 0
+                    )
+                else:
+                    import hashlib as _hashlib
+                    plan_id = _hashlib.sha1(
+                        plan_src.read_bytes()
+                    ).hexdigest()[:12]
+                state.save_plan(plan_id, plan)
+            except (OSError, ValueError):
+                pass
+    except Exception as e:  # noqa: BLE001 — persistence is best-effort
+        job.log_tail.append(f"[persist] {type(e).__name__}: {e}")
+
+
 def _run_render_job(
     job: RenderJob,
     clips: Path,
@@ -243,6 +308,9 @@ def _run_render_job(
         result_path = run_auto(clips, song, out_path, opts)
         job.output_path = str(result_path)
         job.state = "done"
+        # Persist catalog + plan into ~/.skills-data/aftermovie/ so the
+        # `/api/plan` endpoint has something to find on the next request.
+        _persist_render_artifacts(clips, job)
     except Exception as e:
         tb = traceback.format_exc()
         job.error = f"{type(e).__name__}: {e}"
@@ -311,6 +379,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if route == "/api/options":
                 self._serve_options()
+                return
+            if route == "/api/plan":
+                self._serve_plan()
                 return
             m = re.match(r"^/thumbs/([A-Fa-f0-9]+)\.jpg$", route)
             if m:
@@ -409,6 +480,44 @@ class _Handler(BaseHTTPRequestHandler):
             "aspect": ["16:9", "9:16", "1:1"],
             "resolution": ["1920x1080", "1080x1920", "1080x1080", "1280x720"],
         })
+
+    def _serve_plan(self) -> None:
+        """Return the most-recent plan JSON associated with this clips_root.
+
+        Plans get stamped with `_aftermovie.catalog_id` when persisted by
+        `_persist_render_artifacts`, so we match by that. Falls through to a
+        404 `{"error": "no_plan"}` when no matching plan exists yet (i.e. the
+        user hasn't kicked off a render from this folder before).
+        """
+        from aftermovie import state
+
+        try:
+            catalog_id = state.catalog_id_for(self.clips_root)
+        except Exception as e:
+            self._send_json({"error": "server_error", "detail": str(e)}, status=500)
+            return
+
+        plan_dir = state.plan_dir()
+        if not plan_dir.is_dir():
+            self._send_json({"error": "no_plan"}, status=404)
+            return
+
+        # Walk plans newest-first; return the first one tagged with our id.
+        candidates = sorted(
+            plan_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime if p.is_file() else 0.0,
+            reverse=True,
+        )
+        for p in candidates:
+            try:
+                plan = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            tag = plan.get("_aftermovie") if isinstance(plan, dict) else None
+            if isinstance(tag, dict) and tag.get("catalog_id") == catalog_id:
+                self._send_json(plan)
+                return
+        self._send_json({"error": "no_plan"}, status=404)
 
     def _serve_thumb(self, key: str) -> None:
         # Look up the SourceRow whose key matches; this also ensures the

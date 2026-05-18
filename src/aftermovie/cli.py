@@ -578,6 +578,35 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     print(f"  encoder:       {encoder.video_args[1]} {selection_note}")
     print(f"  decode hw:     {'videotoolbox' if encoder.is_hardware else 'cpu'}")
 
+    # F2: analyze pool sizing + per-clip cache footprint. Pulled in here so
+    # users can confirm the chip-aware worker count before kicking off a
+    # 60-clip analyze run that used to peg one core for minutes.
+    from aftermovie.analyze.analyze_cache import analyze_cache
+    from aftermovie.analyze.parallel import choose_max_workers
+
+    workers = choose_max_workers(chip)
+    if chip.perf_cores > 0:
+        worker_note = (
+            f"{chip.brand}: {chip.perf_cores} P-cores - 2 reserve"
+        )
+    else:
+        worker_note = f"{chip.brand}: default floor"
+    print(f"  analyze workers: {workers} ({worker_note})")
+
+    cache_root = analyze_cache.root()
+    entries = analyze_cache.entries()
+    n_entries = len(entries)
+    total_bytes = analyze_cache.total_bytes()
+    if total_bytes < 1024:
+        size_str = f"{total_bytes} B"
+    elif total_bytes < 1024 * 1024:
+        size_str = f"{total_bytes / 1024:.1f} KB"
+    elif total_bytes < 1024 * 1024 * 1024:
+        size_str = f"{total_bytes / (1024 * 1024):.1f} MB"
+    else:
+        size_str = f"{total_bytes / (1024 * 1024 * 1024):.2f} GB"
+    print(f"  analyze cache:   {cache_root} ({n_entries} entries, {size_str})")
+
     for mod in ("librosa", "numpy", "soundfile", "scipy"):
         try:
             __import__(mod)

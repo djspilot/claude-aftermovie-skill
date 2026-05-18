@@ -132,6 +132,15 @@ _BROWSE_TIMEOUT_S = 5.0
 def _browse_cameras(force: bool = False) -> list[Any]:
     """Return the currently-attached ICC cameras (cached).
 
+    **Thread invariant**: `ICDeviceBrowser` dispatches callbacks to the
+    *main* thread's run loop. Pumping `NSRunLoop.currentRunLoop()` on a
+    worker thread (e.g. inside an HTTP request handler) would block forever
+    waiting for events that are never delivered there. So a real browse is
+    only performed when called from the main thread; off-thread callers
+    receive the last cached result (possibly empty if no main-thread call
+    has primed it yet). Callers that need fresh data should pre-warm at
+    process startup on the main thread.
+
     The browser is event-driven; we run it for up to ~5s, collect every
     `didAddDevice` callback, then stop. Cached for 30s so repeated calls
     from `all_sources()` (multiple per CLI invocation) don't stall.
@@ -139,10 +148,17 @@ def _browse_cameras(force: bool = False) -> list[Any]:
     global _BROWSE_CACHE
     if not _ICC.available:
         return []
+    on_main = threading.current_thread() is threading.main_thread()
     with _BROWSE_LOCK:
         now = time.time()
-        if not force and _BROWSE_CACHE is not None and _BROWSE_CACHE.expires_at > now:
+        cache_fresh = _BROWSE_CACHE is not None and _BROWSE_CACHE.expires_at > now
+        if not force and cache_fresh:
             return list(_BROWSE_CACHE.devices)
+        if not on_main:
+            # Off-thread: never trigger a real browse — would deadlock on
+            # NSRunLoop waiting for main-thread events. Serve stale cache
+            # (or empty if no main-thread warmup ever ran).
+            return list(_BROWSE_CACHE.devices) if _BROWSE_CACHE else []
         try:
             devices = _browse_cameras_uncached()
         except Exception as e:
@@ -150,6 +166,16 @@ def _browse_cameras(force: bool = False) -> list[Any]:
             devices = []
         _BROWSE_CACHE = _CachedBrowse(devices=devices, expires_at=now + _BROWSE_TTL_S)
         return list(devices)
+
+
+def prewarm_browse_cache() -> None:
+    """Force one ICC browse on the main thread to populate the cache.
+
+    Surfaces (`aftermovie select`, `aftermovie import`) should call this at
+    startup so subsequent calls from worker threads (HTTP handlers, render
+    jobs) have a populated cache to read from.
+    """
+    _browse_cameras(force=True)
 
 
 def _browse_cameras_uncached() -> list[Any]:

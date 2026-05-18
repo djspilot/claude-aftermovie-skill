@@ -319,6 +319,14 @@ def cmd_select(args: argparse.Namespace) -> None:
     if not clips.is_dir():
         raise SystemExit(f"--clips path is not a directory: {clips}")
     song = Path(args.song).expanduser().resolve() if args.song else None
+    # Prewarm ICC camera browse on the main thread before the HTTP server's
+    # worker threads start serving /api/import-sources — see
+    # import_sources/gopro_icc.py::_browse_cameras for the threading invariant.
+    try:
+        from aftermovie.import_sources.gopro_icc import prewarm_browse_cache
+        prewarm_browse_cache()
+    except Exception:
+        pass  # ICC is optional; don't block the GUI on a broken adapter
     run_server(clips, port=args.port, song=song,
                open_browser=not args.no_open)
 

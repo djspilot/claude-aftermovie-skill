@@ -146,8 +146,12 @@ def test_max_length_override_caps_below_song(tmp_path: Path,
 
 def test_stretch_mode_fills_target_with_small_source_folder(
         capsys: pytest.CaptureFixture[str]):
-    """5 unique clips + 60s target → planner stretches to fill ~60s and
-    emits a `stretch-mode` log line for at least one of the three levers."""
+    """5 unique 4s clips + 60s target → planner stretches to fill ~60s.
+
+    Under F3 moment-budget mode each 4s clip's budget caps at 1 so this
+    test exercises the legacy `stretch_stills` even-distribution path
+    (lever 2 / lever 3 are downstream of allocate). The total must still
+    fill the target window and the moment-budget log line must surface."""
     catalog = {"clips": [_clip(f"/c{i}.mp4", duration=4.0) for i in range(5)]}
     song = _song(duration_s=60.0, tempo_bpm=120.0)
 
@@ -161,23 +165,24 @@ def test_stretch_mode_fills_target_with_small_source_folder(
         f"stretch mode failed to fill 60s target (got {total:.1f}s)"
 
     err = capsys.readouterr().err
-    # At least one lever fired — `source_cap` bump (either the existing
-    # auto-bump inside `allocate_candidates` or my C3 stretch-mode bump),
-    # the still stretch, or the tail stretch. Each lever logs a stable
-    # substring so we can grep for any of them.
-    assert ("stretch-mode" in err
-            or "auto-bumped" in err
-            or "bumped source_cap" in err
+    # F3: the moment-budget log line replaces the old subset/auto-bump
+    # surfacing. Stretch levers may still fire (when even-distribution
+    # falls short of target) so accept any of them too.
+    assert ("moment budget" in err
+            or "stretch-mode" in err
             or "stretched" in err), \
-        f"expected a stretch / cap-bump log line, got stderr: {err!r}"
+        f"expected a moment-budget / stretch log line, got stderr: {err!r}"
 
 
-def test_subset_mode_trims_huge_pool_to_top_candidates(
+def test_moment_budget_protects_winners_from_huge_pool(
         capsys: pytest.CaptureFixture[str]):
-    """200 candidates + 30s target → planner keeps the top scorers and
-    surfaces a subset-mode log line. The chosen sources must be dominated
-    by the high-scoring "winners" — quality dilution is the bug subset
-    mode exists to prevent."""
+    """F3: 200 short clips + 30s target → planner picks the top winners by
+    score from the moment-budgeted pool. Replaces the legacy C4 subset-mode
+    behavior, which globally trimmed the pool's tail; the new behavior
+    keeps every source's best window AND still surfaces the top scorers.
+
+    Winners must dominate because their per-source budget=1 candidate
+    out-scores every quiet source's per-source budget=1 candidate."""
     # 200 candidates, all roughly the same baseline score except 15 with
     # HiLight tags so they out-score everything else.
     winners = {f"/w{i}.mp4" for i in range(15)}
@@ -191,32 +196,28 @@ def test_subset_mode_trims_huge_pool_to_top_candidates(
     catalog = {"clips": clips}
     song = _song(duration_s=30.0, tempo_bpm=120.0)
 
-    # source_cap=3 lets each winner appear up to 3× in the plan; with 30
-    # cuts and 15 winners that means a healthy plan needs ~10-15 unique
-    # candidates rather than 30. (At cap=1 we'd be forced to dip into
-    # lower-scoring quiet clips simply to fill the slot count, defeating
-    # the test.) Tests the "use the top by score, not the first-N by time"
-    # acceptance criterion from the plan.
+    # source_cap=3 is the user's hard ceiling; the moment budget for each
+    # 4s clip is 1 so the effective per-source cap clamps to 1 anyway.
+    # The planner should fill ~30 slots from 30 unique sources, leading
+    # with all 15 winners.
     plan = build_plan(catalog, song, target_len=30.0, no_speed_ramp=True,
                       pace="medium", source_cap=3, chronological=False,
                       burst_window_s=0.0)
 
     err = capsys.readouterr().err
-    assert "subset-mode" in err, \
-        f"expected subset-mode log, got stderr: {err!r}"
+    assert "moment budget" in err, \
+        f"expected moment-budget log, got stderr: {err!r}"
 
-    assert plan, "subset mode should still produce a populated plan"
+    assert plan, "planner should still produce a populated plan"
     chosen = {e["source"] for e in plan}
-    # All 15 winners must make it into the plan — subset mode is here to
+    # All 15 winners must make it into the plan — moment budget is here to
     # protect the top scorers from being crowded out by the noise pool.
     winners_used = chosen & winners
     assert winners_used == winners, \
-        f"subset mode dropped {len(winners) - len(winners_used)} winner(s) " \
-        f"from the plan: missing {winners - winners_used}"
-    # And the plan must not pad itself out with the rejected low-score pool:
-    # there are only 21 non-winner candidates in the trimmed top-36 anyway,
-    # so this guard tightens to the same upper bound.
-    non_winners = chosen - winners
-    assert len(non_winners) <= 25, \
-        f"too many low-score sources leaked into the plan: {len(non_winners)} " \
-        f"({sorted(non_winners)[:5]}…)"
+        f"moment-budget mode dropped {len(winners) - len(winners_used)} " \
+        f"winner(s) from the plan: missing {winners - winners_used}"
+    # And every entry must be a unique source (budget=1 per short clip):
+    # no source repeats, even though source_cap=3 would have allowed up to 3.
+    assert len(chosen) == len(plan), \
+        f"expected one unique source per entry, got {len(chosen)} sources " \
+        f"for {len(plan)} entries"

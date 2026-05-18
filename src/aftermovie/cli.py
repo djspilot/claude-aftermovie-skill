@@ -303,6 +303,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Print the effective defaults (from env file + builtins).")
     pl.set_defaults(func=cmd_show_config)
 
+    pca = sub.add_parser("cache",
+                         help="Manage the per-clip prerender cache.")
+    cache_sub = pca.add_subparsers(dest="cache_cmd", required=True)
+    pca_stats = cache_sub.add_parser(
+        "stats",
+        help="Print prerender-cache disk usage, hit/miss counts, and entry stats.",
+    )
+    pca_stats.set_defaults(func=cmd_cache_stats)
+    pca_clear = cache_sub.add_parser(
+        "clear", help="Wipe the prerender cache (asks for confirmation).",
+    )
+    pca_clear.add_argument("--yes", action="store_true",
+                           help="Skip the interactive confirmation prompt.")
+    pca_clear.set_defaults(func=cmd_cache_clear)
+
     return p
 
 
@@ -464,6 +479,63 @@ def cmd_show_config(args: argparse.Namespace) -> None:
             print(f"  -- {described['description']}")
 
 
+def _fmt_bytes(n: int) -> str:
+    """Render a byte count as a friendly human-readable string."""
+    if n < 1024:
+        return f"{n} B"
+    units = ["KB", "MB", "GB", "TB"]
+    val = float(n)
+    for u in units:
+        val /= 1024.0
+        if val < 1024.0:
+            return f"{val:.2f} {u}"
+    return f"{val:.2f} PB"
+
+
+def _fmt_ts(ts: float | None) -> str:
+    """Format an atime float as ISO local-time, or '-' when no entries."""
+    if ts is None:
+        return "-"
+    from datetime import datetime
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def cmd_cache_stats(args: argparse.Namespace) -> None:
+    """Print prerender-cache stats — disk usage, hits, misses, etc."""
+    from aftermovie.render.prerender_cache import PrerenderCache
+
+    cache = PrerenderCache()
+    s = cache.stats()
+    total = max(1, s["hits"] + s["misses"])
+    hit_pct = 100.0 * s["hits"] / total
+    print("aftermovie prerender cache")
+    print("--------------------------")
+    print(f"  root:        {s['root']}")
+    print(f"  entries:     {s['entry_count']}")
+    print(f"  disk used:   {_fmt_bytes(s['bytes_used'])} "
+          f"/ cap {_fmt_bytes(s['cap_bytes'])}")
+    print(f"  hits:        {s['hits']}")
+    print(f"  misses:      {s['misses']}")
+    print(f"  hit rate:    {hit_pct:.1f}% (since last clear)")
+    print(f"  oldest used: {_fmt_ts(s['oldest_atime'])}")
+    print(f"  newest used: {_fmt_ts(s['newest_atime'])}")
+
+
+def cmd_cache_clear(args: argparse.Namespace) -> None:
+    """Wipe the prerender cache. Asks for confirmation unless --yes."""
+    from aftermovie.render.prerender_cache import PrerenderCache
+
+    cache = PrerenderCache()
+    root = cache.root
+    if not getattr(args, "yes", False):
+        resp = input(f"Wipe prerender cache at {root}? [y/N] ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("Aborted.")
+            return
+    cache.clear()
+    print(f"Cleared prerender cache at {root}")
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Self-check for ffmpeg, python deps, LUTs, optional MCP/mediapipe."""
     import os
@@ -557,6 +629,8 @@ __all__ = [
     "EffectiveConfig",
     "build_parser",
     "cmd_auto",
+    "cmd_cache_clear",
+    "cmd_cache_stats",
     "cmd_init_config",
     "cmd_show_config",
     "main",

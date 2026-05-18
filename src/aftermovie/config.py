@@ -19,28 +19,10 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".insv", ".lrv", ".MP4", ".MOV", ".M4V"}
 
 # ---- Theme presets -----------------------------------------------------------
 
-THEMES: dict[str, dict] = {
-    "cinematic": {
-        "lut": "cinematic", "music_db": -9.0, "no_speed_ramp": False,
-        "transitions": "soft", "audio_mix": "ducked", "pace": "medium",
-        "description": "Glide-y crossfades, ducked audio — looks like a Quik edit.",
-    },
-    "punchy": {
-        "lut": "punchy", "music_db": -6.0, "no_speed_ramp": False,
-        "transitions": "auto", "audio_mix": "ducked", "pace": "fast",
-        "description": "Fast cuts, whips on peaks, hot music — hype mode.",
-    },
-    "chill": {
-        "lut": "chill", "music_db": -10.0, "no_speed_ramp": True,
-        "transitions": "soft", "audio_mix": "ducked", "pace": "slow",
-        "description": "Slow downbeat pacing, soft crossfades, no ramps.",
-    },
-    "nostalgic": {
-        "lut": "nostalgic", "music_db": -10.0, "no_speed_ramp": False,
-        "transitions": "soft", "audio_mix": "ducked", "pace": "medium",
-        "description": "Film-look LUT, warm fades, ducked voice-aware audio.",
-    },
-}
+# The canonical THEMES dict now lives in `aftermovie.themes` (the Theme
+# Resolver Module). Re-exported here for back-compat — existing imports
+# like `from aftermovie.config import THEMES` keep working.
+from aftermovie.themes import THEMES  # noqa: E402,F401
 
 # ---- Paths -------------------------------------------------------------------
 

@@ -236,6 +236,79 @@ def _run_render_job(
         job.finished_at = time.time()
 
 
+def _run_import_job_subprocess(
+    job: ImportJob,
+    source_names: list[str],
+    since_str: str,
+    until_str: str,
+    dest_parent: Path,
+    dry_run: bool,
+) -> None:
+    """Run the import by spawning `aftermovie import` as a subprocess.
+
+    Some Adapters (notably `GoProICCAdapter`, which talks to MTP cameras
+    via ImageCaptureCore) require the *process main thread* — Cocoa's
+    NSRunLoop delivers ICC delegate callbacks only there. SelectionService
+    runs in HTTP worker threads, so we shell out to the CLI, which gets
+    its own fresh process with its own main thread.
+
+    Parses the CLI's stderr lines into `job.copied/skipped/failed`.
+    """
+    import re
+    import subprocess
+    import sys as _sys
+
+    cmd = [
+        _sys.executable, "-m", "aftermovie", "import",
+        "--since", since_str, "--until", until_str,
+        "--to", str(dest_parent),
+        "--sources", ",".join(source_names),
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    per_source_re = re.compile(
+        r"copied=(\d+)\s+skipped=(\d+)\s+failed=(\d+)"
+    )
+    in_range_re = re.compile(r":\s+(\d+)\s+item\(s\)\s+in\s+range")
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            job.log_tail.append(line)
+            m = per_source_re.search(line)
+            if m:
+                job.copied += int(m.group(1))
+                job.skipped += int(m.group(2))
+                job.failed += int(m.group(3))
+                continue
+            m = in_range_re.search(line)
+            if m:
+                job.total += int(m.group(1))
+        rc = proc.wait()
+        if rc != 0:
+            job.state = "error"
+            job.error = f"aftermovie import exited with code {rc}"
+            return
+        job.state = "done"
+    except Exception as e:
+        tb = traceback.format_exc()
+        job.error = f"{type(e).__name__}: {e}"
+        for line in tb.splitlines():
+            job.log_tail.append(line)
+        job.state = "error"
+    finally:
+        job.finished_at = time.time()
+
+
 def _run_import_job(
     job: ImportJob,
     sources: list[Any],
@@ -649,12 +722,30 @@ class SelectionService:
         job = ImportJob(job_id=str(uuid.uuid4()), dest_folder=str(dest_folder))
         with self._import_jobs_lock:
             self._import_jobs[job.job_id] = job
-        worker = threading.Thread(
-            target=self._import_runner,
-            args=(job, selected, since_dt, until_dt, dest_folder, dry_run),
-            name=f"import-{job.job_id[:8]}",
-            daemon=True,
+
+        # Sources whose Adapter requires the process main thread
+        # (ImageCaptureCore-based GoPro MTP) must run in a subprocess so
+        # the CLI's own main thread can pump NSRunLoop. If any selected
+        # source needs that, route the whole job through the subprocess
+        # runner. Tests inject a custom `import_runner` to bypass this.
+        needs_subprocess = (
+            self._import_runner is _run_import_job
+            and any(n.startswith("gopro_icc_") for n in source_names)
         )
+        if needs_subprocess:
+            worker = threading.Thread(
+                target=_run_import_job_subprocess,
+                args=(job, source_names, since, until, parent, dry_run),
+                name=f"import-sub-{job.job_id[:8]}",
+                daemon=True,
+            )
+        else:
+            worker = threading.Thread(
+                target=self._import_runner,
+                args=(job, selected, since_dt, until_dt, dest_folder, dry_run),
+                name=f"import-{job.job_id[:8]}",
+                daemon=True,
+            )
         worker.start()
         return job
 

@@ -178,13 +178,19 @@ def prewarm_browse_cache() -> None:
     _browse_cameras(force=True)
 
 
-def _browse_cameras_uncached() -> list[Any]:
-    """One real ICC browse pass. Caller wraps in the cache."""
+# PyObjC's runtime maintains a flat namespace for ObjC classes, so
+# defining `class _BrowserDelegate(NSObject)` inside a function raises
+# "is overriding existing Objective-C class" on the second call. Cache
+# the class at module scope after first definition.
+_BROWSER_DELEGATE_CLS: Any = None
+
+
+def _get_browser_delegate_cls() -> Any:
+    global _BROWSER_DELEGATE_CLS
+    if _BROWSER_DELEGATE_CLS is not None:
+        return _BROWSER_DELEGATE_CLS
     import objc
     from Foundation import NSObject
-    ICC = _ICC.require()
-    if ICC is None:
-        return []
 
     class _BrowserDelegate(NSObject):
         def init(self):
@@ -206,16 +212,48 @@ def _browse_cameras_uncached() -> list[Any]:
             except ValueError:
                 pass
 
-    delegate = _BrowserDelegate.alloc().init()
-    browser = ICC.ICDeviceBrowser.alloc().init()
-    browser.setDelegate_(delegate)
-    browser.setBrowsedDeviceTypeMask_(ICDeviceTypeMaskCamera)
-    browser.start()
-    try:
-        _pump_until(lambda: delegate.done, _BROWSE_TIMEOUT_S)
-    finally:
-        browser.stop()
-    return list(delegate.devices)
+    _BROWSER_DELEGATE_CLS = _BrowserDelegate
+    return _BROWSER_DELEGATE_CLS
+
+
+# Keep the ICDeviceBrowser alive after the browse — `browser.stop()` appears
+# to release the underlying ICCameraDevice handles, so a subsequent
+# `dev.requestOpenSession()` from the cached `devices` list never gets a
+# `deviceDidBecomeReadyWithCompleteContentCatalog_` callback.
+_LIVE_BROWSER: Any = None
+_LIVE_BROWSER_DELEGATE: Any = None
+
+
+def _browse_cameras_uncached() -> list[Any]:
+    """One real ICC browse pass. Caller wraps in the cache.
+
+    The browser is kept running at module scope (`_LIVE_BROWSER`) so the
+    `ICCameraDevice` handles in the returned list stay alive for later
+    `_open_session` / `_download_one` calls. Stopping the browser drops
+    its strong references to the devices and breaks downstream operations.
+    """
+    global _LIVE_BROWSER, _LIVE_BROWSER_DELEGATE
+    ICC = _ICC.require()
+    if ICC is None:
+        return []
+    # Re-use the live browser if it already exists — restarting it can race
+    # with in-flight device sessions. Just refresh the delegate's view by
+    # pumping the run loop briefly.
+    if _LIVE_BROWSER is None:
+        delegate = _get_browser_delegate_cls().alloc().init()
+        browser = ICC.ICDeviceBrowser.alloc().init()
+        browser.setDelegate_(delegate)
+        browser.setBrowsedDeviceTypeMask_(ICDeviceTypeMaskCamera)
+        browser.start()
+        _LIVE_BROWSER = browser
+        _LIVE_BROWSER_DELEGATE = delegate
+    else:
+        # Reset the 'done' flag so the pump waits for at least one batch
+        # of didAddDevice callbacks before returning.
+        _LIVE_BROWSER_DELEGATE.done = False
+
+    _pump_until(lambda: _LIVE_BROWSER_DELEGATE.done, _BROWSE_TIMEOUT_S)
+    return list(_LIVE_BROWSER_DELEGATE.devices)
 
 
 def _device_uuid(dev: Any) -> str:
@@ -268,7 +306,15 @@ class _SessionDelegate:
     """
 
 
-def _make_session_delegate() -> Any:
+# See _BROWSER_DELEGATE_CLS note: caching the class avoids the second-call
+# "overriding existing Objective-C class" error from PyObjC's flat registry.
+_SESSION_DELEGATE_CLS: Any = None
+
+
+def _get_session_delegate_cls() -> Any:
+    global _SESSION_DELEGATE_CLS
+    if _SESSION_DELEGATE_CLS is not None:
+        return _SESSION_DELEGATE_CLS
     import objc
     from Foundation import NSObject
 
@@ -296,13 +342,54 @@ def _make_session_delegate() -> Any:
         def deviceDidBecomeReadyWithCompleteContentCatalog_(self, _d):
             self.ready = True
 
+        # ICDevice informal protocol method. ImageCaptureCore invokes this
+        # selector on the device delegate (the unprefixed form, not the
+        # browser's `deviceBrowser:didRemoveDevice:moreGoing:`) when the
+        # device is being torn down; no implementation here raises
+        # "unrecognized selector" inside our pumped run loop.
         def didRemoveDevice_(self, _d):
             pass
 
-    return _DeviceDelegate.alloc().init()
+    _SESSION_DELEGATE_CLS = _DeviceDelegate
+    return _SESSION_DELEGATE_CLS
 
 
-def _open_session(dev: Any, timeout_s: float = 15.0) -> Any:
+def _make_session_delegate() -> Any:
+    """Construct a fresh session-delegate instance (the class is cached)."""
+    return _get_session_delegate_cls().alloc().init()
+
+
+_DOWNLOAD_DELEGATE_CLS: Any = None
+
+
+def _get_download_delegate_cls() -> Any:
+    global _DOWNLOAD_DELEGATE_CLS
+    if _DOWNLOAD_DELEGATE_CLS is not None:
+        return _DOWNLOAD_DELEGATE_CLS
+    import objc
+    from Foundation import NSObject
+
+    class _DLDelegate(NSObject):
+        def init(self):
+            self = objc.super(_DLDelegate, self).init()
+            if self is None:
+                return None
+            self.done = False
+            self.err: str | None = None
+            return self
+
+        def didDownloadFile_error_options_contextInfo_(
+            self, _file, err, _opts, _ctx,
+        ):
+            if err is not None:
+                self.err = str(err)
+            self.done = True
+
+    _DOWNLOAD_DELEGATE_CLS = _DLDelegate
+    return _DOWNLOAD_DELEGATE_CLS
+
+
+def _open_session(dev: Any, timeout_s: float = 90.0) -> Any:
     """Open `dev`, wait for the complete catalog, return the delegate.
 
     Raises RuntimeError on timeout or framework error. The caller MUST
@@ -597,31 +684,12 @@ class GoProICCAdapter:
     ) -> tuple[bool, int]:
         """Fire one async ICC download and pump the run loop until it
         finishes. Returns (ok, bytes_written)."""
-        import objc
-        from Foundation import (
-            NSObject, NSURL, NSMutableDictionary, NSNumber, NSString,
-        )
+        from Foundation import NSURL, NSMutableDictionary, NSNumber
         ICC = _ICC.require()
         if ICC is None:
             return False, 0
 
-        class _DLDelegate(NSObject):
-            def init(self):
-                self = objc.super(_DLDelegate, self).init()
-                if self is None:
-                    return None
-                self.done = False
-                self.err: str | None = None
-                return self
-
-            def didDownloadFile_error_options_contextInfo_(
-                self, _file, err, _opts, _ctx,
-            ):
-                if err is not None:
-                    self.err = str(err)
-                self.done = True
-
-        dl = _DLDelegate.alloc().init()
+        dl = _get_download_delegate_cls().alloc().init()
         opts = NSMutableDictionary.dictionary()
         try:
             opts.setObject_forKey_(

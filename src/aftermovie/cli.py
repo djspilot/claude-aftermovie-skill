@@ -253,6 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--no-reveal", dest="no_reveal",
                     action="store_const", const=True, default=None,
                     help="Skip the macOS notification + Finder reveal at end.")
+    pu.add_argument("--force-analyze", dest="force_reanalyze",
+                    action="store_true", default=False,
+                    help="Bypass the on-disk catalog cache and re-run analyze "
+                         "even if a catalog already exists for this clips folder.")
     pu.set_defaults(func=cmd_auto)
 
     psl = sub.add_parser("select",

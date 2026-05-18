@@ -1,7 +1,21 @@
 """Scoring + planning tests with synthetic catalogs (no ffmpeg)."""
 from __future__ import annotations
 
-from aftermovie.score.scorer import build_candidates, build_plan, score_window
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+
+from aftermovie.score import scorer as scorer_mod
+from aftermovie.score.scorer import (
+    allocate_candidates,
+    build_candidates,
+    build_plan,
+    cmd_score,
+    score_window,
+)
+from aftermovie.types import Candidate
 
 
 def _clip(path: str, duration: float = 8.0, **overrides):
@@ -362,3 +376,160 @@ def test_purely_blurry_window_has_only_negative_blurry_component():
     # The ONLY component should be the negative blurry penalty.
     assert components == {"blurry": -1.5}
     assert score == -1.5
+
+
+# ---- F1: tightened auto-bump cap + slight-underfill acceptance -------------
+
+
+def test_auto_bump_cap_ceiling_is_three(capsys: pytest.CaptureFixture[str]):
+    """The auto-bump in `allocate_candidates` must never raise the cap above
+    3 — same-clip 4× is jarring enough that viewers prefer a slightly
+    shorter edit. The math used to allow a bump to 5 when slots / sources
+    demanded it; F1 caps that at 3 and logs the new ceiling."""
+    # 5 sources, 30 slots → math wants 30/5=6, F1 caps to 3.
+    candidates = [
+        Candidate(source=f"/src{s}.mp4", start_s=float(i), end_s=float(i) + 2.0,
+                  score=100.0 - i - s, reasons=[], src_fps=60.0)
+        for s in range(5) for i in range(10)
+    ]
+    cut_points = [float(i) for i in range(31)]  # 30 slots
+    picks = allocate_candidates(candidates, cut_points, source_cap=1)
+    counts: dict[str, int] = {}
+    for _bt, p in picks:
+        counts[p.source] = counts.get(p.source, 0) + 1
+    # No source can appear more than 3 times under the new cap.
+    assert max(counts.values()) <= 3, \
+        f"auto-bump exceeded F1 ceiling of 3: {counts}"
+    err = capsys.readouterr().err
+    # New log phrasing: "bumped source_cap 1 → 3"; the old "auto-bumped … → 5"
+    # is no longer allowed.
+    assert "bumped source_cap 1 → 3" in err, \
+        f"expected 'bumped source_cap 1 → 3' in stderr, got: {err!r}"
+    assert "→ 5" not in err, \
+        f"auto-bump leaked past F1 ceiling of 3: {err!r}"
+
+
+def test_slight_underfill_under_20pct_skips_bump(
+        capsys: pytest.CaptureFixture[str]):
+    """When the no-bump plan would be only slightly short of the slot
+    count, prefer the shorter plan to a clip-repeat plan. The threshold
+    is 20% — at 18% short we accept, at 25% short we bump."""
+    # 9 unique sources, 10 slots — without a bump, 1 slot stays unfilled
+    # (10% underfill, well under 20%). With a bump the 10th slot would
+    # repeat one of the sources. F1 says: accept the 9-cut plan.
+    candidates = [
+        Candidate(source=f"/src{s}.mp4", start_s=0.0, end_s=2.0,
+                  score=100.0 - s, reasons=[], src_fps=60.0)
+        for s in range(9)
+    ]
+    cut_points = [float(i) for i in range(11)]  # 10 slots
+    picks = allocate_candidates(candidates, cut_points, source_cap=1)
+    counts: dict[str, int] = {}
+    for _bt, p in picks:
+        counts[p.source] = counts.get(p.source, 0) + 1
+    # No source repeated — bump was suppressed.
+    assert max(counts.values()) == 1, \
+        f"expected no repeats (bump suppressed), got {counts}"
+    # And exactly 9 picks landed (1 slot intentionally empty).
+    assert len(picks) == 9
+    err = capsys.readouterr().err
+    assert "accepted slight underfill" in err, \
+        f"expected 'accepted slight underfill' log, got: {err!r}"
+    # And the cap-bump line MUST be absent.
+    assert "bumped source_cap" not in err, \
+        f"bump fired when it shouldn't have: {err!r}"
+
+
+def test_large_underfill_over_20pct_triggers_bump(
+        capsys: pytest.CaptureFixture[str]):
+    """A 60%-short plan is still a bump candidate — F1 only suppresses
+    SLIGHT underfill. Mirrors the real-session log line we want for big
+    deficits."""
+    # 4 unique sources, 10 slots → 60% underfill → must bump to cap=3
+    # (capped per F1), landing 4*3=12 ≥ 10 slots so the plan fills.
+    candidates = [
+        Candidate(source=f"/src{s}.mp4", start_s=float(i), end_s=float(i) + 2.0,
+                  score=100.0 - i - s, reasons=[], src_fps=60.0)
+        for s in range(4) for i in range(5)
+    ]
+    cut_points = [float(i) for i in range(11)]
+    picks = allocate_candidates(candidates, cut_points, source_cap=1)
+    err = capsys.readouterr().err
+    assert "bumped source_cap 1 → 3" in err, \
+        f"expected bump-to-3 log, got: {err!r}"
+    assert "accepted slight underfill" not in err, \
+        f"underfill suppression fired when it shouldn't have: {err!r}"
+    # Cap=3 actually fills the 10 slots.
+    counts: dict[str, int] = {}
+    for _bt, p in picks:
+        counts[p.source] = counts.get(p.source, 0) + 1
+    assert max(counts.values()) <= 3
+    assert len(picks) == 10
+
+
+def test_diversity_log_line_emitted(tmp_path: Path,
+                                     monkeypatch: pytest.MonkeyPatch,
+                                     capsys: pytest.CaptureFixture[str]):
+    """`cmd_score` must emit a one-line diversity readout after the 'Built N
+    cuts' summary so users (and the user-facing CLI) can see at a glance
+    how varied the plan is."""
+    catalog = {"clips": [_clip(f"/c{i}.mp4", duration=8.0) for i in range(10)]}
+    beat_dt = 0.5  # 120 BPM
+    n_beats = 40
+    song = {
+        "duration_s": 20.0,
+        "tempo_bpm": 120.0,
+        "beats": [i * beat_dt for i in range(n_beats)],
+        "downbeats": [i * 2.0 for i in range(10)],
+        "intro_end_s": 0.0,
+        "energy_per_s": [0.5] * 20,
+    }
+    cat_path = tmp_path / "catalog.json"
+    cat_path.write_text(json.dumps(catalog))
+    plan_path = tmp_path / "plan.json"
+    fake_song = tmp_path / "song.mp3"
+    fake_song.write_bytes(b"")
+
+    monkeypatch.setattr(scorer_mod, "analyze_song", lambda _p: song)
+    args = argparse.Namespace(
+        catalog=str(cat_path),
+        song=str(fake_song),
+        out=str(plan_path),
+        max_length=None,
+        aspect="16:9",
+        res="1920x1080",
+        fps=30,
+        lut=None,
+        music_db=-8.0,
+        clip_db=-18.0,
+        no_speed_ramp=True,
+        audio_mix="ducked",
+        pace="medium",
+        transitions="cut",
+        titles=None,
+        title_text=None,
+        no_reframe=False,
+        source_cap=3,
+        chronological=False,
+        burst_window_s=0.0,
+    )
+    cmd_score(args)
+    err = capsys.readouterr().err
+    assert "diversity:" in err, \
+        f"expected diversity log line, got stderr: {err!r}"
+    # The line must contain BOTH counts AND the avg/max repeat readout.
+    import re
+    match = re.search(
+        r"diversity: (\d+) cuts from (\d+) unique sources "
+        r"\(avg ([\d.]+) repeats, max (\d+)\)",
+        err,
+    )
+    assert match, f"diversity log line format unexpected: {err!r}"
+    n_cuts, n_unique, avg_repeats, max_repeats = match.groups()
+    assert int(n_cuts) > 0
+    assert int(n_unique) > 0
+    # Math sanity: avg = cuts / unique.
+    assert abs(float(avg_repeats) - int(n_cuts) / int(n_unique)) < 0.05
+    assert int(max_repeats) >= 1
+
+

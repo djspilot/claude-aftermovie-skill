@@ -240,9 +240,19 @@ def test_build_plan_drop_has_higher_motion_than_verse():
     ]
     song = _song_with_sections(30.0, 120.0, sections)
 
+    # `source_cap=5` (user-explicit, not auto-bump — F1's auto-bump ceiling of
+    # 3 only applies to `allocate_candidates`' bump-from-1 path). The higher
+    # cap gives the motion budget enough headroom that the chronological
+    # walker doesn't exhaust motion in verse-1 before the drop section
+    # arrives; SECTION_BIAS then has both `motion` and `face` candidates
+    # available per slot and can actually steer the pick. The pre-F1 version
+    # of this test ran at `cap=2` and relied on subset-mode's old
+    # "top-N-by-score" trim to deprive the allocator of face candidates
+    # altogether, so verse picks degraded to motion-only by exhaustion — a
+    # property the F1 diversity-aware trim deliberately removes.
     plan = build_plan(
         catalog, song, target_len=30.0, no_speed_ramp=True,
-        pace="auto", source_cap=2,
+        pace="auto", source_cap=5,
         chronological=False,   # keep section ordering preserved
         hook=False, climax=False,
     )

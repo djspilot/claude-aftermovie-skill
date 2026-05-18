@@ -25,16 +25,20 @@ to the user.
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
 from aftermovie.analyze.stills import _cache_key
 from aftermovie.config import data_dir
-from aftermovie.ffmpeg_cmd import log
+from aftermovie.optional_dep import optional_command
 
 
-_EXIFTOOL_WARNED = False
+_EXIFTOOL = optional_command(
+    "exiftool",
+    warning="  ! exiftool not found — single-file Live Photos will be used as "
+            "stills only. Install it (brew install exiftool) to enable motion "
+            "extraction.",
+)
 
 
 def _live_photo_cache_dir() -> Path:
@@ -44,21 +48,12 @@ def _live_photo_cache_dir() -> Path:
 
 
 def exiftool_available() -> bool:
-    return shutil.which("exiftool") is not None
-
-
-def _exiftool_warn_once() -> None:
-    global _EXIFTOOL_WARNED
-    if not _EXIFTOOL_WARNED:
-        log("  ! exiftool not found — single-file Live Photos will be used as "
-            "stills only. Install it (brew install exiftool) to enable motion "
-            "extraction.")
-        _EXIFTOOL_WARNED = True
+    return _EXIFTOOL.available
 
 
 def has_live_photo_marker(heic: Path) -> bool:
     """True if `heic` carries an Apple ContentIdentifier (was a Live Photo)."""
-    if not exiftool_available():
+    if not _EXIFTOOL.available:
         return False
     try:
         out = subprocess.run(
@@ -145,8 +140,7 @@ def live_photo_video_path(heic: Path) -> Path | None:
     results (no extractable video) are NOT cached — re-probing each run is
     cheap and avoids stale "no" answers after the user re-exports.
     """
-    if not exiftool_available():
-        _exiftool_warn_once()
+    if _EXIFTOOL.require() is None:
         return None
     cache_dir = _live_photo_cache_dir()
     key = _cache_key(heic, duration_s=0.0, target_res="motion")

@@ -20,28 +20,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aftermovie.ffmpeg_cmd import log
+from aftermovie.optional_dep import optional_import
 
-try:
-    import cv2  # type: ignore[import-not-found]
-    _CV2_AVAILABLE = True
-except ImportError:
-    _CV2_AVAILABLE = False
-
-_CV2_WARNED = False
+_CV2 = optional_import(
+    "cv2",
+    warning="! cv2 not installed — sharpness/exposure skipped "
+            "(pip install opencv-python-headless)",
+)
 
 
 def available() -> bool:
     """True iff cv2 imported. Sibling analyzers use the same pattern."""
-    return _CV2_AVAILABLE
-
-
-def _warn_once() -> None:
-    global _CV2_WARNED
-    if not _CV2_WARNED:
-        log("! cv2 not installed — sharpness/exposure skipped "
-            "(pip install opencv-python-headless)")
-        _CV2_WARNED = True
+    return _CV2.available
 
 
 def _sampled_grayscale_frames(path: Path, duration: float, fps: float):
@@ -51,6 +41,7 @@ def _sampled_grayscale_frames(path: Path, duration: float, fps: float):
     rather than re-seeking — VideoCapture seek on H.264 hops to the nearest
     keyframe and would skew sharpness toward the I-frames.
     """
+    cv2 = _CV2.module
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return
@@ -82,8 +73,8 @@ def sharpness_per_second(path: Path, duration: float, fps: float) -> list[float]
 
     Returns [] if cv2 is unavailable or the file can't be opened.
     """
-    if not _CV2_AVAILABLE:
-        _warn_once()
+    cv2 = _CV2.require()
+    if cv2 is None:
         return []
     raw: list[float] = []
     for _, gray in _sampled_grayscale_frames(path, duration, fps):
@@ -105,8 +96,7 @@ def exposure_per_second(path: Path, duration: float, fps: float) -> list[float]:
 
     Returns [] if cv2 is unavailable or the file can't be opened.
     """
-    if not _CV2_AVAILABLE:
-        _warn_once()
+    if _CV2.require() is None:
         return []
     out: list[float] = []
     for _, gray in _sampled_grayscale_frames(path, duration, fps):
@@ -121,8 +111,8 @@ def sharpness_for_image(path: Path) -> float | None:
     Laplacian variance through a saturating curve: most photos land between
     50 (soft) and 1500 (tack sharp). Returns None if cv2 is unavailable.
     """
-    if not _CV2_AVAILABLE:
-        _warn_once()
+    cv2 = _CV2.require()
+    if cv2 is None:
         return None
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -134,8 +124,8 @@ def sharpness_for_image(path: Path) -> float | None:
 
 def exposure_for_image(path: Path) -> float | None:
     """Single mean-luminance value for a still image in [0, 1]. None if cv2 missing."""
-    if not _CV2_AVAILABLE:
-        _warn_once()
+    cv2 = _CV2.require()
+    if cv2 is None:
         return None
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if img is None:

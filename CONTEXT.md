@@ -42,6 +42,8 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **GPMF** — GoPro Metadata Format: per-frame telemetry (accel, gyro, GPS speed) embedded in the MP4. Parsed at analyze time and contributes to scoring.
 
+- **Optional dep** — a third-party Python package (cv2, mediapipe, Pillow) or PATH command (exiftool, ffprobe) whose absence is recoverable: the analyzer using it logs one warning per process and falls back to a neutral output. Owned by `aftermovie.optional_dep`; analyzers and `cmd_doctor` ask it instead of re-doing `try-import`/`shutil.which` themselves.
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

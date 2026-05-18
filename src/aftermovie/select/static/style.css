@@ -199,6 +199,196 @@ main {
 }
 .cache-indicator.hidden { display: none; }
 
+/* Import-from-devices panel — collapses by default. Surfaces above the source
+   grid so users can pull new clips in without leaving the GUI. Wired to
+   /api/import-sources, /api/import, /api/import-status. Hidden silently when
+   /api/import-sources 404s so the panel only appears once the backend ships. */
+.import-panel {
+  margin: 0 0 16px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  overflow: hidden;
+}
+.import-panel.hidden { display: none; }
+
+.import-panel > .import-summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.2px;
+  list-style: none;
+  user-select: none;
+}
+.import-panel > .import-summary::-webkit-details-marker { display: none; }
+.import-panel > .import-summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 14px;
+  color: var(--fg-dim);
+  transition: transform 120ms ease;
+}
+.import-panel[open] > .import-summary::before { transform: rotate(90deg); }
+.import-panel > .import-summary:hover { background: var(--bg-elev-2); }
+
+.import-body {
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.import-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.import-dates .ctrl input[type="date"] {
+  width: 130px;
+  text-align: left;
+}
+
+.import-sources-label {
+  font-size: 12px;
+  color: var(--fg-dim);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.import-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1;
+}
+.import-sources:empty::after {
+  content: "no sources detected";
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.import-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.import-source input { margin: 0; accent-color: var(--accent); }
+.import-source.unavailable {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.import-source-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--border-strong);
+  color: var(--fg-dim);
+  text-transform: uppercase;
+}
+
+.import-actions { gap: 8px; }
+
+.import-status {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.import-status.hidden { display: none; }
+
+.import-status-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.import-state-badge {
+  display: inline-block;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+.import-state-badge.running {
+  background: var(--accent);
+  border-color: var(--accent-strong);
+  color: #0b1220;
+}
+.import-state-badge.done {
+  background: rgba(108, 212, 122, 0.18);
+  border-color: rgba(108, 212, 122, 0.5);
+  color: #6cd47a;
+}
+.import-state-badge.error {
+  background: rgba(255, 77, 94, 0.18);
+  border-color: var(--danger-dim);
+  color: var(--danger);
+}
+.import-progress {
+  font-size: 12px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.import-error {
+  font-size: 12px;
+  color: var(--danger);
+  background: rgba(255, 77, 94, 0.08);
+  border: 1px solid var(--danger-dim);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+}
+.import-error.hidden { display: none; }
+
+.import-success {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fg);
+}
+.import-success.hidden { display: none; }
+.import-success-msg { color: #6cd47a; font-weight: 600; }
+.import-dest { flex: 1 1 240px; }
+
+.import-log {
+  background: #0a0b0e;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #cbd0d8;
+  margin: 0;
+  overflow: auto;
+  max-height: 120px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.import-log:empty { display: none; }
+
 /* Thumbnail grid */
 .grid {
   display: grid;

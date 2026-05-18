@@ -56,6 +56,21 @@
     planEmpty: $("#plan-empty"),
     planMeta: $("#plan-meta"),
     planTileTemplate: $("#plan-tile-template"),
+    importPanel: $("#import-panel"),
+    importSince: $("#import-since"),
+    importUntil: $("#import-until"),
+    importSources: $("#import-sources"),
+    importBtn: $("#import-btn"),
+    dryRunBtn: $("#dry-run-btn"),
+    importStatus: $("#import-status"),
+    importStateBadge: $("#import-state-badge"),
+    importProgress: $("#import-progress"),
+    importError: $("#import-error"),
+    importSuccess: $("#import-success"),
+    importSuccessMsg: $("#import-success .import-success-msg"),
+    importDest: $("#import-dest"),
+    importUseFolder: $("#import-use-folder"),
+    importLog: $("#import-log"),
   };
 
   // -------- API helpers --------
@@ -634,6 +649,228 @@
     }
   }
 
+  // -------- Import from devices --------
+  // Talks to a parallel agent's backend (aftermovie.import_sources via
+  // SelectionService). On boot, GET /api/import-sources populates the
+  // checkbox list. POST /api/import kicks a job; we then poll
+  // /api/import-status/<job_id> every ~750ms until state ∈ {done, error}.
+  // Robustness rules:
+  //   - /api/import-sources 404 → hide the panel silently (backend not deployed).
+  //   - poll network failure → stop polling, show error message.
+  /** @type {Array<{name:string,label:string,available:boolean}>} */
+  let importSources = [];
+  let importJobId = null;
+  let importPollTimer = null;
+
+  async function loadImportSources() {
+    try {
+      const res = await fetch("/api/import-sources");
+      if (res.status === 404) {
+        // Backend not deployed yet — panel stays hidden.
+        els.importPanel.classList.add("hidden");
+        return;
+      }
+      if (!res.ok) throw new Error(`GET /api/import-sources -> ${res.status}`);
+      importSources = await res.json();
+      els.importPanel.classList.remove("hidden");
+      seedImportDates();
+      renderImportSources();
+      updateImportButtonState();
+    } catch (err) {
+      console.warn("Failed to load import sources:", err);
+      els.importPanel.classList.add("hidden");
+    }
+  }
+
+  function seedImportDates() {
+    // Default window: today minus 7 days → today (YYYY-MM-DD, local).
+    const today = new Date();
+    const past = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    if (!els.importSince.value) els.importSince.value = toDateInput(past);
+    if (!els.importUntil.value) els.importUntil.value = toDateInput(today);
+  }
+
+  function toDateInput(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+
+  function renderImportSources() {
+    els.importSources.replaceChildren();
+    const frag = document.createDocumentFragment();
+    for (const src of importSources) {
+      const label = document.createElement("label");
+      label.className = "import-source";
+      if (src.available === false) label.classList.add("unavailable");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = src.name;
+      cb.dataset.source = src.name;
+      if (src.available === false) {
+        cb.disabled = true;
+        label.title = "source not detected — plug it in / install osxphotos";
+      }
+      cb.addEventListener("change", updateImportButtonState);
+      label.appendChild(cb);
+      const text = document.createElement("span");
+      text.textContent = src.label || src.name;
+      label.appendChild(text);
+      if (src.available === false) {
+        const badge = document.createElement("span");
+        badge.className = "import-source-badge";
+        badge.textContent = "unavailable";
+        label.appendChild(badge);
+      }
+      frag.appendChild(label);
+    }
+    els.importSources.appendChild(frag);
+  }
+
+  function getCheckedImportSources() {
+    return [...els.importSources.querySelectorAll("input[type=checkbox]:checked")].map(
+      (cb) => cb.value,
+    );
+  }
+
+  function updateImportButtonState() {
+    const any = getCheckedImportSources().length > 0;
+    const running = !!importJobId;
+    els.importBtn.disabled = !any || running;
+    els.dryRunBtn.disabled = !any || running;
+  }
+
+  async function startImport(dryRun = false) {
+    const selected = getCheckedImportSources();
+    if (!selected.length) return;
+    const body = {
+      since: els.importSince.value || null,
+      until: els.importUntil.value || null,
+      sources: selected,
+      dest_parent: null,
+      dry_run: !!dryRun,
+    };
+    resetImportStatus();
+    els.importStatus.classList.remove("hidden");
+    setImportState("starting", "running");
+    try {
+      const res = await api("POST", "/api/import", body);
+      importJobId = res.job_id;
+      if (res.dest_folder) {
+        els.importDest.textContent = res.dest_folder;
+      }
+      updateImportButtonState();
+      pollImportStatus();
+    } catch (err) {
+      setImportState("error", "error");
+      showImportError(err.message);
+      importJobId = null;
+      updateImportButtonState();
+    }
+  }
+
+  async function pollImportStatus() {
+    if (!importJobId) return;
+    try {
+      const res = await fetch(`/api/import-status/${encodeURIComponent(importJobId)}`);
+      if (!res.ok) throw new Error(`GET /api/import-status -> ${res.status}`);
+      const s = await res.json();
+      renderImportStatus(s);
+      if (s.state === "done" || s.state === "error") {
+        importJobId = null;
+        updateImportButtonState();
+        return;
+      }
+      importPollTimer = setTimeout(pollImportStatus, 750);
+    } catch (err) {
+      // Network failure → stop polling, show error.
+      setImportState("error", "error");
+      showImportError(`status poll failed: ${err.message}`);
+      importJobId = null;
+      if (importPollTimer) clearTimeout(importPollTimer);
+      importPollTimer = null;
+      updateImportButtonState();
+    }
+  }
+
+  function renderImportStatus(s) {
+    const state = s.state || "running";
+    setImportState(state, state);
+    const copied = Number(s.copied) || 0;
+    const total = Number(s.total) || 0;
+    const skipped = Number(s.skipped) || 0;
+    const failed = Number(s.failed) || 0;
+    els.importProgress.textContent =
+      `(${copied} / ${total} copied, ${skipped} skipped, ${failed} failed)`;
+
+    const tail = typeof s.log_tail === "string" ? s.log_tail : "";
+    if (state === "error") {
+      showImportError(s.error || "import failed");
+      els.importLog.textContent = lastLines(tail, 6);
+    } else {
+      els.importError.classList.add("hidden");
+      els.importLog.textContent = lastLines(tail, 3);
+    }
+    els.importLog.scrollTop = els.importLog.scrollHeight;
+
+    if (state === "done") {
+      const dest = s.dest_folder || els.importDest.textContent || "";
+      showImportSuccess(dest);
+    } else {
+      els.importSuccess.classList.add("hidden");
+    }
+  }
+
+  function lastLines(text, n) {
+    if (!text) return "";
+    const lines = text.split("\n").filter((l) => l.length > 0);
+    return lines.slice(-n).join("\n");
+  }
+
+  function setImportState(label, cls) {
+    els.importStateBadge.textContent = label;
+    els.importStateBadge.className = `import-state-badge${cls ? " " + cls : ""}`;
+  }
+
+  function showImportError(msg) {
+    els.importError.textContent = msg || "";
+    els.importError.classList.toggle("hidden", !msg);
+    els.importSuccess.classList.add("hidden");
+  }
+
+  function showImportSuccess(destFolder) {
+    els.importSuccessMsg.textContent = "Imported to:";
+    els.importDest.textContent = destFolder || "";
+    // Hook for a future agent: navigates the GUI to the new folder via the
+    // ?clips=<path> query param. The receiving handler isn't wired yet; this
+    // just exposes the link.
+    if (destFolder) {
+      els.importUseFolder.href = `?clips=${encodeURIComponent(destFolder)}`;
+      els.importUseFolder.addEventListener("click", onUseFolderClick, { once: true });
+    }
+    els.importSuccess.classList.remove("hidden");
+    els.importError.classList.add("hidden");
+  }
+
+  function onUseFolderClick(e) {
+    e.preventDefault();
+    const dest = els.importDest.textContent || "";
+    if (dest) {
+      window.location = `?clips=${encodeURIComponent(dest)}`;
+    }
+  }
+
+  function resetImportStatus() {
+    els.importError.classList.add("hidden");
+    els.importError.textContent = "";
+    els.importSuccess.classList.add("hidden");
+    els.importLog.textContent = "";
+    els.importProgress.textContent = "";
+    if (importPollTimer) clearTimeout(importPollTimer);
+    importPollTimer = null;
+  }
+
   // -------- Wire-up --------
   els.selectAll.addEventListener("click", selectAll);
   els.deselectAll.addEventListener("click", deselectAll);
@@ -647,8 +884,12 @@
     if (e.key === "Escape" && !els.modal.classList.contains("hidden")) closeModal();
   });
 
+  els.importBtn.addEventListener("click", () => startImport(false));
+  els.dryRunBtn.addEventListener("click", () => startImport(true));
+
   loadOptions();
   loadPreferences();
+  loadImportSources();
   // Load sources first so the plan can resolve thumb URLs via path → /thumbs/<key>.jpg.
   loadSources().finally(loadPlan);
 })();

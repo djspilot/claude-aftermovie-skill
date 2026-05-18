@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=6">
+  <link rel="stylesheet" href="style.css?v=7">
 </head>
 <body>
   <header class="topbar">
@@ -91,6 +91,44 @@
       <span id="preview-message" class="preview-message"></span>
       <span id="cache-indicator" class="cache-indicator hidden" title="Reused cached analyze data">Reuse analysis</span>
     </div>
+
+    <details id="import-panel" class="import-panel hidden">
+      <summary class="import-summary">Import from devices</summary>
+      <div class="import-body">
+        <div class="import-row import-dates">
+          <label class="ctrl">
+            <span>Since</span>
+            <input id="import-since" type="date" aria-label="Import from date">
+          </label>
+          <label class="ctrl">
+            <span>Until</span>
+            <input id="import-until" type="date" aria-label="Import to date">
+          </label>
+        </div>
+        <div class="import-row">
+          <div class="import-sources-label">Sources</div>
+          <div id="import-sources" class="import-sources" role="group" aria-label="Import sources"></div>
+        </div>
+        <div class="import-row import-actions">
+          <button id="import-btn" class="btn primary" type="button" disabled>Import</button>
+          <button id="dry-run-btn" class="btn secondary" type="button" disabled>Dry run</button>
+        </div>
+        <div id="import-status" class="import-status hidden" aria-live="polite">
+          <div class="import-status-header">
+            <span id="import-state-badge" class="import-state-badge">idle</span>
+            <span id="import-progress" class="import-progress"></span>
+          </div>
+          <div id="import-error" class="import-error hidden"></div>
+          <div id="import-success" class="import-success hidden">
+            <span class="import-success-msg"></span>
+            <code id="import-dest" class="path import-dest"></code>
+            <a id="import-use-folder" class="btn ghost" href="#" type="button">Use this folder</a>
+          </div>
+          <pre id="import-log" class="import-log" aria-label="Import log"></pre>
+        </div>
+      </div>
+    </details>
+
     <div id="grid" class="grid" aria-label="Clip thumbnails"></div>
 
     <section id="plan-panel" class="plan-panel hidden" aria-label="Plan timeline">
@@ -156,6 +194,6 @@
     </div>
   </template>
 
-  <script src="app.js?v=6" defer></script>
+  <script src="app.js?v=7" defer></script>
 </body>
 </html>

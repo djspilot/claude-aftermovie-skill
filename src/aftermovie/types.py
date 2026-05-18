@@ -34,6 +34,8 @@ class ClipInfo:
     is_short_form: bool
     captured_at: float | None = None
     face_bboxes: list[dict | None] = field(default_factory=list)
+    sharpness_per_s: list[float] = field(default_factory=list)
+    exposure_per_s: list[float] = field(default_factory=list)
 
 
 @dataclass

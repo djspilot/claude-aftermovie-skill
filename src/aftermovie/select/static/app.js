@@ -6,6 +6,8 @@
 
   /** @type {Array<{path:string,name:string,kind:string,thumb_url:string,selected:boolean}>} */
   let sources = [];
+  /** @type {Map<string,string>} path -> thumb_url, used to resolve thumbs for plan entries */
+  const sourceThumbByPath = new Map();
   /** @type {Set<string>} */
   const excluded = new Set();
   const themes = new Map();
@@ -43,6 +45,11 @@
     copyPath: $("#copy-path"),
     revealLink: $("#reveal-link"),
     template: $("#cell-template"),
+    planPanel: $("#plan-panel"),
+    planTimeline: $("#plan-timeline"),
+    planEmpty: $("#plan-empty"),
+    planMeta: $("#plan-meta"),
+    planTileTemplate: $("#plan-tile-template"),
   };
 
   // -------- API helpers --------
@@ -62,7 +69,11 @@
         return r.json();
       });
       excluded.clear();
-      for (const s of sources) if (s.selected === false) excluded.add(s.path);
+      sourceThumbByPath.clear();
+      for (const s of sources) {
+        if (s.selected === false) excluded.add(s.path);
+        if (s.path && s.thumb_url) sourceThumbByPath.set(s.path, s.thumb_url);
+      }
       renderGrid();
       updateCounter();
       if (!sources.length) setStatus("No sources found. Drop clips into the watched folder and reload.");
@@ -279,6 +290,7 @@
       if (s.state === "done") {
         showResult(s.output_path || "");
         els.render.disabled = false;
+        loadPlan();
         return;
       }
       if (s.state === "error") {
@@ -346,6 +358,135 @@
     }
   }
 
+  // -------- Plan timeline (read-only) --------
+  // Loads the most recent Plan from /api/plan and renders one tile per Entry.
+  // The endpoint may not exist yet (404) or may return an empty plan; in either
+  // case we hide the panel with a soft message instead of failing loudly.
+  async function loadPlan() {
+    try {
+      const res = await fetch("/api/plan", { headers: { "Accept": "application/json" } });
+      if (res.status === 404) {
+        showPlanEmpty();
+        return;
+      }
+      if (!res.ok) {
+        showPlanEmpty();
+        return;
+      }
+      const data = await res.json();
+      const entries = extractPlanEntries(data);
+      if (!entries.length) {
+        showPlanEmpty();
+        return;
+      }
+      renderPlanTimeline(entries, data);
+    } catch (err) {
+      console.warn("Failed to load plan:", err);
+      showPlanEmpty();
+    }
+  }
+
+  function extractPlanEntries(data) {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.entries)) return data.entries;
+    return [];
+  }
+
+  function showPlanEmpty() {
+    els.planPanel.classList.remove("hidden");
+    els.planTimeline.replaceChildren();
+    els.planEmpty.classList.remove("hidden");
+    els.planMeta.textContent = "";
+  }
+
+  function renderPlanTimeline(entries, plan) {
+    els.planPanel.classList.remove("hidden");
+    els.planEmpty.classList.add("hidden");
+    els.planTimeline.replaceChildren();
+    const frag = document.createDocumentFragment();
+    for (const entry of entries) frag.appendChild(buildPlanTile(entry));
+    els.planTimeline.appendChild(frag);
+    const totalDur = entries.reduce(
+      (sum, e) => sum + (Number(e.out_duration_s) || (Number(e.end_s) - Number(e.start_s)) || 0),
+      0,
+    );
+    const bits = [`${entries.length} entr${entries.length === 1 ? "y" : "ies"}`];
+    if (totalDur > 0) bits.push(`${totalDur.toFixed(1)}s total`);
+    if (plan && plan.target_length_s) bits.push(`target ${Number(plan.target_length_s).toFixed(0)}s`);
+    els.planMeta.textContent = bits.join(" · ");
+  }
+
+  function buildPlanTile(entry) {
+    const node = els.planTileTemplate.content.firstElementChild.cloneNode(true);
+    const img = node.querySelector(".plan-thumb");
+    const transitionBadge = node.querySelector(".plan-transition");
+    const durationEl = node.querySelector(".plan-duration");
+    const nameEl = node.querySelector(".plan-name");
+    const reasonsEl = node.querySelector(".plan-reasons");
+    const audioEl = node.querySelector(".plan-audio");
+    const audioBar = node.querySelector(".plan-audio-bar");
+
+    // Thumbnail — reuse the source's /thumbs/<key>.jpg when we know it.
+    // The plan may include its own `thumb_url`; otherwise look up by source
+    // path in the map we built from /api/sources. Fall back to a placeholder.
+    const thumbUrl = entry.thumb_url || sourceThumbByPath.get(entry.source) || "";
+    const baseName = basename(entry.source || "");
+    if (thumbUrl) {
+      img.src = thumbUrl;
+      img.alt = baseName;
+    } else {
+      img.classList.add("placeholder");
+      img.removeAttribute("src");
+      img.alt = "no thumbnail";
+    }
+
+    // Filename + tooltip with full source path.
+    nameEl.textContent = baseName;
+    nameEl.title = entry.source || "";
+
+    // Entry duration — prefer out_duration_s, fall back to end_s - start_s.
+    const dur = Number(entry.out_duration_s);
+    const computed = Number(entry.end_s) - Number(entry.start_s);
+    const shown = Number.isFinite(dur) && dur > 0 ? dur : (Number.isFinite(computed) ? computed : 0);
+    durationEl.textContent = `${shown.toFixed(1)}s`;
+
+    // Transition kind badge (only if transition_in is present).
+    const t = entry.transition_in;
+    if (t && typeof t === "object" && t.kind) {
+      const kind = String(t.kind);
+      transitionBadge.textContent = kind;
+      transitionBadge.classList.remove("hidden");
+      transitionBadge.classList.add(`kind-${kind}`);
+    }
+
+    // Score reason pills.
+    if (Array.isArray(entry.reasons)) {
+      for (const reason of entry.reasons) {
+        const pill = document.createElement("span");
+        pill.className = "plan-reason";
+        pill.textContent = String(reason);
+        reasonsEl.appendChild(pill);
+      }
+    }
+
+    // Audio interest bar (0..1).
+    if (entry.audio_interest != null && Number.isFinite(Number(entry.audio_interest))) {
+      const pct = Math.max(0, Math.min(1, Number(entry.audio_interest))) * 100;
+      audioBar.style.width = `${pct.toFixed(0)}%`;
+      audioEl.classList.remove("hidden");
+      audioEl.setAttribute("title", `audio interest ${Number(entry.audio_interest).toFixed(2)}`);
+    }
+
+    return node;
+  }
+
+  function basename(p) {
+    if (!p) return "";
+    const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+    return i >= 0 ? p.slice(i + 1) : p;
+  }
+
   // -------- Wire-up --------
   els.selectAll.addEventListener("click", selectAll);
   els.deselectAll.addEventListener("click", deselectAll);
@@ -359,5 +500,6 @@
   });
 
   loadOptions();
-  loadSources();
+  // Load sources first so the plan can resolve thumb URLs via path → /thumbs/<key>.jpg.
+  loadSources().finally(loadPlan);
 })();

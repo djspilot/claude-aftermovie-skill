@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=4">
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
   <header class="topbar">
@@ -86,6 +86,15 @@
   <main>
     <div id="status" class="status" role="status" aria-live="polite">Loading sources…</div>
     <div id="grid" class="grid" aria-label="Clip thumbnails"></div>
+
+    <section id="plan-panel" class="plan-panel hidden" aria-label="Plan timeline">
+      <div class="plan-header">
+        <h2 class="plan-title">Plan timeline</h2>
+        <span id="plan-meta" class="plan-meta" aria-live="polite"></span>
+      </div>
+      <div id="plan-empty" class="plan-empty hidden">Render once to see the plan.</div>
+      <div id="plan-timeline" class="plan-timeline" role="list" aria-label="Plan entries"></div>
+    </section>
   </main>
 
   <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -118,6 +127,21 @@
     </div>
   </template>
 
-  <script src="app.js?v=4" defer></script>
+  <template id="plan-tile-template">
+    <div class="plan-tile" role="listitem">
+      <div class="plan-thumb-wrap">
+        <img class="plan-thumb" alt="" loading="lazy">
+        <span class="plan-transition hidden"></span>
+        <span class="plan-duration"></span>
+      </div>
+      <div class="plan-name" title=""></div>
+      <div class="plan-reasons"></div>
+      <div class="plan-audio hidden" aria-label="Audio interest">
+        <span class="plan-audio-bar"></span>
+      </div>
+    </div>
+  </template>
+
+  <script src="app.js?v=5" defer></script>
 </body>
 </html>

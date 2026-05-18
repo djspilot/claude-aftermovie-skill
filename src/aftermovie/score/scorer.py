@@ -341,33 +341,85 @@ def _suppress_bursts(candidates: list[Candidate],
 
 PACE_TO_FACTOR = {"fast": 1, "medium": 2, "slow": 4}
 
+# Phase C5 — per-section beat-stride factors for pace=auto.
+# Numbers are "how many beats between consecutive cuts" inside each Section.
+# Numbers come from docs/IMPROVEMENT_PLAN.md Phase 4: intro breathes (4 beats),
+# verse is medium (2 beats), build tightens (down to 1 beat on the way to the
+# drop), drop is action-tight (1 beat — never tighter, anti-strobe), outro is
+# medium and the climax-tail in build_plan dilates the last few entries.
+SECTION_TO_FACTOR = {
+    "intro": 4,
+    "verse": 2,
+    "build": 1,
+    "drop": 1,
+    "outro": 2,
+}
+
+
+def _section_for_time(t: float, sections: list[dict[str, Any]]) -> str:
+    """Return the `kind` of the section containing `t`, or `"verse"` when
+    `sections` is empty / the time falls in a gap. Linear scan is fine —
+    a typical song has <8 sections."""
+    if not sections:
+        return "verse"
+    for s in sections:
+        if float(s.get("start_s", 0.0)) <= t < float(s.get("end_s", 0.0)):
+            k = s.get("kind")
+            if isinstance(k, str):
+                return k
+    # Past the last section's end → treat as outro for late-tail picking.
+    return "verse"
+
 
 def _auto_cut_points(beats: list[float], intro_end_s: float, target_len: float,
-                     energy_per_s: list[float]) -> list[float]:
+                     energy_per_s: list[float],
+                     sections: list[dict[str, Any]] | None = None,
+                     ) -> list[float]:
     """Energy-aware beat selection: pack cuts tighter during loud sections,
     space them out during quiet ones. Targets ~1.5–2.5s per cut, never tighter
     than 2 beats (so high-BPM songs don't strobe). Mirrors Quik's pacing arc.
+
+    When `sections` is provided (Phase C5), the per-beat stride factor is
+    decided by the section kind rather than by raw energy: intro=4, verse=2,
+    build=1, drop=1, outro=2. Drops still get a half-beat micro-pack guard
+    via the next-beat distance, but never closer than 2 beats apart in
+    real-time (the anti-strobe floor). When sections are absent we fall back
+    to the legacy energy-banded behaviour so old `song.json` files still work.
     """
     out: list[float] = []
     last_kept = -10**9
+    last_kept_t = -1.0e9
+    # Absolute anti-strobe floor in real-time. 0.33s ≈ 12fps at the
+    # video-cut level, which is the perceptual upper bound where the
+    # human eye still parses a cut as "a cut" rather than a flicker. The
+    # legacy energy-banded path was its own implicit anti-strobe via the
+    # `factor=2` floor; in section-aware mode the drop's `factor=1` is
+    # allowed to fire at the song's beat tempo (which on a 180 BPM track
+    # is 0.333s — exactly the floor below).
+    min_gap_s = 0.33
     for i, t in enumerate(beats):
         if t < intro_end_s or t >= target_len:
             continue
-        idx = min(int(t), len(energy_per_s) - 1) if energy_per_s else 0
-        e = energy_per_s[idx] if energy_per_s else 0.5
-        # Higher numbers = sparser cuts. Floor at 2 so cuts always last
-        # at least ~1s on a typical 100-130 BPM song.
-        if e >= 0.8:
-            factor = 2
-        elif e >= 0.55:
-            factor = 3
-        elif e >= 0.3:
-            factor = 4
+        if sections:
+            kind = _section_for_time(t, sections)
+            factor = SECTION_TO_FACTOR.get(kind, 2)
         else:
-            factor = 6
-        if i - last_kept >= factor:
+            idx = min(int(t), len(energy_per_s) - 1) if energy_per_s else 0
+            e = energy_per_s[idx] if energy_per_s else 0.5
+            # Higher numbers = sparser cuts. Floor at 2 so cuts always last
+            # at least ~1s on a typical 100-130 BPM song.
+            if e >= 0.8:
+                factor = 2
+            elif e >= 0.55:
+                factor = 3
+            elif e >= 0.3:
+                factor = 4
+            else:
+                factor = 6
+        if i - last_kept >= factor and (t - last_kept_t) >= min_gap_s - 1e-9:
             out.append(t)
             last_kept = i
+            last_kept_t = t
     return out
 
 
@@ -376,7 +428,8 @@ def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> lis
 
     pace: "fast" (every beat) / "medium" (every 2nd beat) /
           "slow" (every 4th beat — downbeats only) /
-          "auto" (energy-aware — fast on loud sections, slow on quiet ones).
+          "auto" (energy-aware — fast on loud sections, slow on quiet ones,
+                  section-aware when `song["sections"]` is populated).
 
     Returns the list of beat times in [intro_end_s, target_len), with
     `target_len` appended as the terminating sentinel.
@@ -385,6 +438,7 @@ def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> lis
         cut_points = _auto_cut_points(
             song["beats"], song["intro_end_s"], target_len,
             song.get("energy_per_s", []),
+            sections=song.get("sections") or None,
         )
         if not cut_points:
             cut_points = [b for b in song["beats"]
@@ -401,11 +455,86 @@ def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> lis
     return cut_points
 
 
+# Phase C5 — per-section candidate-rank bias.
+# When a cut anchor falls inside a section of a given kind, the allocator
+# adds the matching bias dict's contributions (multiplied by the candidate's
+# matching `components` value) to the candidate's score for the purpose of
+# picking. The candidate's persisted `.score` and `.components` are NOT
+# mutated — this is a local re-rank for greedy selection only, so the plan
+# json continues to record the original score the user can reason about.
+#
+# Numbers are deliberately modest: a HiLight tag is +10 in the base score,
+# so a +2 nudge from "this is the drop" is enough to flip a tie between two
+# similarly-scored picks without overriding genuine signal differences.
+SECTION_BIAS: dict[str, dict[str, float]] = {
+    # Drops want energy: motion, hard impacts, and any user-tagged hilight.
+    "drop": {
+        "motion": 2.0,
+        "accl_jump": 1.5,
+        "hilight_tag": 1.0,
+        "gps_speed": 1.0,
+        "face": -0.5,  # gently de-prioritise talking-head moments on drops
+    },
+    "build": {
+        # Build mirrors the drop but at half-strength — the tension is rising
+        # so we want movement, but the punch lands inside the drop proper.
+        "motion": 1.0,
+        "accl_jump": 0.75,
+    },
+    # Verses are the story beats: people, faces, moderate motion.
+    "verse": {
+        "face": 1.5,
+        "motion": 0.5,
+    },
+    # Intro / outro stay close to neutral — the climax-tail logic in
+    # build_plan handles the outro's dilation, and the intro is short.
+    "intro": {
+        "face": 0.5,
+    },
+    "outro": {
+        "face": 0.5,
+    },
+}
+
+
+def _section_picker_score(c: Candidate, kind: str) -> float:
+    """Score a candidate for the *picker* under a given section kind.
+
+    Applies `SECTION_BIAS[kind]` on top of the candidate's base `score` by
+    looking up the components it actually carries. A candidate with no
+    `motion` component contributes nothing for the `motion` bias, which is
+    exactly what we want (we're amplifying the signals the scorer already
+    surfaced, not inventing new ones)."""
+    bias = SECTION_BIAS.get(kind) or {}
+    if not bias or not c.components:
+        return c.score
+    bonus = 0.0
+    for key, weight in bias.items():
+        # `c.components[key]` is the absolute contribution that component
+        # made to the base score. We treat its presence-and-magnitude as a
+        # proxy for "this candidate has that signal" and add `weight` per
+        # unit of it, capped softly to avoid double-counting massive signals
+        # like a +10 hilight_tag.
+        v = float(c.components.get(key, 0.0))
+        if v == 0.0:
+            continue
+        # Saturate: positive components past 5.0 stop adding extra bias so a
+        # single dominant signal doesn't crowd out a balanced candidate.
+        if v > 0:
+            v = min(v, 5.0)
+        else:
+            v = max(v, -5.0)
+        bonus += weight * (v / 1.0)
+    return c.score + bonus
+
+
 def allocate_candidates(candidates: list[Candidate],
                         cut_points: list[float],
                         source_cap: int = 3,
                         auto_bump_cap: bool = True,
-                        max_auto_cap: int = 5) -> list[tuple[float, Candidate]]:
+                        max_auto_cap: int = 5,
+                        sections: list[dict[str, Any]] | None = None,
+                        ) -> list[tuple[float, Candidate]]:
     """Greedy fill: walk cut points, pick the highest-scoring unused candidate
     that hasn't already hit `source_cap` reuses of the same source file.
 
@@ -415,6 +544,12 @@ def allocate_candidates(candidates: list[Candidate],
     length (e.g. `--max-length 120`) even when their source folder is small:
     some sources will appear more than once, but the alternative is a
     truncated edit. A single log line surfaces the bump.
+
+    When `sections` is provided (Phase C5), the per-anchor candidate ranking
+    is re-scored via `SECTION_BIAS` so drops/builds tend to pull motion- and
+    impact-heavy Candidates and verses prefer face-bearing ones. The base
+    `Candidate.score` is unchanged — the plan still records the original
+    score the user can reason about; only the local pick order shifts.
 
     Returns `[(beat_t, picked_candidate), ...]` in cut order.
     """
@@ -432,7 +567,10 @@ def allocate_candidates(candidates: list[Candidate],
             log(f"  ! source_cap auto-bumped {source_cap} → {effective_cap} to fit "
                 f"{n_slots} cuts from {n_unique} unique sources")
 
-    candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
+    # We keep a pool sorted by base score and re-rank per-anchor when
+    # sections are in play. When sections are absent the inner loop falls
+    # through to the original "highest base score wins" path.
+    pool = sorted(candidates, key=lambda c: c.score, reverse=True)
     used_sources: dict[str, int] = {}
     picks: list[tuple[float, Candidate]] = []
 
@@ -443,17 +581,34 @@ def allocate_candidates(candidates: list[Candidate],
         if gap < MIN_CLIP_S:
             continue
         pick: Candidate | None = None
-        for c in candidates:
-            clip_len = c.end_s - c.start_s
-            if clip_len < MIN_CLIP_S:
-                continue
-            if used_sources.get(c.source, 0) >= effective_cap:
-                continue
-            pick = c
-            break
+        if sections:
+            kind = _section_for_time(beat_t, sections)
+            # Local re-rank: walk the pool once, scoring with the bias. We
+            # don't mutate `pool` so the next anchor sees the same order.
+            best: tuple[float, Candidate] | None = None
+            for c in pool:
+                clip_len = c.end_s - c.start_s
+                if clip_len < MIN_CLIP_S:
+                    continue
+                if used_sources.get(c.source, 0) >= effective_cap:
+                    continue
+                s = _section_picker_score(c, kind)
+                if best is None or s > best[0]:
+                    best = (s, c)
+            if best is not None:
+                pick = best[1]
+        else:
+            for c in pool:
+                clip_len = c.end_s - c.start_s
+                if clip_len < MIN_CLIP_S:
+                    continue
+                if used_sources.get(c.source, 0) >= effective_cap:
+                    continue
+                pick = c
+                break
         if not pick:
             continue
-        candidates.remove(pick)
+        pool.remove(pick)
         used_sources[pick.source] = used_sources.get(pick.source, 0) + 1
         picks.append((beat_t, pick))
     return picks
@@ -594,7 +749,13 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     # near-duplicates) — order matters: duplicates first (cluster-aware), then
     # the global top-N cut. Reversing would let a low-scoring twin survive.
     candidates = _subset_filter_candidates(candidates, cut_points, target_len)
-    picks = allocate_candidates(candidates, cut_points, source_cap=source_cap)
+    # Section-aware allocation only fires for pace=auto. fast/medium/slow
+    # are kept deliberately predictable per the IMPROVEMENT_PLAN.md spec:
+    # "Preserve manual fast, medium, and slow modes for predictable behavior."
+    alloc_sections = song.get("sections") if pace == "auto" else None
+    picks = allocate_candidates(candidates, cut_points,
+                                source_cap=source_cap,
+                                sections=alloc_sections)
 
     # Stretch mode lever 1 (C3): if the greedy allocator left obvious holes
     # (`< STRETCH_FILL_RATIO × n_slots` picked) AND the caller is still at
@@ -611,7 +772,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
         # Re-run the greedy walker with a slightly looser cap. We use the
         # same Candidate list — bursts/visual-dups/subset already pruned it.
         retry_picks = allocate_candidates(candidates, cut_points,
-                                          source_cap=new_cap)
+                                          source_cap=new_cap,
+                                          sections=alloc_sections)
         if len(retry_picks) > len(picks):
             log(f"  ! stretch-mode: bumped source_cap {source_cap} → {new_cap} "
                 f"to fill {target_len:.1f}s ({len(picks)} → {len(retry_picks)} "

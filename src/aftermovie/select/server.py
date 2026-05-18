@@ -15,6 +15,12 @@ Endpoints (all JSON unless otherwise noted):
     GET  /api/import-sources        → [{name, label, available}, ...]
     POST /api/import                → launch import worker → {job_id, dest_folder}
     GET  /api/import-status/<job_id> → {state, copied, skipped, failed, total, ...}
+    GET  /api/song                  → {path, name, duration_s?, tempo_bpm?} | {path: null}
+    POST /api/upload-song           → multipart; copies into the song cache → {path, ...}
+    POST /api/set-song-path         → {path} → validates + activates the song
+    GET  /api/candidate-songs       → [{path, name, duration_s | null}, ...]
+    GET  /api/song-info?path=…      → {duration_s, tempo_bpm, energy_curve_samples}
+    GET  /api/recent-songs          → [{path, name, last_used_iso}, ...]
 
 The server is intentionally synchronous and single-threaded except for the
 render worker (one per render job). Stdlib HTTPServer is the only
@@ -38,9 +44,44 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from aftermovie.select.service import SelectionService
+
+
+# ---- multipart helper -------------------------------------------------------
+
+def _parse_multipart_one_file(body: bytes, boundary: str) -> tuple[str, bytes]:
+    """Parse a single-file multipart/form-data body; return `(filename, payload)`.
+
+    Minimal stdlib-only parser — handles the one shape the song upload uses
+    (one file part). Raises `ValueError` on malformed input so the HTTP
+    Adapter can map that to a 400. Filename comes from the part's
+    `Content-Disposition` header; if missing, we default to "song".
+    """
+    delim = ("--" + boundary).encode()
+    parts = body.split(delim)
+    # parts[0] is the preamble (usually empty); parts[-1] is the closing "--\r\n".
+    for part in parts[1:-1]:
+        part = part.lstrip(b"\r\n")
+        if not part:
+            continue
+        # Split headers from payload at the first blank line.
+        header_blob, _, payload = part.partition(b"\r\n\r\n")
+        if not payload:
+            continue
+        # Strip the trailing CRLF that precedes the next boundary delimiter.
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        try:
+            header_text = header_blob.decode("utf-8", errors="replace")
+        except UnicodeDecodeError as exc:
+            raise ValueError("bad multipart headers") from exc
+        # Find the filename in Content-Disposition.
+        m = re.search(r'filename="([^"]*)"', header_text)
+        filename = m.group(1) if m else "song"
+        return filename, payload
+    raise ValueError("no file part in multipart body")
 
 
 # ---- HTTP handler -----------------------------------------------------------
@@ -120,6 +161,18 @@ class _Handler(BaseHTTPRequestHandler):
             if m:
                 self._serve_import_status(m.group(1))
                 return
+            if route == "/api/song":
+                self._send_json(self.service.current_song())
+                return
+            if route == "/api/candidate-songs":
+                self._send_json(self.service.list_candidate_songs())
+                return
+            if route == "/api/recent-songs":
+                self._send_json(self.service.recent_songs())
+                return
+            if route == "/api/song-info":
+                self._serve_song_info(parsed.query)
+                return
             # Static sibling files (app.js, style.css, any future assets).
             # Restricted to `static_dir` so we can't escape via ../ traversal.
             if self.static_dir is not None and "/" not in route.lstrip("/")[1:]:
@@ -153,6 +206,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if route == "/api/import":
                 self._handle_import(self._read_json())
+                return
+            if route == "/api/set-song-path":
+                self._handle_set_song_path(self._read_json())
+                return
+            if route == "/api/upload-song":
+                self._handle_upload_song()
                 return
             self._send_json({"error": "not_found", "path": route}, status=404)
         except Exception as e:
@@ -259,6 +318,110 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not_found", "job_id": job_id}, status=404)
             return
         self._send_json(body)
+
+    # ---- song picker handlers (D1-D4) ----
+
+    def _handle_set_song_path(self, body: dict[str, Any]) -> None:
+        """Validate `path` exists + is audio; activate it on the service."""
+        raw = body.get("path")
+        if not isinstance(raw, str) or not raw:
+            self._send_json({"error": "bad_request",
+                             "detail": "expected JSON body with 'path'"},
+                            status=400)
+            return
+        try:
+            info = self.service.set_song(Path(raw))
+        except ValueError as e:
+            self._send_json({"error": "bad_request", "detail": str(e)},
+                            status=400)
+            return
+        self._send_json({"ok": True, **info})
+
+    def _handle_upload_song(self) -> None:
+        """Copy a multipart-uploaded song into the server cache + activate it.
+
+        We parse the multipart body ourselves (no Flask/FastAPI dep). The
+        cache lives at `~/.skills-data/aftermovie/songs/<sha1>.<ext>` so
+        re-uploading the same file is idempotent (the SHA1 of the content
+        keys the destination).
+        """
+        ctype = self.headers.get("Content-Type") or ""
+        if "multipart/form-data" not in ctype:
+            self._send_json({"error": "bad_request",
+                             "detail": "expected multipart/form-data"},
+                            status=400)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._send_json({"error": "bad_request",
+                             "detail": "empty upload"},
+                            status=400)
+            return
+        # Extract boundary.
+        m = re.search(r"boundary=(.+?)(?:;|$)", ctype)
+        if not m:
+            self._send_json({"error": "bad_request",
+                             "detail": "missing multipart boundary"},
+                            status=400)
+            return
+        boundary = m.group(1).strip().strip('"')
+        try:
+            filename, payload = _parse_multipart_one_file(
+                self.rfile.read(length), boundary,
+            )
+        except ValueError as e:
+            self._send_json({"error": "bad_request", "detail": str(e)},
+                            status=400)
+            return
+        if not payload:
+            self._send_json({"error": "bad_request",
+                             "detail": "no file content"},
+                            status=400)
+            return
+
+        # Cache the upload under SHA1(content).<ext>. The cache lives next to
+        # the song-analysis cache so both song-related blobs collocate under
+        # ~/.skills-data/aftermovie/.
+        import hashlib
+        from aftermovie.config import data_dir
+
+        sha = hashlib.sha1(payload).hexdigest()
+        ext = Path(filename or "song").suffix.lower() or ".mp3"
+        songs_dir = data_dir() / "songs"
+        songs_dir.mkdir(parents=True, exist_ok=True)
+        dest = songs_dir / f"{sha}{ext}"
+        if not dest.is_file():
+            try:
+                dest.write_bytes(payload)
+            except OSError as e:
+                self._send_json({"error": "server_error", "detail": str(e)},
+                                status=500)
+                return
+
+        try:
+            info = self.service.set_song(dest)
+        except ValueError as e:
+            self._send_json({"error": "bad_request", "detail": str(e)},
+                            status=400)
+            return
+        self._send_json({"ok": True, **info})
+
+    def _serve_song_info(self, query: str) -> None:
+        """Lazy-analyze the song at `?path=…` and return cached JSON."""
+        params = parse_qs(query or "")
+        raw = (params.get("path") or [""])[0]
+        if not raw:
+            self._send_json({"error": "bad_request",
+                             "detail": "missing 'path' query"},
+                            status=400)
+            return
+        try:
+            info = self.service.song_info(Path(raw))
+        except ValueError as e:
+            self._send_json({"error": "bad_request", "detail": str(e)},
+                            status=400)
+            return
+        self._send_json(info)
 
     def _handle_import(self, body: dict[str, Any]) -> None:
         try:

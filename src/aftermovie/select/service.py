@@ -25,6 +25,11 @@ Interface:
     svc.thumb_for_key(key)                   -> bytes | None
     svc.start_render(body)                   -> RenderJob
     svc.status(job_id)                       -> dict | None
+    svc.current_song()                       -> dict
+    svc.set_song(path)                       -> dict
+    svc.list_candidate_songs()               -> list[dict]
+    svc.song_info(path)                      -> dict
+    svc.recent_songs()                       -> list[dict]
 
 Invariants:
 
@@ -39,10 +44,14 @@ Invariants:
     are mtime-cached by `SidecarStore`.
   * `latest_plan` returns `None` (not an exception) when no plan tagged
     with this folder's catalog_id is on disk yet.
+  * `set_song(path)` updates `song_default` in-process (so the next
+    `start_render` without an explicit `song` picks it up) and writes
+    through to the recents sidecar (D4).
 """
 from __future__ import annotations
 
 import io
+import json
 import sys
 import threading
 import time
@@ -144,6 +153,15 @@ ALLOWED_RENDER_OVERRIDES = frozenset({
     "still_duration", "titles", "title_text", "burst_window_s",
 })
 
+# Audio file extensions the song picker accepts and `list_candidate_songs`
+# scans for. Kept lowercase; the scanner compares case-insensitively.
+AUDIO_EXTS = frozenset({".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"})
+
+# Cap of recent-song entries — LRU eviction on `last_used`.
+RECENT_SONGS_CAP = 10
+RECENT_SONGS_FILENAME = "recent-songs.json"
+RECENT_SONGS_VERSION = 1
+
 
 # ---- internal helpers ------------------------------------------------------
 
@@ -153,6 +171,34 @@ def _kind_for(p: Path, live_movs: set[str]) -> str:
     if p.suffix.lower() in {".heic", ".heif", ".jpg", ".jpeg", ".png"}:
         return "still"
     return "video"
+
+
+def _downsample_energy(samples: list[float], n: int = 50) -> list[float]:
+    """Bin `samples` into `n` mean buckets clamped to [0, 1].
+
+    Used by `song_info` to ship a sparkline-sized energy curve to the GUI:
+    `analyze_song` returns one float per second of song; we compress that
+    down to ~50 points so a 4-minute song doesn't pump 240 floats over
+    the wire for every song change. Empty input yields an empty list.
+    """
+    if not samples:
+        return []
+    if n <= 0:
+        return []
+    if len(samples) <= n:
+        out = list(samples)
+    else:
+        step = len(samples) / n
+        out = []
+        for i in range(n):
+            lo = int(i * step)
+            hi = int((i + 1) * step) or (lo + 1)
+            chunk = samples[lo:hi]
+            if not chunk:
+                chunk = [samples[min(lo, len(samples) - 1)]]
+            out.append(sum(chunk) / len(chunk))
+    # Clamp to [0, 1] — `analyze_song` normalises already but defend in depth.
+    return [max(0.0, min(1.0, float(v))) for v in out]
 
 
 class _LogCapture(io.TextIOBase):
@@ -657,6 +703,230 @@ class SelectionService:
             "started_at": job.started_at,
             "finished_at": job.finished_at,
         }
+
+    # ---- song picker (D1-D4) ----
+
+    def current_song(self) -> dict[str, Any]:
+        """Return the currently active song's metadata or `{path: None}`.
+
+        Shape: `{path, name, duration_s, tempo_bpm}` where the analysis
+        fields are filled in only if a cached `song_info` exists for this
+        path (so this Module never blocks on librosa). The HTTP Adapter
+        renders this verbatim at `GET /api/song`.
+        """
+        song = self.song_default
+        if song is None:
+            return {"path": None}
+        try:
+            p = Path(song).expanduser().resolve()
+        except OSError:
+            p = Path(song)
+        info: dict[str, Any] = {"path": str(p), "name": p.name}
+        # Surface cached duration/tempo if `song_info` has been called for
+        # this path before; otherwise leave them out (the GUI lazily calls
+        # `/api/song-info` to populate them).
+        cached = self._cached_song_info(p)
+        if cached is not None:
+            info["duration_s"] = cached.get("duration_s")
+            info["tempo_bpm"] = cached.get("tempo_bpm")
+        return info
+
+    def set_song(self, path: Path) -> dict[str, Any]:
+        """Mark `path` as the active song; record it in the recents sidecar.
+
+        Raises `ValueError` for missing files / non-audio extensions so the
+        HTTP Adapter can map that to a 400. Returns the same shape as
+        `current_song()` for symmetry.
+        """
+        p = Path(path).expanduser().resolve()
+        if not p.is_file():
+            raise ValueError(f"song path is not a file: {p}")
+        if p.suffix.lower() not in AUDIO_EXTS:
+            raise ValueError(f"unsupported audio extension: {p.suffix}")
+        self.song_default = p
+        self._touch_recent(p)
+        return self.current_song()
+
+    def list_candidate_songs(self) -> list[dict[str, Any]]:
+        """Scan `clips_root` for audio files; return them as picker chips.
+
+        One row per audio file under the clips folder (any depth). Shape:
+        `[{path, name, duration_s | None}, ...]`. `duration_s` is filled
+        in only if a cached analysis exists — we never block on librosa
+        from the discovery path.
+        """
+        folder = self.clips_root
+        if not folder.is_dir():
+            return []
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for p in folder.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+            except OSError:
+                continue
+            if p.name.startswith("."):
+                continue
+            if _under_skipped_dir(p, folder):
+                continue
+            if p.suffix.lower() not in AUDIO_EXTS:
+                continue
+            abs_p = str(p.resolve())
+            if abs_p in seen:
+                continue
+            seen.add(abs_p)
+            cached = self._cached_song_info(Path(abs_p))
+            row: dict[str, Any] = {"path": abs_p, "name": p.name}
+            if cached is not None:
+                row["duration_s"] = cached.get("duration_s")
+            else:
+                row["duration_s"] = None
+            rows.append(row)
+        rows.sort(key=lambda r: r["name"].lower())
+        return rows
+
+    def song_info(self, path: Path) -> dict[str, Any]:
+        """Return `{duration_s, tempo_bpm, energy_curve_samples}` for `path`.
+
+        Lazily calls `analyze_song(path)` and caches the result at
+        `~/.skills-data/aftermovie/song-analysis/<key>.json`. The cache
+        key is SHA1(`<abs-path>-<mtime_ns>`) so editing the file (mtime
+        changes) invalidates the cache, but re-picking the same file is
+        instant. Raises `ValueError` if the file is missing.
+        """
+        p = Path(path).expanduser().resolve()
+        if not p.is_file():
+            raise ValueError(f"song path is not a file: {p}")
+
+        cache_path = self._song_cache_path(p)
+        if cache_path.is_file():
+            try:
+                cached = json.loads(cache_path.read_text())
+                if isinstance(cached, dict) and "duration_s" in cached:
+                    return cached
+            except (OSError, json.JSONDecodeError):
+                pass  # fall through to re-analyze
+
+        # Lazy import — librosa is heavy and shouldn't load until first call.
+        from aftermovie.score.song import analyze_song
+
+        analysis = analyze_song(p)
+        energy = analysis.get("energy_per_s") or []
+        samples = _downsample_energy(list(energy), n=50)
+        payload: dict[str, Any] = {
+            "duration_s": float(analysis.get("duration_s") or 0.0),
+            "tempo_bpm": float(analysis.get("tempo_bpm") or 0.0),
+            "energy_curve_samples": samples,
+        }
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(payload))
+        except OSError:
+            # Cache is best-effort; never let a write failure kill the call.
+            pass
+        return payload
+
+    def recent_songs(self) -> list[dict[str, Any]]:
+        """Return the LRU-sorted recent songs sidecar as `[{path, name, last_used_iso}, ...]`."""
+        store = self._recents_store()
+        data = store.read()
+        items = data.get("songs") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        from datetime import datetime as _dt
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            path = it.get("path")
+            if not isinstance(path, str):
+                continue
+            ts = it.get("last_used")
+            try:
+                ts_f = float(ts) if ts is not None else 0.0
+            except (TypeError, ValueError):
+                ts_f = 0.0
+            try:
+                iso = _dt.fromtimestamp(ts_f).isoformat() if ts_f > 0 else ""
+            except (OSError, ValueError, OverflowError):
+                iso = ""
+            rows.append({
+                "path": path,
+                "name": Path(path).name,
+                "last_used": ts_f,
+                "last_used_iso": iso,
+            })
+        rows.sort(key=lambda r: r["last_used"], reverse=True)
+        return rows
+
+    # ---- song helpers (D3 + D4 plumbing) ----
+
+    def _song_cache_dir(self) -> Path:
+        """Where cached `analyze_song(path)` results live on disk."""
+        from aftermovie.config import data_dir
+        return data_dir() / "song-analysis"
+
+    def _song_cache_path(self, path: Path) -> Path:
+        """Cache file for `path` keyed by SHA1(`<abs-path>-<mtime_ns>`)."""
+        import hashlib
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        key_src = f"{path}-{mtime_ns}"
+        key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
+        return self._song_cache_dir() / f"{key}.json"
+
+    def _cached_song_info(self, path: Path) -> dict[str, Any] | None:
+        """Return the on-disk `song_info` cache for `path`, or None.
+
+        Read-only — never triggers an analyze. Used by `current_song` and
+        `list_candidate_songs` to opportunistically surface cached duration
+        without paying the librosa boot.
+        """
+        cache_path = self._song_cache_path(path)
+        if not cache_path.is_file():
+            return None
+        try:
+            data = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    def _recents_store(self) -> "Any":
+        """SidecarStore Adapter for `~/.aftermovie/recent-songs.json`."""
+        from aftermovie.analyze.sidecar import SidecarStore
+        folder = Path.home() / ".aftermovie"
+        defaults: dict[str, Any] = {"songs": [], "version": RECENT_SONGS_VERSION}
+        return SidecarStore(folder, RECENT_SONGS_FILENAME, defaults)
+
+    def _touch_recent(self, path: Path) -> None:
+        """Move `path` to the head of the recents list; cap at RECENT_SONGS_CAP.
+
+        Each entry is `{path, last_used: epoch_seconds}`. We dedupe on
+        `path` so re-picking the same file doesn't create a duplicate row.
+        """
+        store = self._recents_store()
+        data = store.read()
+        items = data.get("songs") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+        path_s = str(path)
+        # Drop any existing row for this path before prepending the fresh one.
+        kept = [it for it in items
+                if isinstance(it, dict) and isinstance(it.get("path"), str)
+                and it["path"] != path_s]
+        kept.insert(0, {"path": path_s, "last_used": time.time()})
+        # LRU eviction — keep only the most-recently-used N entries.
+        kept = kept[:RECENT_SONGS_CAP]
+        store.write({
+            "songs": kept,
+            "version": RECENT_SONGS_VERSION,
+            "generated_by": "aftermovie-select",
+        })
 
     # ---- import jobs ----
 

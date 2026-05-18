@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=7">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
   <header class="topbar">
@@ -85,6 +85,39 @@
   </header>
 
   <main>
+    <section id="song-section" class="song-section" aria-label="Song picker">
+      <div class="song-row song-current">
+        <span class="song-label">Song:</span>
+        <span id="song-current-path" class="song-current-path" title="">none selected</span>
+        <span id="song-meta" class="song-meta" aria-live="polite"></span>
+        <svg id="song-sparkline" class="song-sparkline" viewBox="0 0 100 20"
+             preserveAspectRatio="none" aria-hidden="true"></svg>
+      </div>
+      <div class="song-row song-pick">
+        <label class="ctrl song-file-ctrl">
+          <span>File</span>
+          <input id="song-file" type="file" accept="audio/*"
+                 aria-label="Pick a song file">
+        </label>
+        <label class="ctrl song-path-ctrl">
+          <span>Path</span>
+          <input id="song-path" type="text"
+                 placeholder="/absolute/path/to/song.mp3"
+                 aria-label="Paste an absolute song path">
+        </label>
+        <button id="song-use-path-btn" class="btn ghost" type="button">Use this song</button>
+      </div>
+      <div class="song-row song-suggestions">
+        <span class="song-row-label">In folder</span>
+        <div id="song-candidates" class="song-candidates"
+             role="group" aria-label="Candidate songs"></div>
+      </div>
+      <div class="song-row song-recents">
+        <span class="song-row-label">Recent</span>
+        <div id="song-recents" class="song-recents-list"
+             role="group" aria-label="Recent songs"></div>
+      </div>
+    </section>
     <div id="status" class="status" role="status" aria-live="polite">Loading sources…</div>
     <div id="preview-status" class="preview-status hidden" aria-live="polite">
       <span id="preview-badge" class="preview-badge">Preview</span>
@@ -194,6 +227,6 @@
     </div>
   </template>
 
-  <script src="app.js?v=7" defer></script>
+  <script src="app.js?v=8" defer></script>
 </body>
 </html>

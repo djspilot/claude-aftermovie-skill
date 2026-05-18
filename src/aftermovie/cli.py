@@ -272,6 +272,24 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Don't auto-open the browser to the server URL.")
     psl.set_defaults(func=cmd_select)
 
+    pi = sub.add_parser(
+        "import",
+        help="Copy photos/videos from connected devices into a Source folder.",
+    )
+    pi.add_argument("--since", required=True,
+                    help="ISO date (YYYY-MM-DD) — earliest capture time to import.")
+    pi.add_argument("--until", default=None,
+                    help="ISO date (YYYY-MM-DD); defaults to now.")
+    pi.add_argument("--to", dest="to", required=True,
+                    help="Parent folder. A date-stamped subfolder "
+                         "(YYYY-MM-DD_to_YYYY-MM-DD) is created inside it.")
+    pi.add_argument("--sources", default=None,
+                    help="Comma-separated source names (photos_library,gopro). "
+                         "Default: every available source.")
+    pi.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="List what would be copied without writing anything.")
+    pi.set_defaults(func=cmd_import)
+
     pd = sub.add_parser("doctor", help="Check environment (ffmpeg, deps, LUTs).")
     pd.set_defaults(func=cmd_doctor)
 
@@ -303,6 +321,92 @@ def cmd_select(args: argparse.Namespace) -> None:
     song = Path(args.song).expanduser().resolve() if args.song else None
     run_server(clips, port=args.port, song=song,
                open_browser=not args.no_open)
+
+
+def cmd_import(args: argparse.Namespace) -> None:
+    """Copy photos/videos from connected devices into a date-stamped folder.
+
+    The CLI is the thinnest possible Adapter over the `import_sources`
+    Module: parse dates, materialize the dest subfolder, filter the
+    registry by `--sources`, then ask each Adapter for items and copy.
+    """
+    from datetime import datetime, time
+    from aftermovie.import_sources import all_sources
+
+    try:
+        since_dt = datetime.combine(
+            datetime.strptime(args.since, "%Y-%m-%d").date(), time.min,
+        )
+    except ValueError:
+        raise SystemExit(f"--since must be YYYY-MM-DD: got {args.since!r}")
+    if args.until:
+        try:
+            until_dt = datetime.combine(
+                datetime.strptime(args.until, "%Y-%m-%d").date(), time.max,
+            )
+        except ValueError:
+            raise SystemExit(f"--until must be YYYY-MM-DD: got {args.until!r}")
+    else:
+        until_dt = datetime.now()
+    if until_dt < since_dt:
+        raise SystemExit(f"--until ({until_dt}) is before --since ({since_dt}).")
+
+    parent = Path(args.to).expanduser().resolve()
+    subfolder_name = f"{since_dt.strftime('%Y-%m-%d')}_to_{until_dt.strftime('%Y-%m-%d')}"
+    dest_folder = parent / subfolder_name
+
+    wanted_names: set[str] | None = None
+    if args.sources:
+        wanted_names = {s.strip() for s in args.sources.split(",") if s.strip()}
+
+    sources = all_sources()
+    if wanted_names is not None:
+        sources = [s for s in sources if s.name in wanted_names]
+        if not sources:
+            raise SystemExit(
+                f"No sources match --sources={args.sources!r}. "
+                f"Available: {','.join(s.name for s in all_sources())}"
+            )
+
+    total_copied = 0
+    total_skipped = 0
+    total_failed = 0
+    total_bytes = 0
+    for src in sources:
+        if not src.available():
+            log(f"  - {src.label} ({src.name}): not available, skipping")
+            continue
+        log(f"  scanning {src.label} ({src.name}) "
+            f"{since_dt.date()} → {until_dt.date()}")
+        items = src.list_in_range(since_dt, until_dt)
+        log(f"  {src.label}: {len(items)} item(s) in range")
+        if args.dry_run:
+            for it in items[:20]:
+                log(f"    [dry-run] would copy {it.src_path} ({it.kind})")
+                mov = it.extra.get("live_photo_mov")
+                if mov:
+                    log(f"    [dry-run]   + paired {mov}")
+            if len(items) > 20:
+                log(f"    [dry-run] (+{len(items) - 20} more)")
+            continue
+        if not items:
+            continue
+        res = src.copy_into(items, dest_folder)
+        log(f"  {src.label}: copied={res.copied} skipped={res.skipped} "
+            f"failed={res.failed} ({res.bytes_written / 1e6:.1f} MB)")
+        total_copied += res.copied
+        total_skipped += res.skipped
+        total_failed += res.failed
+        total_bytes += res.bytes_written
+
+    if args.dry_run:
+        log(f"  dry-run complete — destination would be {dest_folder}")
+        return
+    log(
+        f"  import done → {dest_folder}  "
+        f"(copied={total_copied} skipped={total_skipped} "
+        f"failed={total_failed}, {total_bytes / 1e6:.1f} MB)"
+    )
 
 
 def cmd_init_config(args: argparse.Namespace) -> None:

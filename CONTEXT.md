@@ -48,6 +48,12 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **Optional dep** — a third-party Python package (cv2, mediapipe, Pillow) or PATH command (exiftool, ffprobe) whose absence is recoverable: the analyzer using it logs one warning per process and falls back to a neutral output. Owned by `aftermovie.optional_dep`; analyzers and `cmd_doctor` ask it instead of re-doing `try-import`/`shutil.which` themselves.
 
+## Import
+
+- **Import source** — an `ImportSource` Adapter in `aftermovie.import_sources` that knows how to enumerate, filter, and copy files off one connected device. Two implementations ship: `PhotosLibraryAdapter` (macOS Photos library bundle, via the optional `osxphotos` Python dep) and `GoProAdapter` (one instance per mounted `/Volumes/<name>` carrying a `DCIM/` subtree). All sources are reached through the `all_sources()` registry, which lists `photos_library` first then one entry per detected GoPro mount. Not "source folder" (that's the analyzer's input), not "device" (we'd need a Pokemon-tier list of those — "Import source" stays at the Adapter boundary).
+
+- **Import item** — one `ImportItem` dataclass: an absolute `src_path`, a POSIX `captured_at`, a coarse `kind` (`"video"` / `"still"` / `"live_photo"`), a `size_bytes`, a human `source_label`, and an Adapter-specific `extra` dict (Live Photos drop the paired MOV under `extra["live_photo_mov"]`). The `aftermovie import` CLI, the future select-GUI date-picker, and the future HTTP endpoint all consume the same shape so adding a third Adapter (DJI drone, Android MTP) requires zero churn in the call sites.
+
 ## Storage
 
 - **Catalog Repository** — `aftermovie.repos.CatalogRepository` (singleton: `catalog_repo`). Owns id derivation, cache-hit lookup, and on-disk persistence of Catalogs under `~/.skills-data/aftermovie/catalogs/<catalog_id>.json`. `put(folder, catalog)` stamps `_aftermovie.catalog_id` onto the catalog. Pipeline + MCP + select-GUI all go through this Seam.

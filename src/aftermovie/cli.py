@@ -356,14 +356,19 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     """Self-check for ffmpeg, python deps, LUTs, optional MCP/mediapipe."""
     import shutil
 
+    from aftermovie.analyze.live_photo import _EXIFTOOL
+    from aftermovie.analyze.quality import _CV2
+    from aftermovie.analyze.faces import _MEDIAPIPE, available as faces_available
     from aftermovie.config import lut_dir
+    from aftermovie.optional_dep import optional_import
     from aftermovie.score import components as sc
 
     print("aftermovie doctor")
     print("-----------------")
     ff = shutil.which("ffmpeg")
     fp = shutil.which("ffprobe")
-    et = shutil.which("exiftool")
+    # exiftool truth-of-availability lives in optional_dep; ask there, not shutil.
+    et = _EXIFTOOL.path
     print(f"  ffmpeg:        {'OK ' + ff if ff else 'MISSING'}")
     print(f"  ffprobe:       {'OK ' + fp if fp else 'MISSING'}")
     print(f"  exiftool:      {'OK ' + et if et else 'not installed (single-file Live Photos will be used as stills only)'}")
@@ -375,14 +380,17 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         except ImportError as e:
             print(f"  {mod:14s} MISSING ({e})")
 
-    for opt, label in [("mcp", "mcp (optional)"), ("mediapipe", "mediapipe (optional)")]:
-        try:
-            __import__(opt)
-            print(f"  {label:24s} OK")
-        except ImportError:
-            print(f"  {label:24s} not installed")
+    # Optional Python deps already wrapped by analyzers — reuse those handles
+    # so the answer to "is it here?" has exactly one home (optional_dep).
+    mcp_dep = optional_import("mcp", warning="")  # warning unused, doctor never calls .require()
+    optional_python = [
+        ("mcp (optional)", mcp_dep),
+        ("mediapipe (optional)", _MEDIAPIPE),
+        ("cv2 (optional)", _CV2),
+    ]
+    for label, dep in optional_python:
+        print(f"  {label:24s} {'OK' if dep.available else 'not installed'}")
 
-    from aftermovie.analyze.faces import available as faces_available
     print(f"  faces feature:           {'OK' if faces_available() else 'unavailable (mediapipe or model missing)'}")
 
     lut_d = lut_dir()

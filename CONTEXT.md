@@ -46,6 +46,8 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **Score component** — one named signal that contributes to a Candidate's total score (`motion`, `audio`, `hilight_tag`, `accl_jump`, `gps_speed`, `face`, `user_favorite`, `blurry`, `poor_exposure`). Declared once in `score/components.py`; the scorer threads `ScoreComponent` instances (not raw strings) into the `Candidate.components` / `PlanEntry.components` breakdown so the "why this entry won?" inspector has a fixed vocabulary. Not "score field", not "signal" (signal is the analyze-time input — `motion_energy`, `accl_peaks`, ...; the *component* is what the scorer derives from it).
 
+- **Optional dep** — a third-party Python package (cv2, mediapipe, Pillow) or PATH command (exiftool, ffprobe) whose absence is recoverable: the analyzer using it logs one warning per process and falls back to a neutral output. Owned by `aftermovie.optional_dep`; analyzers and `cmd_doctor` ask it instead of re-doing `try-import`/`shutil.which` themselves.
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

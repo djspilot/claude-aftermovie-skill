@@ -92,8 +92,10 @@ def test_exposure_extremes_would_trip_scorer_thresholds(monkeypatch):
 
 def test_cv2_unavailable_returns_empty(monkeypatch):
     """When cv2 import failed we must short-circuit, not crash."""
-    monkeypatch.setattr(quality, "_CV2_AVAILABLE", False)
-    monkeypatch.setattr(quality, "_CV2_WARNED", False)
+    # Pretend cv2 didn't import by flipping the shared OptionalImport handle
+    # to its missing-dep state.
+    monkeypatch.setattr(quality._CV2, "module", None)
+    monkeypatch.setattr(quality._CV2, "_warned", False)
     assert quality.sharpness_per_second(Path("/x"), 1.0, 30.0) == []
     assert quality.exposure_per_second(Path("/x"), 1.0, 30.0) == []
     assert quality.sharpness_for_image(Path("/x")) is None

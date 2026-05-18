@@ -15,15 +15,20 @@ from pathlib import Path
 from typing import Any
 
 from aftermovie.config import models_dir
+from aftermovie.optional_dep import optional_import
 
 _MODEL_NAME = "blaze_face_short_range.tflite"
+
+_MEDIAPIPE = optional_import(
+    "mediapipe",
+    warning="  ! mediapipe not installed — face detection / smart reframe "
+            "disabled (pip install mediapipe).",
+)
 
 
 def available() -> bool:
     """Cheap check for `mediapipe + model file`."""
-    try:
-        import mediapipe  # noqa: F401
-    except ImportError:
+    if not _MEDIAPIPE.available:
         return False
     return (models_dir() / _MODEL_NAME).is_file()
 

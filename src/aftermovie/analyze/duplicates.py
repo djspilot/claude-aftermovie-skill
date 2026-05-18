@@ -18,8 +18,8 @@ mostly matters for direct callers / tests) we load straight via PIL.
 
 Dependency posture: PIL is already a required dep; ffmpeg is the project's
 universal hard requirement. If either is somehow missing at call time we
-log ONCE and return None — the catalog still writes, downstream phash
-consumers treat None as "singleton, leave alone".
+log ONCE (via aftermovie.optional_dep) and return None — the catalog still
+writes, downstream phash consumers treat None as "singleton, leave alone".
 """
 from __future__ import annotations
 
@@ -27,12 +27,19 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from aftermovie.ffmpeg_cmd import log
+from aftermovie.optional_dep import optional_command, optional_import
 
-# One-shot warning flags so a missing dep doesn't spam the log for every
-# clip in the folder. First clip logs, the rest are silent.
-_WARNED_NO_PIL = False
-_WARNED_NO_FFMPEG = False
+# One-shot warning state lives in the optional_dep registry so a missing dep
+# doesn't spam the log for every clip in the folder. First clip logs, the
+# rest are silent — same warn-once contract every analyzer shares.
+_PIL = optional_import(
+    "PIL",
+    warning="phash: Pillow unavailable — perceptual hashing disabled",
+)
+_FFPROBE = optional_command(
+    "ffprobe",
+    warning="phash: ffprobe unavailable or failed — perceptual hashing disabled",
+)
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm",
                   ".insv", ".lrv"}
@@ -45,7 +52,6 @@ def _extract_middle_frame_png(path: Path) -> Path | None:
 
     Caller is responsible for unlinking the returned path. Returns None if
     ffprobe or ffmpeg fails (corrupt file, no ffmpeg on PATH, etc.)."""
-    global _WARNED_NO_FFMPEG
     # Probe duration so we can seek to the midpoint. A failed probe usually
     # means a corrupt clip — bail rather than guess.
     try:
@@ -57,9 +63,9 @@ def _extract_middle_frame_png(path: Path) -> Path | None:
         dur = float(probe.stdout.strip() or "0")
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired, ValueError):
-        if not _WARNED_NO_FFMPEG:
-            log("phash: ffprobe unavailable or failed — perceptual hashing disabled")
-            _WARNED_NO_FFMPEG = True
+        # Route the warn-once through the shared registry so the missing-PATH
+        # message fires at most once per process.
+        _FFPROBE.require()
         return None
     mid = max(0.0, dur / 2.0)
 
@@ -118,14 +124,10 @@ def compute_phash(path: Path) -> str | None:
     Any failure mode (missing PIL, missing ffmpeg, unreadable file, weird
     codec) returns None — never raises — so callers can keep going.
     """
-    global _WARNED_NO_PIL
-    try:
-        from PIL import Image
-    except ImportError:
-        if not _WARNED_NO_PIL:
-            log("phash: Pillow unavailable — perceptual hashing disabled")
-            _WARNED_NO_PIL = True
+    pil = _PIL.require()
+    if pil is None:
         return None
+    Image = pil.Image
 
     suffix = path.suffix.lower()
     tmp_png: Path | None = None

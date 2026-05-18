@@ -9,6 +9,7 @@ Two paths:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from aftermovie.render.encoder import (
     vfilter_output_guard,
 )
 from aftermovie.render.filters import aspect_filter
+from aftermovie.render.parallel import choose_max_workers, parallel_prerender
 from aftermovie.render.reframe import crop_x_expr_for_entry
 from aftermovie.render.titles import (
     build_overlay_chain,
@@ -328,6 +330,44 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         return False
 
 
+def _prerender_worker(
+    entry: dict,
+    out_clip: Path,
+    stage_index: int,
+    stage_total: int,
+    *,
+    aspect: str,
+    target_res: str,
+    target_fps: int,
+    lut: Path | None,
+    keep_audio: bool,
+    encoder: EncoderProfile,
+    enable_reframe: bool,
+) -> bool:
+    """Picklable Adapter that calls `_prerender_clip` from a worker process.
+
+    The parallel pool can't ferry a `ProgressCallback` across the process
+    boundary (closures aren't picklable, and even module-level callables
+    would need a reverse Queue to reach the GUI's progress lock). So this
+    Adapter strips `progress_cb` — the parent process emits coalesced
+    `ProgressEvent`s after each future resolves; see
+    `aftermovie.render.parallel.parallel_prerender`.
+
+    Stage_index/total are still threaded in so legacy logs that reference
+    them stay accurate. They're not used to drive progress here.
+    """
+    return _prerender_clip(
+        entry, out_clip,
+        aspect=aspect, target_res=target_res, target_fps=target_fps,
+        lut=lut, keep_audio=keep_audio,
+        encoder=encoder,
+        enable_reframe=enable_reframe,
+        progress_cb=None,
+        stage_index=stage_index,
+        stage_total=stage_total,
+    )
+
+
 def _compensated_render_entry(entry: dict, *, transitions_active: bool,
                               is_first: bool) -> tuple[dict, float, float]:
     """Return (render_entry, planned_duration, prerender_duration).
@@ -374,48 +414,77 @@ def cmd_render(args: argparse.Namespace, *,
     # cheap (one sysctl on darwin, nothing elsewhere) and select_from_env
     # honours AFTERMOVIE_VIDEO_CODEC while falling back gracefully when an
     # env value asks for a profile ffmpeg doesn't ship.
-    encoder = select_from_env(detect_chip())
+    chip = detect_chip()
+    encoder = select_from_env(chip)
+    # B4: pool size from the chip × encoder heuristic, honouring
+    # AFTERMOVIE_RENDER_WORKERS for ops tuning / deterministic CI.
+    max_workers = choose_max_workers(chip, encoder)
 
     log(f"Rendering {len(entries)} cuts → {output.name}")
     log(f"  res={target_res} fps={target_fps} aspect={aspect}"
         f" audio={audio_mix} transitions={'yes' if transitions_active else 'no'}"
         f" titles={'yes' if titles else 'no'}"
         f" encoder={encoder.name}"
+        f" workers={max_workers}"
         f"{' lut=' + lut.name if lut else ''}")
 
     n_entries = len(entries)
 
     with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmpdir:
         tmp = Path(tmpdir)
-        clip_paths: list[Path] = []
-        durations: list[float] = []
+        # Pre-build the per-slot render entries + output paths. Doing this
+        # upfront keeps the parallel pool ignorant of `_compensated_render_entry`
+        # — the worker just gets a finished entry dict + path. It also lets
+        # us preserve plan order for the post-parallel filter_complex pass
+        # by indexing back into `render_entries` / `durations` using the
+        # same slot index the parallel helper returns paths for.
         render_entries: list[dict] = []
-        planned_total = 0.0
-
+        planned_durations: list[float] = []
+        render_durations: list[float] = []
+        work: list[tuple[dict, Path]] = []
         for i, entry in enumerate(entries):
             render_entry, planned_duration, render_duration = _compensated_render_entry(
                 entry, transitions_active=transitions_active, is_first=(i == 0)
             )
+            render_entries.append(render_entry)
+            planned_durations.append(planned_duration)
+            render_durations.append(render_duration)
+            work.append((render_entry, tmp / f"clip_{i:04d}.mp4"))
 
-            out_clip = tmp / f"clip_{i:04d}.mp4"
-            ok = _prerender_clip(
-                render_entry, out_clip,
-                aspect=aspect, target_res=target_res, target_fps=target_fps,
-                lut=lut, keep_audio=keep_audio,
-                encoder=encoder,
-                enable_reframe=enable_reframe,
-                progress_cb=progress_cb,
-                stage_index=i + 1,
-                stage_total=n_entries,
-            )
-            if not ok:
+        # B4: factory binds the encode flags so the parallel helper only
+        # sees `(entry, out_clip, idx, total) -> bool`. `functools.partial`
+        # over a module-level function is picklable, which keeps the
+        # ProcessPoolExecutor path viable.
+        factory = functools.partial(
+            _prerender_worker,
+            aspect=aspect, target_res=target_res, target_fps=target_fps,
+            lut=lut, keep_audio=keep_audio,
+            encoder=encoder,
+            enable_reframe=enable_reframe,
+        )
+
+        prerender_results = parallel_prerender(
+            work, factory,
+            max_workers=max_workers,
+            progress_cb=progress_cb,
+            encoder_name=encoder.name,
+        )
+
+        # Filter dropped clips, preserving plan order. `parallel_prerender`
+        # returns `None` in failed slots — same skip semantics as the
+        # legacy for-loop's `if not ok: continue`.
+        clip_paths: list[Path] = []
+        durations: list[float] = []
+        kept_render_entries: list[dict] = []
+        planned_total = 0.0
+        for idx, out_clip in enumerate(prerender_results):
+            if out_clip is None:
                 continue
             clip_paths.append(out_clip)
-            render_entries.append(render_entry)
-            planned_total += planned_duration
-            # The prerender pads to `out_duration_s` so beat-sync holds even
-            # when the source ran short. Use that as the authoritative duration.
-            durations.append(render_duration)
+            kept_render_entries.append(render_entries[idx])
+            planned_total += planned_durations[idx]
+            durations.append(render_durations[idx])
+        render_entries = kept_render_entries
 
         if not clip_paths:
             sys.exit("No clips rendered. Aborting.")

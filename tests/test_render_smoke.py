@@ -146,3 +146,46 @@ def test_render_with_h264_vt_env_override(
     codecs = {s.get("codec_name") for s in info.get("streams", [])}
     # h264_videotoolbox produces an h264 stream, just like libx264.
     assert "h264" in codecs, f"expected h264, got {codecs}"
+
+
+def test_render_with_parallel_workers_produces_valid_mp4(
+    tmp_path: Path, fixtures_dir: Path, tone: Path, monkeypatch,
+):
+    """B4 smoke: a 3-clip render at AFTERMOVIE_RENDER_WORKERS=2 produces a
+    valid mp4 with the same shape as the sequential default.
+
+    The fixture clips are tiny (a few hundred KB) so wall-clock isn't the
+    test target — correctness is. We pin the env var to 2 to force a real
+    parallel pool (not the max_workers=1 short-circuit) and verify the
+    output mp4's streams + duration land in the expected range.
+    """
+    monkeypatch.setenv("AFTERMOVIE_RENDER_WORKERS", "2")
+
+    out_path = tmp_path / "smoke_parallel.mp4"
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    for name in ("clip_a.mp4", "clip_b.mp4", "clip_c.mp4"):
+        shutil.copy(fixtures_dir / name, clips_dir / name)
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "auto",
+        "--clips", str(clips_dir),
+        "--song", str(tone),
+        "--output", str(out_path),
+        "--max-length", "6",
+        "--res", "320x240",
+        "--fps", "24",
+        "--source-cap", "3",
+    ])
+    args.func(args)
+
+    assert out_path.exists(), "parallel-pool mp4 was not produced"
+    info = ffprobe_json(out_path)
+    codecs = {s.get("codec_name") for s in info.get("streams", [])}
+    types = {s.get("codec_type") for s in info.get("streams", [])}
+    assert codecs & {"h264", "hevc"}, f"expected h264 or hevc, got {codecs}"
+    assert "aac" in codecs, f"expected aac audio, got {codecs}"
+    assert "video" in types and "audio" in types
+    duration = float(info["format"]["duration"])
+    assert 4.0 < duration < 8.0, f"unexpected duration {duration}"

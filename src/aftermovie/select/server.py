@@ -208,68 +208,14 @@ class _LogCapture(io.TextIOBase):
 
 
 def _persist_render_artifacts(clips: Path, job: RenderJob) -> None:
-    """After a successful render, copy the per-job catalog + plan from the
-    temp workdir into `state.catalog_dir()` / `state.plan_dir()` so the
-    `/api/plan` endpoint has a stable place to find them on next request.
-
-    Best-effort: if the temp workdir was already cleaned or `run_auto` didn't
-    leave artifacts on disk (e.g. the `--from-plan` short-circuit path), the
-    fallback is to leave state unchanged. Errors here are swallowed onto the
-    job's log_tail — they must NOT mark the render as failed.
+    """Compatibility shim — `pipeline_runner.run_auto` now persists the
+    catalog and plan into `state.catalog_dir()` / `state.plan_dir()` itself
+    (with the right `_aftermovie.catalog_id` / `plan_id` stamps), so this
+    function is a no-op kept only so callers don't break. Intentionally
+    swallows any logging it might have done — single source of truth lives
+    inside `run_auto`.
     """
-    try:
-        import json as _json
-        import re as _re
-
-        from aftermovie import state
-
-        # `run_auto` logs `Working dir: <path>` to stderr (captured into
-        # `log_tail`). Scan from the tail backwards for the most recent one.
-        workdir: Path | None = None
-        for line in reversed(list(job.log_tail)):
-            m = _re.match(r"Working dir:\s*(.+)$", line)
-            if m:
-                workdir = Path(m.group(1).strip())
-                break
-        if workdir is None or not workdir.is_dir():
-            return
-
-        catalog_src = workdir / "catalog.json"
-        plan_src = workdir / "plan.json"
-        catalog_id = state.catalog_id_for(clips)
-        if catalog_src.is_file():
-            try:
-                catalog = _json.loads(catalog_src.read_text())
-                state.save_catalog(catalog_id, catalog)
-            except (OSError, ValueError):
-                pass
-        if plan_src.is_file():
-            try:
-                plan = _json.loads(plan_src.read_text())
-                # Stamp the catalog_id onto the plan so /api/plan can match
-                # plans back to a clips folder without re-parsing every plan.
-                if isinstance(plan, dict):
-                    plan.setdefault("_aftermovie", {})["catalog_id"] = catalog_id
-                # Plan IDs are content-hashed; if we can't derive a richer id
-                # from plan metadata, fall back to a hash of the file bytes.
-                song_path = plan.get("song") if isinstance(plan, dict) else None
-                theme = plan.get("theme") if isinstance(plan, dict) else None
-                target_length = plan.get("max_length") if isinstance(plan, dict) else None
-                aspect = plan.get("aspect", "16:9") if isinstance(plan, dict) else "16:9"
-                if song_path:
-                    plan_id = state.plan_id_for(
-                        catalog_id, Path(song_path), theme, target_length, aspect, 0
-                    )
-                else:
-                    import hashlib as _hashlib
-                    plan_id = _hashlib.sha1(
-                        plan_src.read_bytes()
-                    ).hexdigest()[:12]
-                state.save_plan(plan_id, plan)
-            except (OSError, ValueError):
-                pass
-    except Exception as e:  # noqa: BLE001 — persistence is best-effort
-        job.log_tail.append(f"[persist] {type(e).__name__}: {e}")
+    return
 
 
 def _run_render_job(

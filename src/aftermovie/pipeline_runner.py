@@ -13,10 +13,13 @@ score / render modules themselves stay untouched.
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import tempfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from aftermovie import state
 from aftermovie.analyze.clip import cmd_analyze
 from aftermovie.config import (
     DEFAULT_CLIP_DB,
@@ -57,6 +60,7 @@ class AutoOpts:
     burst_window_s: float = 3.0
     preview: bool = False
     reveal: bool = True
+    force_reanalyze: bool = False
 
 
 # Preview-mode overrides — applied after theme expansion so --preview wins.
@@ -166,14 +170,35 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
     catalog_path = workdir / "catalog.json"
     plan_path = workdir / "plan.json"
 
-    # 1) analyze
-    a = argparse.Namespace(
-        clips=str(clips_path),
-        out=str(catalog_path),
-        still_duration=opts.still_duration,
-        no_stills=opts.no_stills,
-    )
-    cmd_analyze(a)
+    # 1) analyze — consult the on-disk catalog cache first. IDs are content-
+    # derived (folder path + file list + sizes + mtimes), so a hit means the
+    # source tree is byte-identical to the prior run. `--force-analyze` and
+    # `opts.force_reanalyze=True` bypass the cache.
+    cid = state.catalog_id_for(clips_path)
+    cached_catalog = state.catalog_dir() / f"{cid}.json"
+    if cached_catalog.is_file() and not opts.force_reanalyze:
+        log(f"Using cached catalog {cid}")
+        shutil.copy(cached_catalog, catalog_path)
+    else:
+        a = argparse.Namespace(
+            clips=str(clips_path),
+            out=str(catalog_path),
+            still_duration=opts.still_duration,
+            no_stills=opts.no_stills,
+        )
+        cmd_analyze(a)
+        # Stamp the catalog_id onto the catalog and persist into the cache
+        # for next time. Best-effort — a malformed catalog falls through
+        # to the score stage unchanged.
+        try:
+            catalog = json.loads(catalog_path.read_text())
+            if isinstance(catalog, dict):
+                catalog.setdefault("_aftermovie", {})["catalog_id"] = cid
+                catalog_path.write_text(json.dumps(catalog, indent=2))
+                state.save_catalog(cid, catalog)
+                log(f"Cached catalog {cid}")
+        except (OSError, ValueError) as e:
+            log(f"  ! could not cache catalog {cid}: {type(e).__name__}: {e}")
 
     # 2) score
     s = argparse.Namespace(
@@ -199,6 +224,21 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
         burst_window_s=opts.burst_window_s,
     )
     cmd_score(s)
+
+    # Persist the plan into state.plan_dir() so the GUI's /api/plan endpoint
+    # can find it. Scoring is cheap so we always re-score and never skip,
+    # but we do stamp + cache the resulting plan.
+    pid = state.plan_id_for(cid, song_path, opts.theme, opts.max_length, opts.aspect, 0)
+    try:
+        plan = json.loads(plan_path.read_text())
+        if isinstance(plan, dict):
+            tag = plan.setdefault("_aftermovie", {})
+            tag["catalog_id"] = cid
+            tag["plan_id"] = pid
+            plan_path.write_text(json.dumps(plan, indent=2))
+            state.save_plan(pid, plan)
+    except (OSError, ValueError) as e:
+        log(f"  ! could not cache plan {pid}: {type(e).__name__}: {e}")
 
     # 3) render
     r = argparse.Namespace(plan=str(plan_path), output=str(output_path))

@@ -267,22 +267,25 @@ def _run_import_job(
 
         dest_folder.mkdir(parents=True, exist_ok=True)
 
-        def _progress_cb(event: str, _item: Any = None) -> None:
-            # `copy_into` is expected to call this with one of:
-            # "copied" | "skipped" | "failed" per item processed.
-            if event == "copied":
-                job.copied += 1
-            elif event == "skipped":
-                job.skipped += 1
-            elif event == "failed":
-                job.failed += 1
+        # base.copy_files signature: progress_cb(done, total, src_path) — fires
+        # once per file processed. We use `done` for live progress feedback,
+        # then fold the accurate copied/skipped/failed breakdown from
+        # CopyResult after each source finishes.
+        def _progress_cb(done: int, _total: int, _src: str | None = None) -> None:
+            # Provisional running count so the GUI's progress bar moves; the
+            # CopyResult fold below replaces it with the true breakdown.
+            job.copied = done
 
         for src, items in items_per_source:
             if not items:
                 continue
+            # Reset the provisional counter so we can fold this source cleanly.
+            before_done = job.copied
             result = src.copy_into(items, dest_folder, progress_cb=_progress_cb)
-            # If the source didn't drive progress_cb, fall back to its tally.
-            if result is not None and (job.copied + job.skipped + job.failed) == 0:
+            # Roll back the provisional in-flight count and apply the real
+            # breakdown from this source's CopyResult.
+            job.copied = before_done
+            if result is not None:
                 job.copied += getattr(result, "copied", 0)
                 job.skipped += getattr(result, "skipped", 0)
                 job.failed += getattr(result, "failed", 0)

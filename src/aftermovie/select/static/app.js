@@ -71,6 +71,15 @@
     importDest: $("#import-dest"),
     importUseFolder: $("#import-use-folder"),
     importLog: $("#import-log"),
+    songSection: $("#song-section"),
+    songCurrentPath: $("#song-current-path"),
+    songMeta: $("#song-meta"),
+    songSparkline: $("#song-sparkline"),
+    songFile: $("#song-file"),
+    songPath: $("#song-path"),
+    songUsePathBtn: $("#song-use-path-btn"),
+    songCandidates: $("#song-candidates"),
+    songRecents: $("#song-recents"),
   };
 
   // -------- API helpers --------
@@ -871,6 +880,197 @@
     importPollTimer = null;
   }
 
+  // -------- Song picker (D1-D4) --------
+  // Per-server song selection, surviving server restart via
+  // ~/.aftermovie/recent-songs.json. Three pick mechanisms:
+  //   1. HTML5 file picker → POST /api/upload-song (multipart). The server
+  //      copies the file into ~/.skills-data/aftermovie/songs/<sha1>.<ext>
+  //      and returns the canonical path the renderer uses. Browsers don't
+  //      expose absolute paths from <input type=file>, hence the copy-through.
+  //   2. Paste an absolute path → POST /api/set-song-path (JSON). Cheap;
+  //      no file movement, just validation + activation.
+  //   3. Click a candidate / recent chip → same as (2).
+  // On success we refresh the path display, recents list, and lazily fetch
+  // /api/song-info for tempo + sparkline.
+  let currentSongPath = "";
+
+  async function loadCurrentSong() {
+    try {
+      const data = await fetch("/api/song").then((r) => {
+        if (!r.ok) throw new Error(`GET /api/song -> ${r.status}`);
+        return r.json();
+      });
+      renderCurrentSong(data);
+      if (data && data.path) {
+        loadSongInfo(data.path).catch(() => {});
+      }
+    } catch (err) {
+      console.warn("Failed to load current song:", err);
+    }
+  }
+
+  function renderCurrentSong(data) {
+    const path = data && data.path ? String(data.path) : "";
+    currentSongPath = path;
+    if (path) {
+      els.songCurrentPath.textContent = (data && data.name) || basename(path);
+      els.songCurrentPath.title = path;
+    } else {
+      els.songCurrentPath.textContent = "none selected";
+      els.songCurrentPath.title = "";
+    }
+    if (data && (data.duration_s || data.tempo_bpm)) {
+      els.songMeta.textContent = formatSongMeta(data);
+    } else {
+      els.songMeta.textContent = "";
+    }
+    // Clear the sparkline until /api/song-info fills it in.
+    els.songSparkline.replaceChildren();
+  }
+
+  function formatSongMeta(info) {
+    const bits = [];
+    const dur = Number(info.duration_s);
+    if (Number.isFinite(dur) && dur > 0) bits.push(formatDuration(dur));
+    const bpm = Number(info.tempo_bpm);
+    if (Number.isFinite(bpm) && bpm > 0) bits.push(`${Math.round(bpm)} BPM`);
+    return bits.join(" · ");
+  }
+
+  function formatDuration(s) {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60).toString().padStart(2, "0");
+    return `${m}:${sec}`;
+  }
+
+  async function loadSongInfo(path) {
+    try {
+      const info = await fetch(`/api/song-info?path=${encodeURIComponent(path)}`)
+        .then((r) => {
+          if (!r.ok) throw new Error(`GET /api/song-info -> ${r.status}`);
+          return r.json();
+        });
+      els.songMeta.textContent = formatSongMeta(info);
+      renderSparkline(info.energy_curve_samples || []);
+    } catch (err) {
+      console.warn("Failed to load song info:", err);
+    }
+  }
+
+  function renderSparkline(samples) {
+    els.songSparkline.replaceChildren();
+    if (!samples || !samples.length) return;
+    const n = samples.length;
+    const w = 100;
+    const h = 20;
+    const stride = n > 1 ? w / (n - 1) : w;
+    const points = samples
+      .map((v, i) => `${(i * stride).toFixed(2)},${(h - Math.max(0, Math.min(1, Number(v) || 0)) * h).toFixed(2)}`)
+      .join(" ");
+    const ns = "http://www.w3.org/2000/svg";
+    const poly = document.createElementNS(ns, "polyline");
+    poly.setAttribute("points", points);
+    poly.setAttribute("fill", "none");
+    poly.setAttribute("stroke", "currentColor");
+    poly.setAttribute("stroke-width", "1");
+    poly.setAttribute("stroke-linejoin", "round");
+    els.songSparkline.appendChild(poly);
+  }
+
+  async function setSong(path) {
+    try {
+      const res = await fetch("/api/set-song-path", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `POST /api/set-song-path -> ${res.status}`);
+      }
+      const data = await res.json();
+      renderCurrentSong(data);
+      els.songPath.value = "";
+      loadSongInfo(data.path || path).catch(() => {});
+      loadRecentSongs();
+    } catch (err) {
+      console.warn("Failed to set song:", err);
+      alert(`Could not set song: ${err.message}`);
+    }
+  }
+
+  async function uploadSong(file) {
+    if (!file) return;
+    const form = new FormData();
+    form.append("song", file, file.name || "song");
+    try {
+      const res = await fetch("/api/upload-song", {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `POST /api/upload-song -> ${res.status}`);
+      }
+      const data = await res.json();
+      renderCurrentSong(data);
+      if (data.path) loadSongInfo(data.path).catch(() => {});
+      loadRecentSongs();
+    } catch (err) {
+      console.warn("Failed to upload song:", err);
+      alert(`Could not upload song: ${err.message}`);
+    }
+  }
+
+  async function loadCandidateSongs() {
+    try {
+      const rows = await fetch("/api/candidate-songs").then((r) => {
+        if (!r.ok) throw new Error(`GET /api/candidate-songs -> ${r.status}`);
+        return r.json();
+      });
+      renderSongChips(els.songCandidates, rows, "no audio files in this folder");
+    } catch (err) {
+      console.warn("Failed to load candidate songs:", err);
+    }
+  }
+
+  async function loadRecentSongs() {
+    try {
+      const rows = await fetch("/api/recent-songs").then((r) => {
+        if (!r.ok) throw new Error(`GET /api/recent-songs -> ${r.status}`);
+        return r.json();
+      });
+      renderSongChips(els.songRecents, rows, "no recent songs");
+    } catch (err) {
+      console.warn("Failed to load recent songs:", err);
+    }
+  }
+
+  function renderSongChips(container, rows, emptyHint) {
+    container.replaceChildren();
+    if (!rows || !rows.length) {
+      const hint = document.createElement("span");
+      hint.className = "song-chip-empty";
+      hint.textContent = emptyHint;
+      container.appendChild(hint);
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const row of rows) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "song-chip";
+      chip.title = row.path || "";
+      chip.textContent = row.name || basename(row.path || "");
+      if (row.path && row.path === currentSongPath) {
+        chip.classList.add("active");
+      }
+      chip.addEventListener("click", () => setSong(row.path));
+      frag.appendChild(chip);
+    }
+    container.appendChild(frag);
+  }
+
   // -------- Wire-up --------
   els.selectAll.addEventListener("click", selectAll);
   els.deselectAll.addEventListener("click", deselectAll);
@@ -887,9 +1087,30 @@
   els.importBtn.addEventListener("click", () => startImport(false));
   els.dryRunBtn.addEventListener("click", () => startImport(true));
 
+  els.songFile.addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) uploadSong(file);
+    // Reset so re-picking the same file re-fires "change".
+    e.target.value = "";
+  });
+  els.songUsePathBtn.addEventListener("click", () => {
+    const p = (els.songPath.value || "").trim();
+    if (p) setSong(p);
+  });
+  els.songPath.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const p = (els.songPath.value || "").trim();
+      if (p) setSong(p);
+    }
+  });
+
   loadOptions();
   loadPreferences();
   loadImportSources();
+  loadCurrentSong();
+  loadCandidateSongs();
+  loadRecentSongs();
   // Load sources first so the plan can resolve thumb URLs via path → /thumbs/<key>.jpg.
   loadSources().finally(loadPlan);
 })();

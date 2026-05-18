@@ -113,6 +113,58 @@ def test_plan_timeline_panel_wired() -> None:
     )
 
 
+def test_song_picker_section_wired() -> None:
+    """Phase D: GUI exposes a song picker section above the source grid.
+
+    Static check — confirms the DOM hooks (song-section, file picker, path
+    input, candidate / recent chip containers), the JS entry points
+    (loadSongInfo, setSong, loadCandidateSongs, loadRecentSongs), and the
+    documented endpoint names exist. The backend is wired by the same
+    Phase D batch; this only verifies the front-end stays in lockstep.
+    """
+    html = _read("index.html")
+    css = _read("style.css")
+    js = _read("app.js")
+
+    # DOM: the picker section, the current-path display, and the two pick
+    # mechanisms (file picker + text path + Use button).
+    assert 'id="song-section"' in html, "index.html missing #song-section"
+    assert 'id="song-current-path"' in html, (
+        "index.html missing #song-current-path"
+    )
+    assert 'id="song-file"' in html, "index.html missing #song-file picker"
+    assert 'id="song-path"' in html, "index.html missing #song-path input"
+    assert 'id="song-use-path-btn"' in html, (
+        "index.html missing #song-use-path-btn"
+    )
+    # DOM: candidate + recent chip containers and the sparkline element.
+    assert 'id="song-candidates"' in html, "index.html missing #song-candidates"
+    assert 'id="song-recents"' in html, "index.html missing #song-recents"
+    assert 'id="song-sparkline"' in html, "index.html missing #song-sparkline"
+
+    # CSS: the picker has dedicated styles using existing tokens.
+    assert ".song-section" in css, "style.css missing .song-section rule"
+    assert ".song-chip" in css, "style.css missing .song-chip rule"
+
+    # JS: the documented entry points must be greppable.
+    assert "loadSongInfo" in js, "app.js missing loadSongInfo function"
+    assert "setSong" in js, "app.js missing setSong function"
+    assert "uploadSong" in js, "app.js missing uploadSong function"
+    assert "loadCandidateSongs" in js, "app.js missing loadCandidateSongs"
+    assert "loadRecentSongs" in js, "app.js missing loadRecentSongs"
+    assert "loadCurrentSong" in js, "app.js missing loadCurrentSong"
+
+    # JS: the documented endpoints must be referenced.
+    assert "/api/song" in js, "app.js does not call /api/song"
+    assert "/api/song-info" in js, "app.js does not call /api/song-info"
+    assert "/api/set-song-path" in js, "app.js does not call /api/set-song-path"
+    assert "/api/upload-song" in js, "app.js does not call /api/upload-song"
+    assert "/api/candidate-songs" in js, (
+        "app.js does not call /api/candidate-songs"
+    )
+    assert "/api/recent-songs" in js, "app.js does not call /api/recent-songs"
+
+
 def test_import_from_devices_panel_wired() -> None:
     """Issue: Import-from-devices panel above the source grid.
 

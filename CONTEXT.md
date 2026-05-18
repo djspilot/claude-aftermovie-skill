@@ -42,6 +42,8 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **GPMF** — GoPro Metadata Format: per-frame telemetry (accel, gyro, GPS speed) embedded in the MP4. Parsed at analyze time and contributes to scoring.
 
+- **Score component** — one named signal that contributes to a Candidate's total score (`motion`, `audio`, `hilight_tag`, `accl_jump`, `gps_speed`, `face`, `user_favorite`, `blurry`, `poor_exposure`). Declared once in `score/components.py`; the scorer threads `ScoreComponent` instances (not raw strings) into the `Candidate.components` / `PlanEntry.components` breakdown so the "why this entry won?" inspector has a fixed vocabulary. Not "score field", not "signal" (signal is the analyze-time input — `motion_energy`, `accl_peaks`, ...; the *component* is what the scorer derives from it).
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

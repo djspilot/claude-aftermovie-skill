@@ -10,6 +10,8 @@ from typing import Any
 from aftermovie.config import DEFAULT_TARGET_LEN_S, MIN_CLIP_S
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.transitions import decide_transitions
+from aftermovie.score import components as sc
+from aftermovie.score.components import ScoreComponent
 from aftermovie.score.song import analyze_song
 from aftermovie.types import Candidate
 
@@ -36,14 +38,28 @@ def score_window(
     components: dict[str, float] = {}
     score = 0.0
 
-    def _add(name: str, delta: float) -> None:
+    def _add(component: ScoreComponent, delta: float) -> None:
+        """Record a contribution from a registered ScoreComponent.
+
+        Accepting a `ScoreComponent` rather than a bare string means typos
+        like `_add("hilght_tag", ...)` fail at import time, and the set of
+        keys a window can emit is exactly `iter_components()`.
+        """
         nonlocal score
         if delta == 0.0:
             return
+        # Belt-and-braces: only `ScoreComponent` instances from the registry
+        # may write into `components`. Catches in-tree drift if anyone
+        # bypasses the typed signature with a raw string.
+        if not isinstance(component, ScoreComponent) or not sc.is_known(component.name):
+            raise ValueError(
+                f"score_window: unknown ScoreComponent {component!r} — "
+                f"add it to aftermovie.score.components first"
+            )
         score += delta
         # Accumulate in case the same signal contributes more than once
         # (none do today, but keeps the invariant honest).
-        components[name] = components.get(name, 0.0) + delta
+        components[component.name] = components.get(component.name, 0.0) + delta
 
     motion = clip.get("motion_energy", [])
     motion_avg = (
@@ -51,7 +67,7 @@ def score_window(
         if motion[start:end] else 0.0
     )
     if motion_avg > 0:
-        _add("motion", motion_avg * 1.5)
+        _add(sc.MOTION, motion_avg * 1.5)
         if motion_avg > (max(motion) * 0.7 if motion else 0):
             reasons.append("motion_peak")
 
@@ -60,7 +76,7 @@ def score_window(
         sum(audio[start:end]) / (end - start)
         if audio[start:end] else 0.0
     )
-    _add("audio", audio_avg * 1.0)
+    _add(sc.AUDIO, audio_avg * 1.0)
     if audio_avg > 0.7:
         reasons.append("loud_audio")
 
@@ -68,10 +84,10 @@ def score_window(
     if accl[start:end]:
         accl_max = max(accl[start:end])
         if accl_max > 15:
-            _add("accl_jump", 3.0)
+            _add(sc.ACCL_JUMP, 3.0)
             reasons.append("high_accel_jump")
         elif accl_max > 12:
-            _add("accl_jump", 1.5)
+            _add(sc.ACCL_JUMP, 1.5)
             reasons.append("moderate_accel")
 
     speeds = clip.get("gps_speed", [])
@@ -79,21 +95,21 @@ def score_window(
         sp_max = max(speeds[start:end])
         sp_overall_max = max(speeds) if speeds else 0
         if sp_overall_max > 0 and sp_max > sp_overall_max * 0.8:
-            _add("gps_speed", 2.0)
+            _add(sc.GPS_SPEED, 2.0)
             reasons.append("speed_peak")
 
     win_ms_start = start * 1000
     win_ms_end = end * 1000
     for tag_ms in clip.get("hilight_tags_ms", []):
         if win_ms_start <= tag_ms <= win_ms_end:
-            _add("hilight_tag", 10.0)
+            _add(sc.HILIGHT_TAG, 10.0)
             reasons.append("hilight_tag")
             break
 
     faces = clip.get("face_bboxes") or []
     in_window = [f for f in faces[start:end] if f]
     if in_window:
-        _add("face", 0.5)
+        _add(sc.FACE, 0.5)
         reasons.append("face_present")
 
     # Quality penalties. Both lists are absent when cv2 wasn't installed at
@@ -110,7 +126,7 @@ def score_window(
         p30_idx = max(0, min(len(sorted_sharp) - 1, int(len(sorted_sharp) * 0.3)))
         p30 = sorted_sharp[p30_idx]
         if sharp_avg <= p30:
-            _add("blurry", -1.5)
+            _add(sc.BLURRY, -1.5)
             reasons.append("blurry")
 
     expo = clip.get("exposure_per_s") or []
@@ -118,7 +134,7 @@ def score_window(
     if expo_win:
         expo_avg = sum(expo_win) / len(expo_win)
         if expo_avg < 0.25 or expo_avg > 0.85:
-            _add("poor_exposure", -1.5)
+            _add(sc.POOR_EXPOSURE, -1.5)
             reasons.append("poor_exposure")
 
     if os.environ.get("AFTERMOVIE_SCORE_DEBUG") == "1":
@@ -172,9 +188,10 @@ def build_candidates(
         if duration <= 4.0:
             score, reasons, components = score_window(clip, 0, int(duration))
             if is_favorite:
-                score += 2.0
-                reasons = list(reasons) + ["user_favorite"]
-                components = {**components, "user_favorite": 2.0}
+                score += sc.USER_FAVORITE.weight_hint or 0.0
+                reasons = list(reasons) + [sc.USER_FAVORITE.name]
+                components = {**components,
+                              sc.USER_FAVORITE.name: sc.USER_FAVORITE.weight_hint or 0.0}
             candidates.append(Candidate(
                 source=path,
                 start_s=0.0,
@@ -193,9 +210,10 @@ def build_candidates(
             end = min(n_sec, start + win)
             score, reasons, components = score_window(clip, start, end)
             if is_favorite:
-                score += 2.0
-                reasons = list(reasons) + ["user_favorite"]
-                components = {**components, "user_favorite": 2.0}
+                score += sc.USER_FAVORITE.weight_hint or 0.0
+                reasons = list(reasons) + [sc.USER_FAVORITE.name]
+                components = {**components,
+                              sc.USER_FAVORITE.name: sc.USER_FAVORITE.weight_hint or 0.0}
             candidates.append(Candidate(
                 source=path,
                 start_s=float(start),

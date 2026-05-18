@@ -149,3 +149,60 @@ def test_low_fps_never_gets_speed_ramp():
     }
     plan = build_plan(catalog, song, target_len=6.0, no_speed_ramp=False)
     assert all(e["speed"] == 1.0 for e in plan)
+
+
+def test_blurry_window_is_penalized_and_tagged():
+    """Bottom-third sharpness in the window must subtract score + emit 'blurry'."""
+    # Mostly sharp, but seconds 2-3 are clearly the softest in the clip.
+    clip = _clip(
+        "/c.mp4",
+        sharpness_per_s=[0.9, 0.8, 0.1, 0.1, 0.85, 0.95, 0.9, 0.88],
+    )
+    baseline = _clip("/c.mp4")  # no sharpness_per_s → no penalty
+    blurry_score, blurry_reasons = score_window(clip, 2, 4)
+    base_score, base_reasons = score_window(baseline, 2, 4)
+    assert "blurry" in blurry_reasons
+    assert "blurry" not in base_reasons
+    assert blurry_score < base_score
+
+
+def test_over_bright_window_is_penalized_and_tagged():
+    """Mean exposure > 0.85 over the window adds 'poor_exposure' and drops score."""
+    clip = _clip(
+        "/c.mp4",
+        exposure_per_s=[0.5, 0.5, 0.95, 0.92, 0.5, 0.5, 0.5, 0.5],
+    )
+    baseline = _clip("/c.mp4")
+    bright_score, bright_reasons = score_window(clip, 2, 4)
+    base_score, _ = score_window(baseline, 2, 4)
+    assert "poor_exposure" in bright_reasons
+    assert bright_score < base_score
+
+
+def test_under_exposed_window_is_penalized():
+    """Mean exposure < 0.25 over the window adds 'poor_exposure' and drops score."""
+    clip = _clip(
+        "/c.mp4",
+        exposure_per_s=[0.5, 0.5, 0.10, 0.08, 0.5, 0.5, 0.5, 0.5],
+    )
+    baseline = _clip("/c.mp4")
+    dark_score, dark_reasons = score_window(clip, 2, 4)
+    base_score, _ = score_window(baseline, 2, 4)
+    assert "poor_exposure" in dark_reasons
+    assert dark_score < base_score
+
+
+def test_well_exposed_midtones_not_penalized():
+    """Mean exposure inside [0.25, 0.85] must NOT trigger 'poor_exposure'."""
+    clip = _clip("/c.mp4", exposure_per_s=[0.4, 0.45, 0.5, 0.55, 0.5, 0.5, 0.5, 0.5])
+    _, reasons = score_window(clip, 2, 4)
+    assert "poor_exposure" not in reasons
+
+
+def test_missing_quality_lists_skip_penalties():
+    """Clips analyzed before cv2 was installed have empty quality lists —
+    they must not be penalized."""
+    clip = _clip("/c.mp4")  # no sharpness_per_s / exposure_per_s overrides
+    _, reasons = score_window(clip, 2, 4)
+    assert "blurry" not in reasons
+    assert "poor_exposure" not in reasons

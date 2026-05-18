@@ -13,6 +13,12 @@ from aftermovie.analyze.capture_time import captured_at_for
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
+from aftermovie.analyze.quality import (
+    exposure_for_image,
+    exposure_per_second,
+    sharpness_for_image,
+    sharpness_per_second,
+)
 from aftermovie.analyze.selection import is_excluded
 from aftermovie.analyze.stills import (
     DEFAULT_STILL_DURATION_S,
@@ -26,6 +32,12 @@ from aftermovie.ffmpeg_cmd import ffprobe_json, log
 from aftermovie.telemetry.gpmf import extract_gpmf_track, parse_gpmf_motion
 from aftermovie.telemetry.hilight import read_hilight_tags
 from aftermovie.types import ClipInfo
+
+# Populated by `discover_sources` — maps a materialized-still mp4 back to its
+# original HEIC/JPG/PNG so the quality analyzer can read the source image
+# instead of the synthetic mp4 (which has constant frames and would yield a
+# flat sharpness/exposure curve).
+_STILL_ORIGIN: dict[str, Path] = {}
 
 
 def analyze_clip(path: Path) -> ClipInfo | None:
@@ -80,6 +92,18 @@ def analyze_clip(path: Path) -> ClipInfo | None:
     face_bboxes: list[dict | None] = (
         detect_per_second(path, duration) if faces_available() else []
     )
+    origin_still = _STILL_ORIGIN.get(str(path))
+    if origin_still is not None:
+        # Stills are sampled from the original image, not the synthetic mp4.
+        # Single-element lists by convention — the renderer treats stills as
+        # one big "second" of constant quality.
+        s_val = sharpness_for_image(origin_still)
+        e_val = exposure_for_image(origin_still)
+        sharpness = [s_val] if s_val is not None else []
+        exposure = [e_val] if e_val is not None else []
+    else:
+        sharpness = sharpness_per_second(path, duration, fps)
+        exposure = exposure_per_second(path, duration, fps)
 
     def per_second(arr: list[float], target_len: int) -> list[float]:
         if not arr or target_len == 0:
@@ -108,6 +132,8 @@ def analyze_clip(path: Path) -> ClipInfo | None:
         is_short_form=is_short_form,
         captured_at=captured_at_for(path),
         face_bboxes=face_bboxes,
+        sharpness_per_s=sharpness,
+        exposure_per_s=exposure,
     )
 
 
@@ -166,6 +192,9 @@ def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURAT
                 mp4 = materialize_still(s, duration_s=still_duration_s)
                 if mp4 is not None:
                     sources.append(mp4)
+                    # Remember the original still so the quality analyzer can
+                    # sample it directly instead of the synthetic Ken-Burns mp4.
+                    _STILL_ORIGIN[str(mp4)] = s
     return sources
 
 

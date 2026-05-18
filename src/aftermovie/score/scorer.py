@@ -74,6 +74,31 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
         score += 0.5
         reasons.append("face_present")
 
+    # Quality penalties. Both lists are absent when cv2 wasn't installed at
+    # analyze time — in that case we simply skip the penalty rather than
+    # punishing every window in the catalog.
+    sharp = clip.get("sharpness_per_s") or []
+    sharp_win = sharp[start:end]
+    if sharp_win and len(sharp) >= 2:
+        sharp_avg = sum(sharp_win) / len(sharp_win)
+        # 30th-percentile cutoff within this clip — penalize the softest third.
+        # Using <= so a window whose mean lands on the cutoff still trips it
+        # (otherwise clips with many tied values slip through).
+        sorted_sharp = sorted(sharp)
+        p30_idx = max(0, min(len(sorted_sharp) - 1, int(len(sorted_sharp) * 0.3)))
+        p30 = sorted_sharp[p30_idx]
+        if sharp_avg <= p30:
+            score -= 1.5
+            reasons.append("blurry")
+
+    expo = clip.get("exposure_per_s") or []
+    expo_win = expo[start:end]
+    if expo_win:
+        expo_avg = sum(expo_win) / len(expo_win)
+        if expo_avg < 0.25 or expo_avg > 0.85:
+            score -= 1.5
+            reasons.append("poor_exposure")
+
     return score, reasons
 
 

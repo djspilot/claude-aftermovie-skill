@@ -48,6 +48,11 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **Optional dep** — a third-party Python package (cv2, mediapipe, Pillow) or PATH command (exiftool, ffprobe) whose absence is recoverable: the analyzer using it logs one warning per process and falls back to a neutral output. Owned by `aftermovie.optional_dep`; analyzers and `cmd_doctor` ask it instead of re-doing `try-import`/`shutil.which` themselves.
 
+## Storage
+
+- **Catalog Repository** — `aftermovie.repos.CatalogRepository` (singleton: `catalog_repo`). Owns id derivation, cache-hit lookup, and on-disk persistence of Catalogs under `~/.skills-data/aftermovie/catalogs/<catalog_id>.json`. `put(folder, catalog)` stamps `_aftermovie.catalog_id` onto the catalog. Pipeline + MCP + select-GUI all go through this Seam.
+- **Plan Repository** — `aftermovie.repos.PlanRepository` (singleton: `plan_repo`). Same role for Plans under `plans/<plan_id>.json`. `put(catalog_id, song, opts, plan)` stamps both `_aftermovie.catalog_id` and `_aftermovie.plan_id`; `get_latest_for_catalog(cid)` backs the GUI's `/api/plan` endpoint.
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

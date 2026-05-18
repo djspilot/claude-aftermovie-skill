@@ -440,40 +440,25 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve_plan(self) -> None:
         """Return the most-recent plan JSON associated with this clips_root.
 
-        Plans get stamped with `_aftermovie.catalog_id` when persisted by
-        `_persist_render_artifacts`, so we match by that. Falls through to a
-        404 `{"error": "no_plan"}` when no matching plan exists yet (i.e. the
-        user hasn't kicked off a render from this folder before).
+        Delegates to `PlanRepository.get_latest_for_catalog`, which walks the
+        plan-dir newest-first and matches on the `_aftermovie.catalog_id`
+        stamp that `run_auto` writes via the Plan Repository. Falls through
+        to a 404 `{"error": "no_plan"}` when no matching plan exists yet
+        (i.e. the user hasn't kicked off a render from this folder).
         """
-        from aftermovie import state
+        from aftermovie.repos import catalog_repo, plan_repo
 
         try:
-            catalog_id = state.catalog_id_for(self.clips_root)
+            catalog_id = catalog_repo.id_for(self.clips_root)
         except Exception as e:
             self._send_json({"error": "server_error", "detail": str(e)}, status=500)
             return
 
-        plan_dir = state.plan_dir()
-        if not plan_dir.is_dir():
+        plan = plan_repo.get_latest_for_catalog(catalog_id)
+        if plan is None:
             self._send_json({"error": "no_plan"}, status=404)
             return
-
-        # Walk plans newest-first; return the first one tagged with our id.
-        candidates = sorted(
-            plan_dir.glob("*.json"),
-            key=lambda p: p.stat().st_mtime if p.is_file() else 0.0,
-            reverse=True,
-        )
-        for p in candidates:
-            try:
-                plan = json.loads(p.read_text())
-            except (OSError, ValueError):
-                continue
-            tag = plan.get("_aftermovie") if isinstance(plan, dict) else None
-            if isinstance(tag, dict) and tag.get("catalog_id") == catalog_id:
-                self._send_json(plan)
-                return
-        self._send_json({"error": "no_plan"}, status=404)
+        self._send_json(plan)
 
     def _serve_thumb(self, key: str) -> None:
         # Look up the SourceRow whose key matches; this also ensures the

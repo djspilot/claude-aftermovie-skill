@@ -28,14 +28,7 @@ from aftermovie.render.pipeline import cmd_render
 from aftermovie.render.transitions import decide_transitions
 from aftermovie.score.scorer import build_plan
 from aftermovie.score.song import analyze_song
-from aftermovie.state import (
-    catalog_id_for,
-    load_catalog,
-    load_plan,
-    plan_id_for,
-    save_catalog,
-    save_plan,
-)
+from aftermovie.repos import catalog_repo, plan_repo
 
 # Match the CLI: load the env file into the process env on import so render-
 # time code paths that read os.environ.get(...) (e.g. AUDIO_INTEREST_THRESHOLD)
@@ -61,7 +54,7 @@ def aftermovie_list_luts() -> dict[str, Any]:
 
 @mcp.tool(description="Fetch a single clip's ClipInfo from a saved catalog.")
 def inspect_clip(catalog_id: str, clip_index: int) -> dict[str, Any]:
-    catalog = load_catalog(catalog_id)
+    catalog = catalog_repo.load(catalog_id)
     clips = catalog.get("clips", [])
     if clip_index < 0 or clip_index >= len(clips):
         raise IndexError(f"clip_index {clip_index} out of range (have {len(clips)})")
@@ -70,7 +63,7 @@ def inspect_clip(catalog_id: str, clip_index: int) -> dict[str, Any]:
 
 @mcp.tool(description="Fetch a saved plan. If include_entries=False only return the summary.")
 def get_plan(plan_id: str, include_entries: bool = True) -> dict[str, Any]:
-    plan = load_plan(plan_id)
+    plan = plan_repo.load(plan_id)
     if not include_entries:
         plan = {k: v for k, v in plan.items() if k != "entries"}
     return plan
@@ -100,14 +93,10 @@ def analyze_folder(
     folder = Path(path).expanduser().resolve()
     if not folder.is_dir():
         raise FileNotFoundError(f"not a directory: {folder}")
-    catalog_id = catalog_id_for(folder)
+    catalog_id = catalog_repo.id_for(folder)
 
-    if not force_reanalyze:
-        try:
-            load_catalog(catalog_id)
-            return {"job_id": None, "catalog_id": catalog_id, "cached": True}
-        except FileNotFoundError:
-            pass
+    if not force_reanalyze and catalog_repo.get(folder) is not None:
+        return {"job_id": None, "catalog_id": catalog_id, "cached": True}
 
     files = discover_sources(folder, still_duration_s=still_duration_s,
                              include_stills=include_stills)
@@ -129,7 +118,9 @@ def analyze_folder(
                 continue
             clips.append(asdict(info))
         catalog = {"clips": clips, "folder": str(folder)}
-        save_catalog(catalog_id, catalog)
+        # Use put(folder) so the catalog gets stamped with `_aftermovie.catalog_id`
+        # — keeps the on-disk shape consistent with the run_auto path.
+        catalog_repo.put(folder, catalog)
         return {
             "catalog_id": catalog_id,
             "n_clips": len(clips),
@@ -171,7 +162,7 @@ def propose_plan(
         theme=theme,
     )
 
-    catalog = load_catalog(catalog_id)
+    catalog = catalog_repo.load(catalog_id)
     song = analyze_song(Path(song_path).expanduser().resolve())
     requested = cfg.max_length or DEFAULT_TARGET_LEN_S
     target = min(song["duration_s"], requested)
@@ -181,8 +172,8 @@ def propose_plan(
     if cfg.transitions in ("auto", "soft"):
         decide_transitions(entries, song, mode=cfg.transitions)
 
-    plan_id = plan_id_for(catalog_id, Path(song_path), cfg.theme, target,
-                          cfg.aspect, seed)
+    plan_id = plan_repo.id_for(catalog_id, Path(song_path), cfg.theme, target,
+                               cfg.aspect, seed)
     plan = {
         "plan_id": plan_id,
         "catalog_id": catalog_id,
@@ -204,7 +195,7 @@ def propose_plan(
         "song_start_s": float(song["intro_end_s"]),
         "entries": entries,
     }
-    save_plan(plan_id, plan)
+    plan_repo.save_raw(plan_id, plan)
     sources = sorted({e["source"] for e in entries})
     return {
         "plan_id": plan_id,
@@ -226,7 +217,7 @@ def propose_plan(
 def tweak_plan(plan_id: str, ops: list[dict[str, Any]]) -> dict[str, Any]:
     import copy
 
-    plan = load_plan(plan_id)
+    plan = plan_repo.load(plan_id)
     new_plan = copy.deepcopy(plan)
     diff: list[str] = []
 
@@ -270,7 +261,7 @@ def tweak_plan(plan_id: str, ops: list[dict[str, Any]]) -> dict[str, Any]:
     seed = plan_id + _json.dumps(ops, sort_keys=True)
     new_id = hashlib.sha1(seed.encode()).hexdigest()[:12]
     new_plan["plan_id"] = new_id
-    save_plan(new_id, new_plan)
+    plan_repo.save_raw(new_id, new_plan)
     return {"plan_id": new_id, "diff": diff}
 
 
@@ -310,7 +301,7 @@ def _swap_at(plan: dict[str, Any], idx: int, rank: int) -> None:
 
 @mcp.tool(description="Render a plan to an MP4. Returns a job_id; poll with get_job.")
 def render_plan(plan_id: str, output_path: str) -> dict[str, Any]:
-    plan = load_plan(plan_id)
+    plan = plan_repo.load(plan_id)
     out = Path(output_path).expanduser().resolve()
 
     def _work(cancel):

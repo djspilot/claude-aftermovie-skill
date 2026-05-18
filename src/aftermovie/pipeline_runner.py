@@ -14,12 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import tempfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from aftermovie import state
 from aftermovie.analyze.clip import cmd_analyze
 from aftermovie.config import (
     DEFAULT_CLIP_DB,
@@ -29,6 +27,7 @@ from aftermovie.config import (
 )
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.pipeline import cmd_render
+from aftermovie.repos import PlanIdOpts, catalog_repo, plan_repo
 from aftermovie.score.scorer import cmd_score
 from aftermovie.themes import BASELINE_DEFAULTS as _THEME_DEFAULTS
 from aftermovie.themes import ThemeResolver
@@ -153,15 +152,15 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
     catalog_path = workdir / "catalog.json"
     plan_path = workdir / "plan.json"
 
-    # 1) analyze — consult the on-disk catalog cache first. IDs are content-
-    # derived (folder path + file list + sizes + mtimes), so a hit means the
-    # source tree is byte-identical to the prior run. `--force-analyze` and
-    # `opts.force_reanalyze=True` bypass the cache.
-    cid = state.catalog_id_for(clips_path)
-    cached_catalog = state.catalog_dir() / f"{cid}.json"
-    if cached_catalog.is_file() and not opts.force_reanalyze:
+    # 1) analyze — consult the Catalog Repository's on-disk cache first.
+    # IDs are content-derived (folder path + file list + sizes + mtimes),
+    # so a hit means the source tree is byte-identical to the prior run.
+    # `--force-analyze` / `opts.force_reanalyze=True` bypass the cache.
+    cid = catalog_repo.id_for(clips_path)
+    cached_path = catalog_repo.path_for_id(cid)
+    if cached_path.is_file() and not opts.force_reanalyze:
         log(f"Using cached catalog {cid}")
-        shutil.copy(cached_catalog, catalog_path)
+        catalog_repo.copy_into(cid, catalog_path)
     else:
         a = argparse.Namespace(
             clips=str(clips_path),
@@ -170,15 +169,14 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
             no_stills=opts.no_stills,
         )
         cmd_analyze(a)
-        # Stamp the catalog_id onto the catalog and persist into the cache
-        # for next time. Best-effort — a malformed catalog falls through
-        # to the score stage unchanged.
+        # Hand the freshly-written catalog to the repository — `put` stamps
+        # `_aftermovie.catalog_id` and persists into the cache. Best-effort:
+        # a malformed catalog falls through to the score stage unchanged.
         try:
             catalog = json.loads(catalog_path.read_text())
             if isinstance(catalog, dict):
-                catalog.setdefault("_aftermovie", {})["catalog_id"] = cid
+                catalog_repo.put(clips_path, catalog)
                 catalog_path.write_text(json.dumps(catalog, indent=2))
-                state.save_catalog(cid, catalog)
                 log(f"Cached catalog {cid}")
         except (OSError, ValueError) as e:
             log(f"  ! could not cache catalog {cid}: {type(e).__name__}: {e}")
@@ -208,19 +206,19 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
     )
     cmd_score(s)
 
-    # Persist the plan into state.plan_dir() so the GUI's /api/plan endpoint
-    # can find it. Scoring is cheap so we always re-score and never skip,
-    # but we do stamp + cache the resulting plan.
-    pid = state.plan_id_for(cid, song_path, opts.theme, opts.max_length, opts.aspect, 0)
+    # Hand the freshly-scored plan to the Plan Repository. Scoring is cheap
+    # so we always re-score and never skip, but `put` stamps the plan with
+    # both ids and persists it under the canonical plan-dir name — that's
+    # what the GUI's /api/plan endpoint reads back.
+    id_opts = PlanIdOpts(opts.theme, opts.max_length, opts.aspect, seed=0)
     try:
         plan = json.loads(plan_path.read_text())
         if isinstance(plan, dict):
-            tag = plan.setdefault("_aftermovie", {})
-            tag["catalog_id"] = cid
-            tag["plan_id"] = pid
+            plan_repo.put(cid, song_path, id_opts, plan)
             plan_path.write_text(json.dumps(plan, indent=2))
-            state.save_plan(pid, plan)
     except (OSError, ValueError) as e:
+        pid = plan_repo.id_for(cid, song_path, opts.theme, opts.max_length,
+                               opts.aspect, 0)
         log(f"  ! could not cache plan {pid}: {type(e).__name__}: {e}")
 
     # 3) render

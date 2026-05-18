@@ -10,6 +10,7 @@ import pytest
 from aftermovie import optional_dep
 from aftermovie.cli import build_parser
 from aftermovie.import_sources import gopro as gopro_mod
+from aftermovie.import_sources import gopro_icc as icc_mod
 
 
 @pytest.fixture(autouse=True)
@@ -32,8 +33,13 @@ def _seed_gopro_dcim(root: Path) -> Path:
 
 
 def _patch_registry_with_single_gopro(monkeypatch, mount: Path) -> None:
-    """Hide real /Volumes detection; expose only the fixture mount."""
+    """Hide real /Volumes detection; expose only the fixture mount.
+
+    Also pins the ICC GoPro branch to empty so a HERO9 happens to be
+    plugged in on the dev machine doesn't bleed into CLI tests.
+    """
     monkeypatch.setattr(gopro_mod, "detect_gopro_mounts", lambda: [mount])
+    monkeypatch.setattr(icc_mod, "detect_icc_gopros", lambda: [])
 
 
 def test_import_dry_run_writes_nothing(monkeypatch, tmp_path: Path, capsys):

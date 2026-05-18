@@ -299,3 +299,101 @@ def test_excluded_files_skipped_in_discover_sources(
     assert any(p.name == "clip_b.mp4" for p in sources), (
         f"expected clip_b.mp4 in remaining sources, got {[p.name for p in sources]}"
     )
+
+
+# ---- import-sources HTTP routes -------------------------------------------
+
+class _FakeImportSource:
+    """Duck-typed `ImportSource` for HTTP tests; not coupled to the real Module."""
+
+    def __init__(self, name: str = "fake", label: str = "Fake",
+                 available: bool = True) -> None:
+        self.name = name
+        self.label = label
+        self._available = available
+
+    def available(self) -> bool:
+        return self._available
+
+    def list_in_range(self, since, until):
+        return []
+
+    def copy_into(self, items, dest_folder, progress_cb=None):
+        class _Result:
+            copied = 0
+            skipped = 0
+            failed = 0
+            bytes_written = 0
+            dest_folder = ""
+        return _Result()
+
+
+def _install_fake_import_module(monkeypatch, sources: list[_FakeImportSource]) -> None:
+    """Inject a fake `aftermovie.import_sources` Module for the HTTP tests."""
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("aftermovie.import_sources")
+    fake_mod.all_sources = lambda: list(sources)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aftermovie.import_sources", fake_mod)
+
+
+def test_import_sources_endpoint_returns_json_list(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """`GET /api/import-sources` returns `[{name, label, available}, ...]`."""
+    clear_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    _install_fake_import_module(monkeypatch, [
+        _FakeImportSource(name="photos_library", label="Photos library", available=True),
+    ])
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        status, body, _ = _http_get(f"{srv.url}api/import-sources")
+    assert status == 200
+    data = json.loads(body)
+    assert isinstance(data, list)
+    assert {"name": "photos_library", "label": "Photos library",
+            "available": True} in data
+
+
+def test_import_post_bad_since_returns_400(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """Malformed `since` → HTTP 400 (the service raises ValueError)."""
+    clear_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    _install_fake_import_module(monkeypatch, [_FakeImportSource()])
+
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        try:
+            _http_post(f"{srv.url}api/import",
+                       {"since": "tomorrow", "until": "2026-05-18",
+                        "sources": ["fake"]})
+            raise AssertionError("expected 400 from /api/import with bad since")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            payload = json.loads(e.read())
+            assert payload["error"] == "bad_request"
+
+
+def test_import_status_unknown_returns_404(
+    tmp_path: Path, fixtures_dir: Path,
+) -> None:
+    """Unknown import job_id → HTTP 404."""
+    clear_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        req = urllib.request.Request(
+            f"{srv.url}api/import-status/no-such-id", method="GET",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5.0)
+            raise AssertionError("expected 404 for unknown import job id")
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+            payload = json.loads(e.read())
+            assert payload["error"] == "not_found"

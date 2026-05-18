@@ -5,6 +5,12 @@ from pathlib import Path
 
 # ---- Defaults ----------------------------------------------------------------
 
+# Fallback ceiling for `target_len` when the Song's duration can't be
+# determined (corrupt audio, librosa failure, etc.). This is NOT the default
+# render length — by default we now use the full Song duration. See
+# `effective_config.BUILTIN_DEFAULTS["max_length"] = None` and the
+# `cmd_score` / mcp_server `propose_plan` Adapters that materialise that
+# `None` into `song["duration_s"]`.
 DEFAULT_TARGET_LEN_S = 90
 DEFAULT_FPS = 30
 DEFAULT_RES = "1920x1080"

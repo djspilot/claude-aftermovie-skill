@@ -52,6 +52,15 @@ def test_resolve_returns_builtins_when_no_inputs(tmp_path: Path):
     assert cfg.theme is None
 
 
+def test_resolve_max_length_is_none_by_default(tmp_path: Path):
+    """After Phase C1 `max_length` defaults to None so the planner picks the
+    Song's full duration. Previously this fell out as 90s; if it ever
+    reverts the planner caps every render at 90s again — regression guard."""
+    cfg = resolve(env_file=tmp_path / "missing.env")
+    assert cfg.max_length is None, \
+        "max_length must default to None so the planner uses the full song"
+
+
 def test_resolve_precedence(tmp_path: Path):
     """CLI override beats theme; theme beats env file; env file beats default."""
     # Env file sets pace=fast (overriding builtin 'medium') and lut='punchy'.

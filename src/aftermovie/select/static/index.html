@@ -4,16 +4,25 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=7">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
   <header class="topbar">
     <h1 class="title">Aftermovie — pick your clips</h1>
     <div class="toolbar" role="toolbar" aria-label="Render controls">
-      <label class="ctrl">
+      <label class="ctrl length-ctrl">
         <span>Length</span>
-        <input id="length" type="number" min="10" max="600" step="5" value="90" aria-label="Target length in seconds">
-        <span class="suffix">s</span>
+        <select id="length-mode" aria-label="Length mode">
+          <option value="full" selected>Full song</option>
+          <option value="90">90s</option>
+          <option value="60">60s</option>
+          <option value="30">30s</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input id="length-custom" class="length-custom hidden" type="number"
+               min="10" max="600" step="5" value="90"
+               aria-label="Custom target length in seconds">
+        <span id="length-custom-suffix" class="suffix length-custom-suffix hidden">s</span>
       </label>
       <label class="ctrl">
         <span>Pace</span>
@@ -194,6 +203,6 @@
     </div>
   </template>
 
-  <script src="app.js?v=7" defer></script>
+  <script src="app.js?v=8" defer></script>
 </body>
 </html>

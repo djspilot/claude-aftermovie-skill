@@ -684,7 +684,8 @@ class GoProICCAdapter:
     ) -> tuple[bool, int]:
         """Fire one async ICC download and pump the run loop until it
         finishes. Returns (ok, bytes_written)."""
-        from Foundation import NSURL, NSMutableDictionary, NSNumber
+        import objc
+        from Foundation import NSURL, NSMutableDictionary, NSNumber, NSString
         ICC = _ICC.require()
         if ICC is None:
             return False, 0

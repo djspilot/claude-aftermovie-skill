@@ -375,9 +375,12 @@ class _FakeSource:
 
     def copy_into(self, items, dest_folder, progress_cb=None):
         self.copy_calls.append((list(items), Path(dest_folder)))
-        for _ in items:
+        # base.copy_files signature: (done, total, src_path). Mirror that
+        # contract here so the service's _progress_cb gets the right shape.
+        total = len(items)
+        for done, item in enumerate(items, start=1):
             if progress_cb is not None:
-                progress_cb("copied")
+                progress_cb(done, total, item.src_path)
         return _FakeCopyResult(copied=len(items), dest_folder=str(dest_folder))
 
 

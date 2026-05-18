@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +15,35 @@ from aftermovie.types import Candidate
 
 DEFAULT_BURST_WINDOW_S = 3.0
 
+# Float tolerance for `sum(components.values()) == score`. Generous because
+# the legacy total is also accumulated by repeated `+=` in arbitrary order,
+# so we only need to guard against logic drift, not full IEEE strictness.
+_SCORE_DEBUG_EPS = 1e-6
 
-def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, list[str]]:
+
+def score_window(
+    clip: dict[str, Any], start: int, end: int,
+) -> tuple[float, list[str], dict[str, float]]:
     """
     Composite score for a window into a clip.
-    Returns (score, list of reasons explaining the score).
+
+    Returns ``(score, reasons, components)`` where ``components`` is a
+    breakdown of every named signal that contributed to ``score``. Zero
+    contributions are omitted so consumers can iterate the dict without
+    filtering. Invariant (debug-gated): ``sum(components.values()) == score``.
     """
     reasons: list[str] = []
+    components: dict[str, float] = {}
     score = 0.0
+
+    def _add(name: str, delta: float) -> None:
+        nonlocal score
+        if delta == 0.0:
+            return
+        score += delta
+        # Accumulate in case the same signal contributes more than once
+        # (none do today, but keeps the invariant honest).
+        components[name] = components.get(name, 0.0) + delta
 
     motion = clip.get("motion_energy", [])
     motion_avg = (
@@ -29,7 +51,7 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
         if motion[start:end] else 0.0
     )
     if motion_avg > 0:
-        score += motion_avg * 1.5
+        _add("motion", motion_avg * 1.5)
         if motion_avg > (max(motion) * 0.7 if motion else 0):
             reasons.append("motion_peak")
 
@@ -38,7 +60,7 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
         sum(audio[start:end]) / (end - start)
         if audio[start:end] else 0.0
     )
-    score += audio_avg * 1.0
+    _add("audio", audio_avg * 1.0)
     if audio_avg > 0.7:
         reasons.append("loud_audio")
 
@@ -46,10 +68,10 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
     if accl[start:end]:
         accl_max = max(accl[start:end])
         if accl_max > 15:
-            score += 3.0
+            _add("accl_jump", 3.0)
             reasons.append("high_accel_jump")
         elif accl_max > 12:
-            score += 1.5
+            _add("accl_jump", 1.5)
             reasons.append("moderate_accel")
 
     speeds = clip.get("gps_speed", [])
@@ -57,21 +79,21 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
         sp_max = max(speeds[start:end])
         sp_overall_max = max(speeds) if speeds else 0
         if sp_overall_max > 0 and sp_max > sp_overall_max * 0.8:
-            score += 2.0
+            _add("gps_speed", 2.0)
             reasons.append("speed_peak")
 
     win_ms_start = start * 1000
     win_ms_end = end * 1000
     for tag_ms in clip.get("hilight_tags_ms", []):
         if win_ms_start <= tag_ms <= win_ms_end:
-            score += 10.0
+            _add("hilight_tag", 10.0)
             reasons.append("hilight_tag")
             break
 
     faces = clip.get("face_bboxes") or []
     in_window = [f for f in faces[start:end] if f]
     if in_window:
-        score += 0.5
+        _add("face", 0.5)
         reasons.append("face_present")
 
     # Quality penalties. Both lists are absent when cv2 wasn't installed at
@@ -88,7 +110,7 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
         p30_idx = max(0, min(len(sorted_sharp) - 1, int(len(sorted_sharp) * 0.3)))
         p30 = sorted_sharp[p30_idx]
         if sharp_avg <= p30:
-            score -= 1.5
+            _add("blurry", -1.5)
             reasons.append("blurry")
 
     expo = clip.get("exposure_per_s") or []
@@ -96,10 +118,18 @@ def score_window(clip: dict[str, Any], start: int, end: int) -> tuple[float, lis
     if expo_win:
         expo_avg = sum(expo_win) / len(expo_win)
         if expo_avg < 0.25 or expo_avg > 0.85:
-            score -= 1.5
+            _add("poor_exposure", -1.5)
             reasons.append("poor_exposure")
 
-    return score, reasons
+    if os.environ.get("AFTERMOVIE_SCORE_DEBUG") == "1":
+        total = sum(components.values())
+        assert abs(total - score) < _SCORE_DEBUG_EPS, (
+            f"score_window invariant broken: sum(components)={total!r} != "
+            f"score={score!r} for clip={clip.get('path')} [{start}:{end}] "
+            f"components={components!r}"
+        )
+
+    return score, reasons, components
 
 
 def build_candidates(
@@ -140,10 +170,11 @@ def build_candidates(
         is_short = clip.get("is_short_form", False)
         is_favorite = path in favorited
         if duration <= 4.0:
-            score, reasons = score_window(clip, 0, int(duration))
+            score, reasons, components = score_window(clip, 0, int(duration))
             if is_favorite:
                 score += 2.0
                 reasons = list(reasons) + ["user_favorite"]
+                components = {**components, "user_favorite": 2.0}
             candidates.append(Candidate(
                 source=path,
                 start_s=0.0,
@@ -152,6 +183,7 @@ def build_candidates(
                 reasons=reasons,
                 src_fps=fps,
                 is_short=is_short,
+                components=components,
             ))
             continue
         n_sec = int(duration)
@@ -159,10 +191,11 @@ def build_candidates(
         win = 2
         for start in range(0, max(1, n_sec - win + 1), step):
             end = min(n_sec, start + win)
-            score, reasons = score_window(clip, start, end)
+            score, reasons, components = score_window(clip, start, end)
             if is_favorite:
                 score += 2.0
                 reasons = list(reasons) + ["user_favorite"]
+                components = {**components, "user_favorite": 2.0}
             candidates.append(Candidate(
                 source=path,
                 start_s=float(start),
@@ -171,6 +204,7 @@ def build_candidates(
                 reasons=reasons,
                 src_fps=fps,
                 is_short=False,
+                components=components,
             ))
     return candidates
 
@@ -545,6 +579,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "beat_time_s": beat_t,
             "score": pick.score,
             "reasons": pick.reasons,
+            "components": dict(pick.components),
             "audio_interest": audio_interest,
             "source_width": int(src_clip.get("width", 1920)),
             "source_height": int(src_clip.get("height", 1080)),

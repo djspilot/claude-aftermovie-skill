@@ -15,6 +15,11 @@ class Candidate:
     reasons: list[str] = field(default_factory=list)
     src_fps: float = 30.0
     is_short: bool = False
+    # Named contributions that sum to `score`. Each named signal (motion,
+    # audio, hilight_tag, blurry penalty, ...) writes its delta here so the
+    # GUI / "why this won?" inspector can break down WHY a candidate scored
+    # what it did, not just the total. Zero-valued signals are omitted.
+    components: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,6 +60,10 @@ class PlanEntry:
     beat_time_s: float
     score: float
     reasons: list[str] = field(default_factory=list)
+    # Per-signal score breakdown forwarded from the Candidate that won this
+    # slot. Sum equals `score` within float epsilon. Plan.json files written
+    # before this field existed are tolerated by `from_dict`.
+    components: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "PlanEntry":
@@ -67,4 +76,5 @@ class PlanEntry:
             beat_time_s=float(d.get("beat_time_s", 0.0)),
             score=float(d.get("score", 0.0)),
             reasons=list(d.get("reasons", [])),
+            components={k: float(v) for k, v in (d.get("components") or {}).items()},
         )

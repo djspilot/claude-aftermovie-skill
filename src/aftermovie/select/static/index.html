@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=5">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
 <body>
   <header class="topbar">
@@ -79,12 +79,18 @@
       <button id="select-all" class="btn ghost" type="button">Select all</button>
       <button id="deselect-all" class="btn ghost" type="button">Deselect all</button>
       <span id="counter" class="counter" aria-live="polite">0 of 0 selected</span>
-      <button id="render" class="btn primary" type="button">▶ Render</button>
+      <button id="render-preview-btn" class="btn secondary" type="button" title="Quarter-res, no LUT, no reframe — for fast iteration">⚡ Render Preview</button>
+      <button id="render" class="btn primary" type="button">▶ Render Final</button>
     </div>
   </header>
 
   <main>
     <div id="status" class="status" role="status" aria-live="polite">Loading sources…</div>
+    <div id="preview-status" class="preview-status hidden" aria-live="polite">
+      <span id="preview-badge" class="preview-badge">Preview</span>
+      <span id="preview-message" class="preview-message"></span>
+      <span id="cache-indicator" class="cache-indicator hidden" title="Reused cached analyze data">Reuse analysis</span>
+    </div>
     <div id="grid" class="grid" aria-label="Clip thumbnails"></div>
 
     <section id="plan-panel" class="plan-panel hidden" aria-label="Plan timeline">
@@ -142,6 +148,6 @@
     </div>
   </template>
 
-  <script src="app.js?v=5" defer></script>
+  <script src="app.js?v=6" defer></script>
 </body>
 </html>

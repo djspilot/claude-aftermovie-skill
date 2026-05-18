@@ -15,6 +15,7 @@
   let pollTimer = null;
   let currentJobId = null;
   let pollFailures = 0;
+  let currentIsPreview = false;
 
   const $ = (sel) => document.querySelector(sel);
 
@@ -36,6 +37,11 @@
     selectAll: $("#select-all"),
     deselectAll: $("#deselect-all"),
     render: $("#render"),
+    renderPreviewBtn: $("#render-preview-btn"),
+    previewStatus: $("#preview-status"),
+    previewBadge: $("#preview-badge"),
+    previewMessage: $("#preview-message"),
+    cacheIndicator: $("#cache-indicator"),
     modal: $("#modal"),
     modalState: $("#modal-state"),
     modalLog: $("#modal-log"),
@@ -208,7 +214,11 @@
   }
 
   // -------- Render flow --------
-  async function startRender() {
+  // Both buttons share this path; `isPreview=true` adds `preview: true` to the
+  // POST body which the server forwards to AutoOpts.preview (quarter-res, no
+  // LUT, no reframe). The preview status badge is surfaced while a preview
+  // job is in flight; the final-render status uses the existing modal only.
+  async function startRender(isPreview = false) {
     const body = compactPayload({
       excluded: [...excluded],
       max_length: clampInt(els.length.value, 10, 600, 90),
@@ -223,10 +233,14 @@
       no_reframe: !els.reframe.checked,
       burst_window_s: els.keepBursts.checked ? 0 : 3,
     });
+    if (isPreview) body.preview = true;
     openModal();
     setModalState("starting…");
     appendLog(renderSummary(body));
     els.render.disabled = true;
+    els.renderPreviewBtn.disabled = true;
+    currentIsPreview = isPreview;
+    showPreviewStatus(isPreview);
     try {
       const { job_id } = await api("POST", "/api/render", body);
       currentJobId = job_id;
@@ -236,7 +250,30 @@
     } catch (err) {
       setModalState(`error: ${err.message}`, "error");
       els.render.disabled = false;
+      els.renderPreviewBtn.disabled = false;
+      hidePreviewStatus();
     }
+  }
+
+  function renderPreview() {
+    return startRender(true);
+  }
+
+  function showPreviewStatus(isPreview) {
+    if (!isPreview) {
+      hidePreviewStatus();
+      return;
+    }
+    els.previewStatus.classList.remove("hidden");
+    els.previewMessage.textContent =
+      "Preview render: quarter-res, no LUT — fast iteration.";
+    // The cache indicator stays hidden until /api/status/<job> reports it.
+    els.cacheIndicator.classList.add("hidden");
+  }
+
+  function hidePreviewStatus() {
+    els.previewStatus.classList.add("hidden");
+    els.cacheIndicator.classList.add("hidden");
   }
 
   function clampInt(v, min, max, dflt) {
@@ -264,6 +301,7 @@
     ];
     if (body.no_speed_ramp) bits.push("no_speed_ramp");
     if (body.no_reframe) bits.push("no_reframe");
+    if (body.preview) bits.push("preview");
     return `POST /api/render  ${bits.join("  ")}`;
   }
 
@@ -287,14 +325,23 @@
       pollFailures = 0;
       setModalState(s.state, s.state === "done" ? "done" : s.state === "error" ? "error" : "");
       if (s.log_tail) replaceLog(s.log_tail);
+      // Cache-hit indicator is defensive: only lights up if the field is
+      // present and truthy. Issue #1 may or may not add it — silently no-op
+      // until it lands.
+      if (currentIsPreview && s && s.cache_hit) {
+        els.cacheIndicator.classList.remove("hidden");
+      }
       if (s.state === "done") {
         showResult(s.output_path || "");
         els.render.disabled = false;
+        els.renderPreviewBtn.disabled = false;
         loadPlan();
         return;
       }
       if (s.state === "error") {
         els.render.disabled = false;
+        els.renderPreviewBtn.disabled = false;
+        hidePreviewStatus();
         return;
       }
       pollTimer = setTimeout(pollStatus, 1500);
@@ -307,6 +354,8 @@
       if (pollFailures >= 10) {
         appendLog("status polling stopped. Reopen the current GUI URL and start the render again.");
         els.render.disabled = false;
+        els.renderPreviewBtn.disabled = false;
+        hidePreviewStatus();
         currentJobId = null;
         return;
       }
@@ -490,7 +539,8 @@
   // -------- Wire-up --------
   els.selectAll.addEventListener("click", selectAll);
   els.deselectAll.addEventListener("click", deselectAll);
-  els.render.addEventListener("click", startRender);
+  els.render.addEventListener("click", () => startRender(false));
+  els.renderPreviewBtn.addEventListener("click", renderPreview);
   els.theme.addEventListener("change", applyTheme);
   els.modalClose.addEventListener("click", closeModal);
   els.copyPath.addEventListener("click", copyPath);

@@ -41,6 +41,45 @@ def test_static_files_exist_and_parse() -> None:
     assert "grid-template-columns" in css, "style.css missing grid-template-columns"
 
 
+def test_render_preview_button_wired() -> None:
+    """Issue #3: GUI exposes a separate `Render Preview` button.
+
+    Static check — confirms the DOM has the preview button, app.js sends
+    `preview: true` in the POST payload, and the preview status badge has
+    CSS rules. We don't boot the GUI here; only that the wiring is present.
+    """
+    html = _read("index.html")
+    css = _read("style.css")
+    js = _read("app.js")
+
+    # DOM: a dedicated preview button distinct from the final Render button.
+    assert 'id="render-preview-btn"' in html, (
+        "index.html missing #render-preview-btn button"
+    )
+    assert "Render Preview" in html, "index.html missing 'Render Preview' label"
+
+    # DOM: a preview status row with badge + message + (optional) cache hint.
+    assert 'id="preview-status"' in html, "index.html missing #preview-status row"
+    assert 'id="preview-badge"' in html, "index.html missing #preview-badge"
+    assert 'id="cache-indicator"' in html, (
+        "index.html missing #cache-indicator (Reuse analysis hint)"
+    )
+
+    # JS: payload assembly must include `preview: true` for the preview path.
+    assert "preview: true" in js, (
+        "app.js does not send preview: true in /api/render payload"
+    )
+    # JS: a dedicated renderPreview entry point so the wiring is greppable.
+    assert "renderPreview" in js, "app.js missing renderPreview function"
+    # JS: cache_hit handling must be defensive (only acts when present).
+    assert "cache_hit" in js, "app.js does not read cache_hit from /api/status"
+
+    # CSS: the new button + preview badge must have styles using existing tokens.
+    assert ".btn.secondary" in css, "style.css missing .btn.secondary rule"
+    assert ".preview-badge" in css, "style.css missing .preview-badge rule"
+    assert ".cache-indicator" in css, "style.css missing .cache-indicator rule"
+
+
 def test_plan_timeline_panel_wired() -> None:
     """Issue #5: read-only Plan timeline below the source grid.
 

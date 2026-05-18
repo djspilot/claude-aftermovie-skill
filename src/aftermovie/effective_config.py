@@ -25,9 +25,9 @@ from aftermovie.config import (
     DEFAULT_FPS,
     DEFAULT_MUSIC_DB,
     DEFAULT_RES,
-    THEMES,
 )
 from aftermovie.env_config import config_path
+from aftermovie.themes import ThemeResolver
 
 
 # ---- built-in defaults -----------------------------------------------------
@@ -181,20 +181,16 @@ def _env_layer(env_pairs: dict[str, str]) -> dict[str, Any]:
 
 
 def _theme_layer(theme: str | None) -> dict[str, Any]:
-    """Pluck the relevant fields from a theme preset; unknown themes are no-ops."""
-    if not theme:
-        return {}
-    preset = THEMES.get(theme)
-    if not preset:
-        return {}
-    out: dict[str, Any] = {}
-    for k, v in preset.items():
-        if k == "description":
-            continue
-        # Only project values that EffectiveConfig actually knows about.
-        if k in BUILTIN_DEFAULTS:
-            out[k] = v
-    return out
+    """Pluck the relevant fields from a theme preset; unknown themes are no-ops.
+
+    Delegates the precedence kernel to `ThemeResolver.apply` so this Module
+    and `pipeline_runner._apply_theme` cannot drift. Passing `BUILTIN_DEFAULTS`
+    as both the current values and the defaults makes every theme-controlled
+    knob look "still at baseline", so the resolver emits the full overlay —
+    `resolve()` itself sequences env / CLI layers above this one.
+    """
+    overlaid = ThemeResolver.apply(theme, BUILTIN_DEFAULTS, BUILTIN_DEFAULTS)
+    return {k: v for k, v in overlaid.items() if overlaid[k] != BUILTIN_DEFAULTS[k]}
 
 
 def _cli_layer(cli_overrides: dict[str, Any] | None) -> dict[str, Any]:

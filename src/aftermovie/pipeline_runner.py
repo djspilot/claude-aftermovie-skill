@@ -26,11 +26,12 @@ from aftermovie.config import (
     DEFAULT_FPS,
     DEFAULT_MUSIC_DB,
     DEFAULT_RES,
-    THEMES,
 )
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.pipeline import cmd_render
 from aftermovie.score.scorer import cmd_score
+from aftermovie.themes import BASELINE_DEFAULTS as _THEME_DEFAULTS
+from aftermovie.themes import ThemeResolver
 
 
 @dataclass
@@ -84,36 +85,18 @@ def _apply_preview_overrides(opts: "AutoOpts") -> "AutoOpts":
     return opts
 
 
-# Per-field "is this still the built-in default?" snapshot. The theme bundle
-# only overrides a field when its current value equals the baseline — anything
-# the caller (CLI flag, env file, MCP arg) explicitly set is preserved.
-_THEME_DEFAULTS: dict[str, object] = {
-    "lut": None,
-    "music_db": DEFAULT_MUSIC_DB,
-    "no_speed_ramp": False,
-    "transitions": "cut",
-    "audio_mix": "ducked",
-    "pace": "medium",
-}
+# The baseline-defaults snapshot used to detect "is this field still at its
+# built-in default?" lives in `aftermovie.themes` (imported above as
+# `_THEME_DEFAULTS`). The precedence logic lives there too — this Module
+# only owns the AutoOpts dataclass <-> dict adapter glue.
 
 
 def _apply_theme(opts: AutoOpts) -> AutoOpts:
     """If `opts.theme` is set, fill in unset (still-at-default) theme fields."""
-    if not opts.theme:
-        return opts
-    preset = THEMES.get(opts.theme)
-    if not preset:
-        return opts
-    for k, v in preset.items():
-        if k == "description":
-            continue
-        if not hasattr(opts, k):
-            continue
-        cur = getattr(opts, k)
-        baseline = _THEME_DEFAULTS.get(k)
-        # Only override when the field is still at the built-in default.
-        if cur == baseline:
-            setattr(opts, k, v)
+    current = {k: getattr(opts, k) for k in _THEME_DEFAULTS if hasattr(opts, k)}
+    resolved = ThemeResolver.apply(opts.theme, current, _THEME_DEFAULTS)
+    for k, v in resolved.items():
+        setattr(opts, k, v)
     return opts
 
 

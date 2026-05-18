@@ -12,8 +12,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from aftermovie.analyze.clip import cmd_analyze
-from aftermovie.config import THEMES
 from aftermovie.effective_config import EffectiveConfig, resolve
+from aftermovie.themes import ThemeResolver
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.env_config import (
     DEFAULT_CONFIG_TEMPLATE,
@@ -242,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Ignore HEIC/JPG/PNG stills; analyze only native video.")
     _add_score_flags(pu)
     pu.add_argument("--theme", default=None,
-                    choices=sorted(THEMES.keys()),
+                    choices=ThemeResolver.names(),
                     help="Preset bundle (cinematic, punchy, chill, nostalgic). "
                          "Env: AFTERMOVIE_THEME.")
     pu.add_argument("--preview", dest="preview",
@@ -342,14 +342,14 @@ def cmd_show_config(args: argparse.Namespace) -> None:
     for k, v in rows:
         print(f"  {k:30s} {v}")
     theme = cfg_env_only.theme
-    if theme and theme in THEMES:
-        print()
-        print(f"Theme bundle for '{theme}' (each value only applied if user didn't override):")
-        for k, v in THEMES[theme].items():
-            if k == "description":
-                continue
-            print(f"  {k:30s} {v}")
-        print(f"  -- {THEMES[theme].get('description', '')}")
+    if theme:
+        described = ThemeResolver.describe(theme)
+        if described:
+            print()
+            print(f"Theme bundle for '{theme}' (each value only applied if user didn't override):")
+            for k, v in described["values"].items():
+                print(f"  {k:30s} {v}")
+            print(f"  -- {described['description']}")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:

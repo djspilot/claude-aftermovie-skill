@@ -28,7 +28,7 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **Pace** — how dense cuts are: `fast` (every beat), `medium` (every 2nd), `slow` (every 4th = downbeats), `auto` (energy-aware, varies per song section).
 
-- **Theme** — a preset bundle of look-and-feel knobs (LUT, music_db, pace, transitions, audio_mix). Names: `cinematic`, `punchy`, `chill`, `nostalgic`. Not "style" or "preset."
+- **Theme** — a preset bundle of look-and-feel knobs (LUT, music_db, pace, transitions, audio_mix). Names: `cinematic`, `punchy`, `chill`, `nostalgic`. Not "style" or "preset." The single source of truth is the **Theme Resolver** Module in `src/aftermovie/themes.py` — it owns the preset dict, the baseline-defaults snapshot, and the precedence kernel (`ThemeResolver.apply(theme, current_values, defaults)`: theme value wins only when the field is still at baseline; explicit caller values are preserved). Both `pipeline_runner._apply_theme` (mutates `AutoOpts`) and `effective_config._theme_layer` (composes the layered `EffectiveConfig`) are 3-line adapters into this kernel — adding theme features (variants, inheritance) means changing one Module.
 
 - **Live Photo** — an iPhone HEIC paired with a MOV that carries the brief motion. Pairs can be **paired-file** (`IMG_xxxx.HEIC` + same-stem `IMG_xxxx.MOV`) or **single-file** (HEIC with the MOV in a metadata box; requires exiftool).
 

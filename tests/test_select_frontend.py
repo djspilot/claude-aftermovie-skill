@@ -111,3 +111,37 @@ def test_plan_timeline_panel_wired() -> None:
     assert "extractPlanEntries" in js, (
         "app.js missing extractPlanEntries (entries-or-array fallback)"
     )
+
+
+def test_import_from_devices_panel_wired() -> None:
+    """Issue: Import-from-devices panel above the source grid.
+
+    Static check — confirms the DOM hooks, JS entry points, CSS class, and
+    referenced HTTP endpoints exist. The backend (aftermovie.import_sources +
+    /api/import* routes) is wired by parallel agents; this only verifies the
+    front-end stays in lockstep with the documented contracts.
+    """
+    html = _read("index.html")
+    css = _read("style.css")
+    js = _read("app.js")
+
+    # DOM: the panel container, two date inputs, primary + secondary buttons,
+    # and a status area for live job updates.
+    assert 'id="import-panel"' in html, "index.html missing #import-panel"
+    assert html.count('type="date"') >= 2, (
+        "index.html needs at least two date inputs inside #import-panel"
+    )
+    assert 'id="import-btn"' in html, "index.html missing #import-btn"
+    assert 'id="dry-run-btn"' in html, "index.html missing #dry-run-btn"
+    assert 'id="import-status"' in html, "index.html missing #import-status area"
+
+    # CSS: a dedicated panel rule using existing tokens (no new colors).
+    assert ".import-panel" in css, "style.css missing .import-panel rule"
+
+    # JS: greppable entry points and the documented endpoint names.
+    assert "loadImportSources" in js, "app.js missing loadImportSources"
+    assert "startImport" in js, "app.js missing startImport"
+    assert "pollImportStatus" in js, "app.js missing pollImportStatus"
+    assert "/api/import-sources" in js, "app.js does not call /api/import-sources"
+    assert "/api/import" in js, "app.js does not call /api/import"
+    assert "/api/import-status" in js, "app.js does not call /api/import-status"

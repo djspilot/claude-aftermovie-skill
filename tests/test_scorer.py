@@ -135,6 +135,35 @@ def test_speed_ramp_suppressed_when_flag_set():
         f"--no-speed-ramp should force speed=1.0, got {[e['speed'] for e in plan]}"
 
 
+def test_duplicate_group_collapses_to_highest_scoring():
+    """Two sources sharing a `duplicate_group` must yield exactly ONE entry
+    in the plan — the higher-scoring one wins, the other is dropped before
+    candidate allocation. Sources outside the group are untouched."""
+    # Two visually-identical clips (same duplicate_group), one with a HiLight
+    # tag so it out-scores its twin by a wide margin. Plus an unrelated clip.
+    catalog = {"clips": [
+        _clip("/twin_lo.mp4", duration=8.0, duplicate_group="g1"),
+        _clip("/twin_hi.mp4", duration=8.0, duplicate_group="g1",
+              hilight_tags_ms=[2500]),
+        _clip("/other.mp4", duration=8.0, duplicate_group=None),
+    ]}
+    song = {
+        "duration_s": 30.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(60)],
+        "downbeats": [i * 2.0 for i in range(15)],
+        "intro_end_s": 0.0,
+    }
+    plan = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
+                      source_cap=5)
+    sources = {entry["source"] for entry in plan}
+    # The low-scoring twin must be evicted; the high-scoring twin survives.
+    assert "/twin_lo.mp4" not in sources
+    assert "/twin_hi.mp4" in sources
+    # The unrelated clip isn't part of the cluster, so it stays available.
+    assert "/other.mp4" in sources
+
+
 def test_low_fps_never_gets_speed_ramp():
     """A 30fps source must never be slowed even on downbeat + action reasons."""
     catalog = {"clips": [

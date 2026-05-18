@@ -36,6 +36,13 @@ class ClipInfo:
     face_bboxes: list[dict | None] = field(default_factory=list)
     sharpness_per_s: list[float] = field(default_factory=list)
     exposure_per_s: list[float] = field(default_factory=list)
+    # Perceptual hash of a representative frame (8x8 dHash, 16-char hex) or
+    # None if hashing failed / deps unavailable. See analyze/duplicates.py.
+    phash: str | None = None
+    # Visual-duplicate cluster id assigned at the end of analyze; None means
+    # "singleton" (no near-twins in this folder). The scorer uses this to
+    # keep only the highest-scoring candidate from each cluster.
+    duplicate_group: str | None = None
 
 
 @dataclass

@@ -23,7 +23,9 @@
     grid: $("#grid"),
     status: $("#status"),
     counter: $("#counter"),
-    length: $("#length"),
+    lengthMode: $("#length-mode"),
+    lengthCustom: $("#length-custom"),
+    lengthCustomSuffix: $("#length-custom-suffix"),
     pace: $("#pace"),
     lut: $("#lut"),
     theme: $("#theme"),
@@ -264,7 +266,7 @@
   async function startRender(isPreview = false) {
     const body = compactPayload({
       excluded: [...excluded],
-      max_length: clampInt(els.length.value, 10, 600, 90),
+      max_length: resolveMaxLength(),
       pace: els.pace.value || "auto",
       lut: els.lut.value || null,
       theme: els.theme.value || null,
@@ -325,14 +327,39 @@
     return Math.max(min, Math.min(max, n));
   }
 
+  // Translate the length dropdown + custom input into the `max_length` payload
+  // field that the planner consumes. `full` yields null so `compactPayload`
+  // drops the key, and the backend's `cfg.max_length is None` path picks the
+  // full Song duration (Phase C1).
+  function resolveMaxLength() {
+    const mode = (els.lengthMode && els.lengthMode.value) || "full";
+    if (mode === "full") return null;
+    if (mode === "custom") {
+      return clampInt(els.lengthCustom && els.lengthCustom.value, 10, 600, 90);
+    }
+    // Preset second-counts ("90", "60", "30") come through as numeric strings.
+    const n = parseInt(mode, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Reveal the numeric input + suffix only when the user picks "Custom…".
+  function syncLengthCustomVisibility() {
+    const isCustom = els.lengthMode && els.lengthMode.value === "custom";
+    if (els.lengthCustom) els.lengthCustom.classList.toggle("hidden", !isCustom);
+    if (els.lengthCustomSuffix) {
+      els.lengthCustomSuffix.classList.toggle("hidden", !isCustom);
+    }
+  }
+
   function compactPayload(body) {
     return Object.fromEntries(Object.entries(body).filter(([, value]) => value !== null && value !== ""));
   }
 
   function renderSummary(body) {
+    const lengthLabel = body.max_length == null ? "full song" : `${body.max_length}s`;
     const bits = [
       `excluded=${body.excluded.length}`,
-      `length=${body.max_length}s`,
+      `length=${lengthLabel}`,
       `pace=${body.pace}`,
       `lut=${body.lut || "default"}`,
       `theme=${body.theme || "custom"}`,
@@ -1077,6 +1104,12 @@
   els.render.addEventListener("click", () => startRender(false));
   els.renderPreviewBtn.addEventListener("click", renderPreview);
   els.theme.addEventListener("change", applyTheme);
+  if (els.lengthMode) {
+    els.lengthMode.addEventListener("change", syncLengthCustomVisibility);
+    // Sync once on load so a server-rendered initial value (e.g. when a
+    // future Phase persists the user's choice) lands in the right state.
+    syncLengthCustomVisibility();
+  }
   els.modalClose.addEventListener("click", closeModal);
   els.copyPath.addEventListener("click", copyPath);
   els.modal.addEventListener("click", (e) => { if (e.target === els.modal) closeModal(); });

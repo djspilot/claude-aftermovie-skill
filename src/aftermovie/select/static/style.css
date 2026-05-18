@@ -99,6 +99,15 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .ctrl input[type="number"] { width: 56px; text-align: right; }
 .ctrl select { appearance: none; padding-right: 4px; }
 .ctrl .suffix { color: var(--fg-dim); }
+/* Length dropdown (C2): the custom seconds input + suffix only appear when
+   the mode is "Custom…" — `.hidden` is set/cleared by app.js. Kept inside
+   the surrounding `.ctrl` chrome so the dropdown + input look like one
+   control rather than two adjacent pills. */
+.length-ctrl { gap: 8px; }
+.length-ctrl select { min-width: 92px; }
+.length-ctrl .length-custom { width: 56px; text-align: right; }
+.length-ctrl .length-custom.hidden,
+.length-ctrl .length-custom-suffix.hidden { display: none; }
 .check input {
   margin: 0;
   accent-color: var(--accent);

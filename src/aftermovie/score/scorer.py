@@ -479,6 +479,66 @@ def decide_speed(pick: Candidate, beat_t: float,
     return (0.4, 1.0)
 
 
+# Stretch-mode tunables (C3). When the planner produces a plan visibly
+# shorter than `target_len`, we walk three levers in order — bump source_cap,
+# stretch stills, then stretch the trailing beat slots — until the plan
+# fills (or we've exhausted them). All three log a single line on use so the
+# user can see why an edit ended up tighter or looser than expected.
+STRETCH_FILL_RATIO = 0.85           # below this we engage stretch mode
+STRETCH_MAX_SOURCE_CAP = 5          # ceiling for the +1 cap bump retry
+STRETCH_MAX_STILL_DURATION_S = 4.0  # ceiling for per-entry still stretch
+STRETCH_DEFAULT_STILL_DURATION_S = 2.5
+STRETCH_TAIL_FACTOR = 1.5           # last-entries beat-slot stretch ceiling
+STRETCH_TAIL_ENTRIES = 4            # how many trailing entries the lever 3
+                                    # stretch is allowed to dilate
+
+# Subset-mode tunables (C4). When the candidate pool is large enough that
+# `len(candidates) * average_slot_s > target_len * SUBSET_TRIGGER_RATIO`,
+# we trim it to roughly `SUBSET_KEEP_RATIO × needed-slot-count` candidates,
+# keeping the top by score. Avoids quality dilution on a 200-clip pool.
+SUBSET_TRIGGER_RATIO = 1.5
+SUBSET_KEEP_RATIO = 1.2
+
+
+def _average_slot_seconds(cut_points: list[float]) -> float:
+    """Mean inter-beat interval across the cut anchors. Used by subset mode
+    to estimate how many candidates a plan can possibly need."""
+    if len(cut_points) < 2:
+        return 0.0
+    gaps = [cut_points[i + 1] - cut_points[i]
+            for i in range(len(cut_points) - 1)]
+    return sum(gaps) / max(len(gaps), 1)
+
+
+def _subset_filter_candidates(candidates: list[Candidate],
+                              cut_points: list[float],
+                              target_len: float) -> list[Candidate]:
+    """Subset mode (C4): when the Candidate pool dwarfs what a plan can use,
+    drop the bottom-scoring ones until ~1.2× the needed count remains.
+
+    Operates at the Candidate level (not the source-file level) because
+    `allocate_candidates` already enforces `source_cap`-aware diversity; we
+    only need the top scorers to be available to the greedy walker.
+    """
+    n_slots = max(1, len(cut_points) - 1)
+    avg_slot = _average_slot_seconds(cut_points) or 1.0
+    pool_capacity_s = len(candidates) * avg_slot
+    if pool_capacity_s <= target_len * SUBSET_TRIGGER_RATIO:
+        return candidates
+    keep = max(n_slots, int(round(n_slots * SUBSET_KEEP_RATIO)))
+    if keep >= len(candidates):
+        return candidates
+    ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+    trimmed = ranked[:keep]
+    log(f"  ! subset-mode: pool {len(candidates)} cand → top {len(trimmed)} by "
+        f"score (target {target_len:.1f}s, ~{n_slots} slots)")
+    return trimmed
+
+
+def _plan_total_duration_s(plan_entries: list[dict[str, Any]]) -> float:
+    return sum(float(e.get("out_duration_s", 0.0)) for e in plan_entries)
+
+
 def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                target_len: float, no_speed_ramp: bool,
                pace: str = "medium",
@@ -506,6 +566,16 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     capture time (EXIF / ffprobe creation_time / mtime fallback) before
     being bound to beat anchors. Scoring still controls *which* clips win
     a slot; this only controls their order in the timeline.
+
+    Stretch mode (C3): when the resulting plan fills less than
+    `STRETCH_FILL_RATIO × target_len`, three levers fire in order — bump
+    `source_cap` (retry the allocator), stretch per-entry duration up to
+    `STRETCH_MAX_STILL_DURATION_S`, and dilate the trailing entries' beat
+    slots up to `STRETCH_TAIL_FACTOR×`. Each lever logs a single line.
+
+    Subset mode (C4): when the Candidate pool is much larger than the
+    target can consume, the bottom-scoring candidates are dropped before
+    `allocate_candidates` runs. Logged. Avoids quality dilution.
     """
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
@@ -519,7 +589,35 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     candidates = _suppress_bursts(candidates, by_source, window_s=burst_window_s)
     candidates = _suppress_visual_duplicates(candidates, by_source)
     cut_points = select_cut_points(song, target_len, pace)
+    # Subset mode runs BEFORE allocate so the greedy walker never sees the
+    # low-score noise. Composes with the suppress-* filters above (which trim
+    # near-duplicates) — order matters: duplicates first (cluster-aware), then
+    # the global top-N cut. Reversing would let a low-scoring twin survive.
+    candidates = _subset_filter_candidates(candidates, cut_points, target_len)
     picks = allocate_candidates(candidates, cut_points, source_cap=source_cap)
+
+    # Stretch mode lever 1 (C3): if the greedy allocator left obvious holes
+    # (`< STRETCH_FILL_RATIO × n_slots` picked) AND the caller is still at
+    # the strict-no-duplicates default (`source_cap == 1`), bump the cap one
+    # notch and retry. Mirrors the existing `allocate_candidates` auto-bump
+    # contract: callers who explicitly passed `source_cap >= 2` have already
+    # decided "I want this much variety at most", so we don't over-rule
+    # them — levers 2 (still stretch) and 3 (tail stretch) take over for
+    # those callers and absorb the remaining deficit.
+    n_slots = max(0, len(cut_points) - 1)
+    if (n_slots > 0 and len(picks) < int(n_slots * STRETCH_FILL_RATIO)
+            and source_cap == 1):
+        new_cap = min(source_cap + 1, STRETCH_MAX_SOURCE_CAP)
+        # Re-run the greedy walker with a slightly looser cap. We use the
+        # same Candidate list — bursts/visual-dups/subset already pruned it.
+        retry_picks = allocate_candidates(candidates, cut_points,
+                                          source_cap=new_cap)
+        if len(retry_picks) > len(picks):
+            log(f"  ! stretch-mode: bumped source_cap {source_cap} → {new_cap} "
+                f"to fill {target_len:.1f}s ({len(picks)} → {len(retry_picks)} "
+                f"picks)")
+            picks = retry_picks
+            source_cap = new_cap
 
     if chronological and picks:
         def _captured(pick) -> float:
@@ -619,6 +717,62 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                 e["out_duration_s"] = even_gap
                 beat_t += even_gap
 
+    # Stretch mode lever 2 (C3): the plan is *populated* but still falls
+    # short of `target_len` (e.g. the allocator filled every slot but
+    # cumulative `out_duration_s` < target_len because the beat anchors only
+    # span the first part of the song). Grow per-entry duration uniformly up
+    # to `STRETCH_MAX_STILL_DURATION_S` to make up the deficit.
+    plan_total = _plan_total_duration_s(plan_entries)
+    if (plan_entries
+            and plan_total > 0
+            and plan_total < target_len * STRETCH_FILL_RATIO):
+        old_dur = plan_total / len(plan_entries)
+        # Compute the per-entry duration we *want* to hit target; cap it at
+        # the stretched-still ceiling so we don't park a single image for 8s.
+        want_dur = target_len / len(plan_entries)
+        new_dur = min(STRETCH_MAX_STILL_DURATION_S, want_dur)
+        if new_dur > old_dur + 0.05:
+            scale = new_dur / old_dur
+            beat_t = float(plan_entries[0].get("beat_time_s", 0.0))
+            for e in plan_entries:
+                e["beat_time_s"] = beat_t
+                e["out_duration_s"] = float(e["out_duration_s"]) * scale
+                beat_t += float(e["out_duration_s"])
+            log(f"  ! stretch-mode: stretched stills "
+                f"{STRETCH_DEFAULT_STILL_DURATION_S:.1f}s → {new_dur:.1f}s "
+                f"to fill {target_len:.1f}s")
+
+    # Stretch mode lever 3 (C3): if we're still short, give the trailing
+    # entries a bit more breathing room (up to `STRETCH_TAIL_FACTOR×` their
+    # current beat-slot). Keeps the climax frames on screen long enough for
+    # the song's outro to land without a hard cut into silence.
+    plan_total = _plan_total_duration_s(plan_entries)
+    deficit = target_len - plan_total
+    if (plan_entries
+            and deficit > 0.5
+            and len(plan_entries) >= 1):
+        tail_n = min(STRETCH_TAIL_ENTRIES, len(plan_entries))
+        tail = plan_entries[-tail_n:]
+        tail_total = sum(float(e["out_duration_s"]) for e in tail)
+        if tail_total > 0:
+            # Cap the multiplier at STRETCH_TAIL_FACTOR so we never balloon a
+            # single entry past 1.5× its original beat slot.
+            mult = min(STRETCH_TAIL_FACTOR,
+                       1.0 + deficit / tail_total)
+            old_tail_total = tail_total
+            new_tail_total = tail_total * mult
+            # Recompute beat_time_s monotonically so the renderer's timeline
+            # math stays consistent — we touch only the tail's durations and
+            # roll their start times forward.
+            beat_t = float(plan_entries[-tail_n].get("beat_time_s", 0.0))
+            for e in tail:
+                e["beat_time_s"] = beat_t
+                e["out_duration_s"] = float(e["out_duration_s"]) * mult
+                beat_t += float(e["out_duration_s"])
+            log(f"  ! stretch-mode: stretched tail {tail_n} entries "
+                f"{old_tail_total:.1f}s → {new_tail_total:.1f}s "
+                f"(×{mult:.2f}) to fill {target_len:.1f}s")
+
     return plan_entries
 
 
@@ -655,10 +809,18 @@ def cmd_score(args: argparse.Namespace) -> None:
     log(f"Song: {song['tempo_bpm']:.0f} BPM, "
         f"{len(song['beats'])} beats, intro ends ~{song['intro_end_s']:.1f}s")
 
-    target_len = min(
-        song["duration_s"],
-        float(args.max_length) if args.max_length else DEFAULT_TARGET_LEN_S,
-    )
+    # `max_length=None` means "no user override" → fill the full Song. The
+    # 90s cap from before C1 used to live here; `DEFAULT_TARGET_LEN_S` is now
+    # only a fallback ceiling for the case where the song's duration came
+    # back unusable (analyze failure → 0/NaN).
+    song_dur = float(song.get("duration_s") or 0.0)
+    if args.max_length is None:
+        target_len = song_dur if song_dur > 0 else float(DEFAULT_TARGET_LEN_S)
+    else:
+        target_len = min(
+            song_dur if song_dur > 0 else float(DEFAULT_TARGET_LEN_S),
+            float(args.max_length),
+        )
 
     # Preferences live in a sidecar next to the user's clips. `cmd_score`
     # only sees the catalog (not the original clips folder) so we derive the

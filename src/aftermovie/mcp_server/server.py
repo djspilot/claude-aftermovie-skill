@@ -164,8 +164,14 @@ def propose_plan(
 
     catalog = catalog_repo.load(catalog_id)
     song = analyze_song(Path(song_path).expanduser().resolve())
-    requested = cfg.max_length or DEFAULT_TARGET_LEN_S
-    target = min(song["duration_s"], requested)
+    # `max_length=None` → fill the full Song (post-C1). The fallback ceiling
+    # only kicks in when the Song's duration came back as 0 (analyze failure).
+    song_dur = float(song.get("duration_s") or 0.0)
+    if cfg.max_length is None:
+        target = song_dur if song_dur > 0 else float(DEFAULT_TARGET_LEN_S)
+    else:
+        target = min(song_dur if song_dur > 0 else float(DEFAULT_TARGET_LEN_S),
+                     float(cfg.max_length))
 
     entries = build_plan(catalog, song, target_len=target,
                          no_speed_ramp=cfg.no_speed_ramp, pace=cfg.pace)

@@ -134,8 +134,8 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
     # `effective_config.BUILTIN_DEFAULTS` and flow through `resolve()`.
     p.add_argument("--max-length", "--length", dest="max_length", type=float,
                    default=None,
-                   help="Target output length in seconds (default: min(song, 90)). "
-                        "Env: AFTERMOVIE_MAX_LENGTH.")
+                   help="Target output length in seconds (default: full song "
+                        "duration). Env: AFTERMOVIE_MAX_LENGTH.")
     p.add_argument("--aspect", default=None,
                    choices=["16:9", "9:16", "1:1"])
     p.add_argument("--res", default=None)

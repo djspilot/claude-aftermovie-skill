@@ -58,6 +58,7 @@ This file defines the terms the codebase uses. Match them when extending or refa
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).
 - **MCP server** — `aftermovie-mcp` binary exposing the same flow as Claude Code tools (`analyze_folder`, `propose_plan`, `render_plan`, ...). Both surfaces should drive the same `pipeline_runner`.
 - **Skill** — the `aftermovie` Claude Code skill (`~/.claude/skills/aftermovie/`) that documents user-facing recipes.
+- **Select Service** — `aftermovie.select.service.SelectionService`, the domain Interface the `aftermovie select` GUI consumes (`list_sources` / `get_selection` / `save_selection` / `get_preferences` / `save_preferences` / `latest_plan` / `available_options` / `thumb_for_key` / `start_render` / `status`). HTTP-only concerns (response writing, route regex, content types) stay in `select/server.py`, which is now a thin Adapter that parses → calls the service → serializes. Render-job tracking + worker dispatch are instance state on the service, not class-level on the handler, so two services in one process stay independent. Tests target the service directly without binding a port; a future `select-cli` or TUI would consume the same Interface.
 
 ## Pipeline phases (the three-act structure of every render)
 

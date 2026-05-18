@@ -28,8 +28,8 @@ def test_hilight_dominates_scoring():
     quiet = _clip("/q.mp4", motion_energy=[0.1] * 8, audio_energy=[0.0] * 8)
     tagged = _clip("/t.mp4", motion_energy=[0.1] * 8, audio_energy=[0.0] * 8,
                    hilight_tags_ms=[2500])
-    q_score, q_reasons = score_window(quiet, 2, 4)
-    t_score, t_reasons = score_window(tagged, 2, 4)
+    q_score, q_reasons, _ = score_window(quiet, 2, 4)
+    t_score, t_reasons, _ = score_window(tagged, 2, 4)
     assert t_score >= q_score + 10
     assert "hilight_tag" in t_reasons
     assert "hilight_tag" not in q_reasons
@@ -38,8 +38,8 @@ def test_hilight_dominates_scoring():
 def test_accel_jump_adds_bonus():
     clip = _clip("/a.mp4", accl_peaks=[10.0, 10.0, 16.0, 10.0, 10.0, 10.0, 10.0, 10.0])
     quiet = _clip("/b.mp4", accl_peaks=[10.0] * 8)
-    a_score, a_reasons = score_window(clip, 2, 4)
-    q_score, _ = score_window(quiet, 2, 4)
+    a_score, a_reasons, _ = score_window(clip, 2, 4)
+    q_score, _, _ = score_window(quiet, 2, 4)
     assert "high_accel_jump" in a_reasons
     assert a_score == q_score + 3.0
 
@@ -188,8 +188,8 @@ def test_blurry_window_is_penalized_and_tagged():
         sharpness_per_s=[0.9, 0.8, 0.1, 0.1, 0.85, 0.95, 0.9, 0.88],
     )
     baseline = _clip("/c.mp4")  # no sharpness_per_s → no penalty
-    blurry_score, blurry_reasons = score_window(clip, 2, 4)
-    base_score, base_reasons = score_window(baseline, 2, 4)
+    blurry_score, blurry_reasons, _ = score_window(clip, 2, 4)
+    base_score, base_reasons, _ = score_window(baseline, 2, 4)
     assert "blurry" in blurry_reasons
     assert "blurry" not in base_reasons
     assert blurry_score < base_score
@@ -202,8 +202,8 @@ def test_over_bright_window_is_penalized_and_tagged():
         exposure_per_s=[0.5, 0.5, 0.95, 0.92, 0.5, 0.5, 0.5, 0.5],
     )
     baseline = _clip("/c.mp4")
-    bright_score, bright_reasons = score_window(clip, 2, 4)
-    base_score, _ = score_window(baseline, 2, 4)
+    bright_score, bright_reasons, _ = score_window(clip, 2, 4)
+    base_score, _, _ = score_window(baseline, 2, 4)
     assert "poor_exposure" in bright_reasons
     assert bright_score < base_score
 
@@ -215,8 +215,8 @@ def test_under_exposed_window_is_penalized():
         exposure_per_s=[0.5, 0.5, 0.10, 0.08, 0.5, 0.5, 0.5, 0.5],
     )
     baseline = _clip("/c.mp4")
-    dark_score, dark_reasons = score_window(clip, 2, 4)
-    base_score, _ = score_window(baseline, 2, 4)
+    dark_score, dark_reasons, _ = score_window(clip, 2, 4)
+    base_score, _, _ = score_window(baseline, 2, 4)
     assert "poor_exposure" in dark_reasons
     assert dark_score < base_score
 
@@ -224,7 +224,7 @@ def test_under_exposed_window_is_penalized():
 def test_well_exposed_midtones_not_penalized():
     """Mean exposure inside [0.25, 0.85] must NOT trigger 'poor_exposure'."""
     clip = _clip("/c.mp4", exposure_per_s=[0.4, 0.45, 0.5, 0.55, 0.5, 0.5, 0.5, 0.5])
-    _, reasons = score_window(clip, 2, 4)
+    _, reasons, _ = score_window(clip, 2, 4)
     assert "poor_exposure" not in reasons
 
 
@@ -232,6 +232,74 @@ def test_missing_quality_lists_skip_penalties():
     """Clips analyzed before cv2 was installed have empty quality lists —
     they must not be penalized."""
     clip = _clip("/c.mp4")  # no sharpness_per_s / exposure_per_s overrides
-    _, reasons = score_window(clip, 2, 4)
+    _, reasons, _ = score_window(clip, 2, 4)
     assert "blurry" not in reasons
     assert "poor_exposure" not in reasons
+
+
+def test_components_break_down_mixed_signals():
+    """A window with motion + audio + face must populate at least those three
+    component keys, all positive. Zero-valued signals must be absent."""
+    clip = _clip(
+        "/m.mp4",
+        motion_energy=[0.4] * 8,
+        audio_energy=[0.5] * 8,
+        # Face boxes per second; non-None entries within the window light up
+        # the "face" contribution.
+        face_bboxes=[None, None, {"x": 0, "y": 0, "w": 10, "h": 10},
+                     {"x": 0, "y": 0, "w": 10, "h": 10}, None, None, None, None],
+        # No accel/GPS/HiLight tags so those component keys must be absent.
+        accl_peaks=[9.0] * 8,
+        gps_speed=[0.0] * 8,
+    )
+    _, _, components = score_window(clip, 2, 4)
+    assert components["motion"] > 0
+    assert components["audio"] > 0
+    assert components["face"] > 0
+    # Signals that didn't fire must not appear as zero entries.
+    assert "accl_jump" not in components
+    assert "gps_speed" not in components
+    assert "hilight_tag" not in components
+    assert "blurry" not in components
+    assert "poor_exposure" not in components
+
+
+def test_components_sum_matches_score():
+    """sum(components.values()) must equal the returned score within float
+    epsilon for every combination of signals — this is the invariant the
+    debug-gated assert in score_window guards."""
+    clip = _clip(
+        "/all.mp4",
+        motion_energy=[0.8] * 8,
+        audio_energy=[0.9] * 8,
+        accl_peaks=[10.0, 10.0, 18.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+        gps_speed=[5.0, 5.0, 9.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+        hilight_tags_ms=[2500],
+        face_bboxes=[None, None, {"x": 0, "y": 0, "w": 10, "h": 10},
+                     {"x": 0, "y": 0, "w": 10, "h": 10}, None, None, None, None],
+    )
+    score, _, components = score_window(clip, 2, 4)
+    assert abs(sum(components.values()) - score) < 1e-9, \
+        f"sum({components}) != score={score}"
+
+
+def test_purely_blurry_window_has_only_negative_blurry_component():
+    """A window with no positive signals but bottom-third sharpness must
+    yield ONLY the negative `blurry` component — no positive contributions,
+    no other penalties."""
+    clip = _clip(
+        "/blur.mp4",
+        # No motion, no audio, no accel above gravity, no GPS, no faces.
+        motion_energy=[0.0] * 8,
+        audio_energy=[0.0] * 8,
+        accl_peaks=[9.8] * 8,
+        gps_speed=[0.0] * 8,
+        face_bboxes=[None] * 8,
+        # Seconds 2-3 are clearly the softest — bottom 30th percentile.
+        sharpness_per_s=[0.9, 0.8, 0.1, 0.1, 0.85, 0.95, 0.9, 0.88],
+    )
+    score, reasons, components = score_window(clip, 2, 4)
+    assert "blurry" in reasons
+    # The ONLY component should be the negative blurry penalty.
+    assert components == {"blurry": -1.5}
+    assert score == -1.5

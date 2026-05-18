@@ -112,6 +112,59 @@ def test_score_then_render_roundtrip(tmp_path: Path, fixtures_dir: Path, tone: P
     assert output.exists()
 
 
+def test_second_render_is_faster_with_prerender_cache(
+    tmp_path: Path, fixtures_dir: Path, tone: Path, monkeypatch,
+):
+    """E1 acceptance: a re-render of the same plan must hit the prerender
+    cache on every clip and complete substantially faster than the first
+    render. We target ≥3× speedup; in practice the cache-hit path avoids
+    ffmpeg entirely so the savings are much larger, but the threshold is
+    set conservatively so transient I/O noise on CI doesn't flake."""
+    import time as _time
+
+    from aftermovie import config
+
+    # Isolate the prerender-cache root inside the test's tmp tree so this
+    # test never depends on (or pollutes) the developer's real cache.
+    fake_data = tmp_path / "state"
+    fake_data.mkdir()
+    monkeypatch.setattr(config, "data_dir", lambda: fake_data)
+
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    for name in ("clip_a.mp4", "clip_b.mp4", "clip_c.mp4"):
+        shutil.copy(fixtures_dir / name, clips_dir / name)
+
+    parser = build_parser()
+
+    def _render(out_name: str) -> float:
+        out = tmp_path / out_name
+        args = parser.parse_args([
+            "auto",
+            "--clips", str(clips_dir),
+            "--song", str(tone),
+            "--output", str(out),
+            "--max-length", "6",
+            "--res", "320x240",
+            "--fps", "24",
+            "--source-cap", "3",
+        ])
+        t0 = _time.perf_counter()
+        args.func(args)
+        elapsed = _time.perf_counter() - t0
+        assert out.exists(), f"{out_name} not produced"
+        return elapsed
+
+    t_cold = _render("cold.mp4")
+    t_warm = _render("warm.mp4")
+
+    speedup = t_cold / max(t_warm, 1e-3)
+    assert speedup >= 3.0, (
+        f"expected ≥3× speedup from prerender cache, got "
+        f"{speedup:.2f}× (cold={t_cold:.2f}s warm={t_warm:.2f}s)"
+    )
+
+
 @pytest.mark.skipif(
     not _ffmpeg_has_encoder("h264_videotoolbox"),
     reason="h264_videotoolbox not available (likely non-Apple-Silicon host)",

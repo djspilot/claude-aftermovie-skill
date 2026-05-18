@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,7 @@ from aftermovie.render.encoder import (
     vfilter_output_guard,
 )
 from aftermovie.render.filters import aspect_filter
+from aftermovie.render.prerender_cache import PrerenderCache, PrerenderOpts
 from aftermovie.render.reframe import crop_x_expr_for_entry
 from aftermovie.render.titles import (
     build_overlay_chain,
@@ -124,7 +127,53 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
                     enable_reframe: bool = True,
                     progress_cb: ProgressCallback | None = None,
                     stage_index: int = 0,
-                    stage_total: int = 0) -> bool:
+                    stage_total: int = 0,
+                    cache: PrerenderCache | None = None) -> bool:
+    """Render one Entry to `out_clip`. Returns True on success.
+
+    When `cache` is provided, a cache lookup runs first; on hit we hard-link
+    (or copy) the cached file to `out_clip` and emit a synthetic 100%
+    progress event so the GUI bar advances exactly like the ffmpeg path.
+    On miss we ffmpeg normally and then `put()` the result into the cache,
+    but only after a successful exit — failed renders never poison the cache.
+    """
+    if cache is not None:
+        opts = PrerenderOpts(
+            aspect=aspect,
+            target_res=target_res,
+            fps=target_fps,
+            lut=lut,
+            encoder=encoder,
+            keep_audio=keep_audio,
+            audio_interest_threshold=_audio_interest_threshold(),
+        )
+        cache_key = cache.key_for(entry, opts)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            # Materialise the cached clip into the workdir. Hard-link when
+            # we can (instant + ~zero disk), copy otherwise so the
+            # downstream concat/filter_complex stage can read it like any
+            # freshly-rendered clip.
+            try:
+                if out_clip.exists():
+                    out_clip.unlink()
+                os.link(cached, out_clip)
+            except OSError:
+                shutil.copy2(cached, out_clip)
+            log(f"  [cache hit] {Path(entry['source']).name}")
+            if progress_cb is not None:
+                progress_cb(ProgressEvent(
+                    stage="prerender",
+                    stage_index=stage_index,
+                    stage_total=stage_total,
+                    fraction_in_stage=1.0,
+                    current_pid=None,
+                ))
+            return True
+    else:
+        cache_key = None  # silence linters; only used inside the cache branch
+
+
     src = Path(entry["source"])
     duration = entry["end_s"] - entry["start_s"]
     s_start, s_end = _ramp_speeds(entry)
@@ -322,10 +371,18 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     try:
         run_with_progress(cmd, _on_block, check=True,
                           total_frames=total_frames, on_pid=_on_pid)
-        return True
     except subprocess.CalledProcessError:
         log(f"  ! failed to render {src.name} — skipping")
         return False
+    # Only populate the cache after a clean ffmpeg exit. A half-written
+    # out_clip from a crashed ffmpeg would otherwise pollute the cache and
+    # break every future render at the same key.
+    if cache is not None and cache_key is not None:
+        try:
+            cache.put(cache_key, out_clip)
+        except OSError as exc:
+            log(f"  ! cache put failed for {src.name}: {exc}")
+    return True
 
 
 def _compensated_render_entry(entry: dict, *, transitions_active: bool,
@@ -376,12 +433,22 @@ def cmd_render(args: argparse.Namespace, *,
     # env value asks for a profile ffmpeg doesn't ship.
     encoder = select_from_env(detect_chip())
 
+    # E1: per-clip prerender cache. Lives at ~/.skills-data/aftermovie/
+    # prerender-cache/; a single instance is reused for every clip in this
+    # render so the LRU evictor sees a consistent batch of writes. Disabled
+    # via AFTERMOVIE_PRERENDER_CACHE=off for benchmarking / debug renders.
+    cache: PrerenderCache | None = None
+    if (os.environ.get("AFTERMOVIE_PRERENDER_CACHE", "on")
+            .strip().lower() not in ("off", "0", "false", "no")):
+        cache = PrerenderCache()
+
     log(f"Rendering {len(entries)} cuts → {output.name}")
     log(f"  res={target_res} fps={target_fps} aspect={aspect}"
         f" audio={audio_mix} transitions={'yes' if transitions_active else 'no'}"
         f" titles={'yes' if titles else 'no'}"
         f" encoder={encoder.name}"
-        f"{' lut=' + lut.name if lut else ''}")
+        f"{' lut=' + lut.name if lut else ''}"
+        f"{' cache=on' if cache else ' cache=off'}")
 
     n_entries = len(entries)
 
@@ -407,6 +474,7 @@ def cmd_render(args: argparse.Namespace, *,
                 progress_cb=progress_cb,
                 stage_index=i + 1,
                 stage_total=n_entries,
+                cache=cache,
             )
             if not ok:
                 continue

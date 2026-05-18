@@ -532,7 +532,7 @@ def allocate_candidates(candidates: list[Candidate],
                         cut_points: list[float],
                         source_cap: int = 3,
                         auto_bump_cap: bool = True,
-                        max_auto_cap: int = 5,
+                        max_auto_cap: int = 3,
                         sections: list[dict[str, Any]] | None = None,
                         ) -> list[tuple[float, Candidate]]:
     """Greedy fill: walk cut points, pick the highest-scoring unused candidate
@@ -540,10 +540,13 @@ def allocate_candidates(candidates: list[Candidate],
 
     When `auto_bump_cap=True` (default) and the available unique sources
     can't fill every cut point at the given `source_cap`, the cap is bumped
-    automatically (up to `max_auto_cap`). This lets users hit a target
-    length (e.g. `--max-length 120`) even when their source folder is small:
-    some sources will appear more than once, but the alternative is a
-    truncated edit. A single log line surfaces the bump.
+    automatically (up to `max_auto_cap`, default 3 — past 3 reuses the same
+    clip becomes noticeable to viewers and variety is preferable to length).
+
+    F1 acceptance: if the bump-free plan would only be *slightly* short
+    (within `AUTO_BUMP_UNDERFILL_TOLERANCE` of the slot count), we accept
+    the shorter plan and log `accepted slight underfill: …` instead of
+    bumping the cap. A 3.8%-short edit is better than a 4×-repeat edit.
 
     When `sections` is provided (Phase C5), the per-anchor candidate ranking
     is re-scored via `SECTION_BIAS` so drops/builds tend to pull motion- and
@@ -560,12 +563,22 @@ def allocate_candidates(candidates: list[Candidate],
     # explicitly passed source_cap > 1 they already weighed reuse vs. variety.
     if (auto_bump_cap and source_cap == 1
             and n_unique > 0 and n_unique * source_cap < n_slots):
-        # Round up: e.g. 64 sources, 75 slots, cap=1 → need cap=2.
-        needed = -(-n_slots // n_unique)
-        effective_cap = min(max(source_cap, needed), max_auto_cap)
-        if effective_cap > source_cap:
-            log(f"  ! source_cap auto-bumped {source_cap} → {effective_cap} to fit "
-                f"{n_slots} cuts from {n_unique} unique sources")
+        # How many slots would stay unfilled if we DON'T bump? If the gap is
+        # within tolerance, prefer the slightly-shorter plan to a repeated-clip
+        # plan — F1 trades length for variety on the margin.
+        deficit_slots = n_slots - n_unique * source_cap
+        underfill_ratio = deficit_slots / n_slots
+        if underfill_ratio <= AUTO_BUMP_UNDERFILL_TOLERANCE:
+            log(f"  ! accepted slight underfill: {n_unique * source_cap} cuts "
+                f"(would-be {n_slots}) — {underfill_ratio * 100:.1f}% short, "
+                f"within {AUTO_BUMP_UNDERFILL_TOLERANCE * 100:.0f}% tolerance")
+        else:
+            # Round up: e.g. 64 sources, 75 slots, cap=1 → need cap=2.
+            needed = -(-n_slots // n_unique)
+            effective_cap = min(max(source_cap, needed), max_auto_cap)
+            if effective_cap > source_cap:
+                log(f"  ! bumped source_cap {source_cap} → {effective_cap} to fit "
+                    f"{n_slots} cuts from {n_unique} unique sources")
 
     # We keep a pool sorted by base score and re-rank per-anchor when
     # sections are in play. When sections are absent the inner loop falls
@@ -640,7 +653,8 @@ def decide_speed(pick: Candidate, beat_t: float,
 # fills (or we've exhausted them). All three log a single line on use so the
 # user can see why an edit ended up tighter or looser than expected.
 STRETCH_FILL_RATIO = 0.85           # below this we engage stretch mode
-STRETCH_MAX_SOURCE_CAP = 5          # ceiling for the +1 cap bump retry
+STRETCH_MAX_SOURCE_CAP = 3          # ceiling for the +1 cap bump retry
+                                    # (F1: 5 → 3; same-clip 4× is jarring)
 STRETCH_MAX_STILL_DURATION_S = 4.0  # ceiling for per-entry still stretch
 STRETCH_DEFAULT_STILL_DURATION_S = 2.5
 STRETCH_TAIL_FACTOR = 1.5           # last-entries beat-slot stretch ceiling
@@ -653,6 +667,13 @@ STRETCH_TAIL_ENTRIES = 4            # how many trailing entries the lever 3
 # keeping the top by score. Avoids quality dilution on a 200-clip pool.
 SUBSET_TRIGGER_RATIO = 1.5
 SUBSET_KEEP_RATIO = 1.2
+
+# F1 auto-bump underfill tolerance. When `allocate_candidates` would have to
+# bump `source_cap` only to cover a few trailing beats, the lever instead
+# accepts the slightly-shorter plan (logged). The threshold is "at most 20%
+# of slots unfilled" — viewers will notice a missing 4 seconds less than they
+# notice the same clip showing 4 times.
+AUTO_BUMP_UNDERFILL_TOLERANCE = 0.20
 
 
 def _average_slot_seconds(cut_points: list[float]) -> float:
@@ -668,25 +689,90 @@ def _average_slot_seconds(cut_points: list[float]) -> float:
 def _subset_filter_candidates(candidates: list[Candidate],
                               cut_points: list[float],
                               target_len: float) -> list[Candidate]:
-    """Subset mode (C4): when the Candidate pool dwarfs what a plan can use,
-    drop the bottom-scoring ones until ~1.2× the needed count remains.
+    """Subset mode (C4 + F1): when the Candidate pool dwarfs what a plan can
+    use, trim it to ~1.2× the needed slot count while preserving source
+    diversity.
 
-    Operates at the Candidate level (not the source-file level) because
-    `allocate_candidates` already enforces `source_cap`-aware diversity; we
-    only need the top scorers to be available to the greedy walker.
+    Algorithm (F1):
+      1. Bucket candidates by `source` path; sort each bucket by score desc.
+      2. Round-robin across buckets, taking the next best-scoring candidate
+         from each, until we've reached `keep_target` OR every bucket is
+         drained. This guarantees every source contributes at least one
+         strong candidate before any source contributes a second.
+      3. If we're still under `keep_target` after every source has been
+         offered up, top-up with the remaining best-score candidates from
+         any source.
+
+    Net effect vs. the old "top-N by score" trim: the greedy allocator
+    downstream now sees the BEST window of every source, not just the
+    handful of sources that happened to host the highest absolute scores.
+    Quality stays high (we still pick each source's strongest candidates
+    first); variety stays high (the 25-source × 4-repeat case from the
+    real-session log no longer happens because every other source had a
+    candidate in the trimmed pool waiting to be picked).
     """
     n_slots = max(1, len(cut_points) - 1)
     avg_slot = _average_slot_seconds(cut_points) or 1.0
     pool_capacity_s = len(candidates) * avg_slot
     if pool_capacity_s <= target_len * SUBSET_TRIGGER_RATIO:
         return candidates
-    keep = max(n_slots, int(round(n_slots * SUBSET_KEEP_RATIO)))
-    if keep >= len(candidates):
+    keep_target = max(n_slots, int(round(n_slots * SUBSET_KEEP_RATIO)))
+    if keep_target >= len(candidates):
         return candidates
-    ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
-    trimmed = ranked[:keep]
-    log(f"  ! subset-mode: pool {len(candidates)} cand → top {len(trimmed)} by "
-        f"score (target {target_len:.1f}s, ~{n_slots} slots)")
+
+    # Bucket by source, each bucket sorted by score desc.
+    buckets: dict[str, list[Candidate]] = {}
+    for c in candidates:
+        buckets.setdefault(c.source, []).append(c)
+    for src in buckets:
+        buckets[src].sort(key=lambda c: c.score, reverse=True)
+
+    # Iterate sources in descending order of their top candidate's score so
+    # the round-robin opens with the strongest source. This is a tie-breaker
+    # for the order in which sources contribute their first candidate; it
+    # doesn't change WHO contributes (every source still gets a slot before
+    # anyone repeats).
+    source_order = sorted(buckets.keys(),
+                          key=lambda s: buckets[s][0].score,
+                          reverse=True)
+
+    trimmed: list[Candidate] = []
+    seen_ids: set[int] = set()
+    depth = 0
+    # Round-robin: depth 0 takes each source's #1, depth 1 takes #2, ... We
+    # stop once we've hit the target OR we've offered every source's full
+    # bucket (i.e. no source has anything left at this depth).
+    while len(trimmed) < keep_target:
+        added_this_pass = 0
+        for src in source_order:
+            if len(trimmed) >= keep_target:
+                break
+            bucket = buckets[src]
+            if depth >= len(bucket):
+                continue
+            c = bucket[depth]
+            trimmed.append(c)
+            seen_ids.add(id(c))
+            added_this_pass += 1
+        if added_this_pass == 0:
+            break
+        depth += 1
+
+    # Top-up: if round-robin didn't reach the target (e.g. sources were
+    # exhausted), pull the best-score remainder from any source. This only
+    # runs when round-robin couldn't cover the target, which means every
+    # source was already represented at maximum depth — variety can't drop
+    # at this stage, only score quality rises.
+    if len(trimmed) < keep_target:
+        remainder = [c for c in candidates if id(c) not in seen_ids]
+        remainder.sort(key=lambda c: c.score, reverse=True)
+        need = keep_target - len(trimmed)
+        trimmed.extend(remainder[:need])
+
+    n_sources_kept = len({c.source for c in trimmed})
+    log(f"  ! subset-mode: pool {len(candidates)} cand → top {len(trimmed)} "
+        f"round-robin from {n_sources_kept} sources "
+        f"(target {target_len:.1f}s, ~{n_slots} slots)")
     return trimmed
 
 
@@ -1011,6 +1097,19 @@ def cmd_score(args: argparse.Namespace) -> None:
     if tmode in ("auto", "soft"):
         decide_transitions(entries, song, mode=tmode)
     log(f"Built {len(entries)} cuts over {target_len:.1f}s")
+
+    # F1 diversity metric: one-line at-a-glance read on how many unique
+    # sources back the plan and whether any are repeated. avg_repeats is
+    # `cuts / sources`; max_repeats surfaces the worst-case clip reuse.
+    if entries:
+        per_source: dict[str, int] = {}
+        for e in entries:
+            per_source[e["source"]] = per_source.get(e["source"], 0) + 1
+        n_unique = len(per_source)
+        avg_repeats = len(entries) / max(n_unique, 1)
+        max_repeats = max(per_source.values())
+        log(f"  diversity: {len(entries)} cuts from {n_unique} unique sources "
+            f"(avg {avg_repeats:.1f} repeats, max {max_repeats})")
 
     # Heuristic: pace=auto produces beat anchors based on tempo + energy.
     # If the planner emitted noticeably fewer cuts than the target window's

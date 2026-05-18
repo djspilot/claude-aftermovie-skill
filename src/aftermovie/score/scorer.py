@@ -828,7 +828,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                hook: bool = True,
                climax: bool = True,
                stretch_stills: bool = True,
-               preferences: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+               preferences: dict[str, Any] | None = None,
+               moments_per_source: int | None = None) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure.
 
     Orchestrates three seams:
@@ -884,7 +885,10 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     # passes above remain — those are PER-CLIP cleanups (same-camera burst,
     # same-look-everywhere), not pool reductions, so they compose cleanly
     # with the per-source budget.
-    source_budgets = _compute_source_budgets(catalog, candidates)
+    source_budgets = _compute_source_budgets(
+        catalog, candidates,
+        max_moments_per_source=moments_per_source,
+    )
     if source_budgets:
         budget_values = sorted(source_budgets.values())
         n_sources = len(budget_values)
@@ -1145,6 +1149,8 @@ def cmd_score(args: argparse.Namespace) -> None:
     if clips_root is not None:
         preferences = load_preferences(clips_root)
 
+    raw_moments = getattr(args, "moments_per_source", None)
+    moments_per_source = int(raw_moments) if raw_moments is not None else None
     entries = build_plan(
         catalog, song, target_len, args.no_speed_ramp,
         pace=getattr(args, "pace", "medium"),
@@ -1157,6 +1163,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         climax=bool(getattr(args, "climax", True)),
         stretch_stills=bool(getattr(args, "stretch_stills", True)),
         preferences=preferences,
+        moments_per_source=moments_per_source,
     )
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):

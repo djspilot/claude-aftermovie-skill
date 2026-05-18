@@ -268,6 +268,10 @@
   // LUT, no reframe). The preview status badge is surfaced while a preview
   // job is in flight; the final-render status uses the existing modal only.
   async function startRender(isPreview = false) {
+    const momentsSel = document.getElementById("moments-per-source");
+    const momentsPerSource = momentsSel
+      ? clampInt(momentsSel.value, 1, 8, 1)
+      : null;
     const body = compactPayload({
       excluded: [...excluded],
       max_length: resolveMaxLength(),
@@ -278,6 +282,7 @@
       audio_mix: els.audioMix.value || null,
       aspect: els.aspect.value || null,
       source_cap: clampInt(els.sourceCap.value, 1, 5, 1),
+      moments_per_source: momentsPerSource,
       no_speed_ramp: !els.speedRamp.checked,
       no_reframe: !els.reframe.checked,
       burst_window_s: els.keepBursts.checked ? 0 : 3,

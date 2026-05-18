@@ -72,6 +72,7 @@ class AutoOpts:
     preview: bool = False
     reveal: bool = True
     force_reanalyze: bool = False
+    moments_per_source: int | None = None  # F3 ceiling; None = use scorer default (1)
 
 
 # Preview-mode overrides — applied after theme expansion so --preview wins.
@@ -216,6 +217,7 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts,
         source_cap=opts.source_cap,
         chronological=opts.chronological,
         burst_window_s=opts.burst_window_s,
+        moments_per_source=opts.moments_per_source,
     )
     cmd_score(s)
 

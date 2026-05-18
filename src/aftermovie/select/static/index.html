@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=8">
+  <link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
   <header class="topbar">
@@ -31,6 +31,17 @@
           <option value="slow">slow</option>
           <option value="medium">medium</option>
           <option value="fast">fast</option>
+        </select>
+      </label>
+      <label class="ctrl"
+             title="How many distinct sub-clips each source video may contribute. 1 = each file appears at most once.">
+        <span>Moments / source</span>
+        <select id="moments-per-source" aria-label="Moments per source">
+          <option value="1" selected>1 (no repeat)</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="5">5</option>
+          <option value="8">8</option>
         </select>
       </label>
       <label class="ctrl">
@@ -245,6 +256,6 @@
     </div>
   </template>
 
-  <script src="app.js?v=8" defer></script>
+  <script src="app.js?v=9" defer></script>
 </body>
 </html>

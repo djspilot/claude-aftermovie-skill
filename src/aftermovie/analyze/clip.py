@@ -10,6 +10,7 @@ from pathlib import Path
 
 from aftermovie.analyze.audio import measure_audio_energy, measure_voice_energy
 from aftermovie.analyze.capture_time import captured_at_for
+from aftermovie.analyze.duplicates import compute_phash, group_duplicates
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
@@ -80,6 +81,7 @@ def analyze_clip(path: Path) -> ClipInfo | None:
     face_bboxes: list[dict | None] = (
         detect_per_second(path, duration) if faces_available() else []
     )
+    phash = compute_phash(path)
 
     def per_second(arr: list[float], target_len: int) -> list[float]:
         if not arr or target_len == 0:
@@ -108,6 +110,9 @@ def analyze_clip(path: Path) -> ClipInfo | None:
         is_short_form=is_short_form,
         captured_at=captured_at_for(path),
         face_bboxes=face_bboxes,
+        phash=phash,
+        # duplicate_group is stamped in after the whole catalog is built
+        # (we need every clip's phash before we can cluster them).
     )
 
 
@@ -189,6 +194,20 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         info = analyze_clip(f)
         if info:
             catalog.append(asdict(info))
+
+    # Visual-duplicate grouping: once every clip has a phash we can cluster
+    # near-identical shots across the whole folder. Singletons and clips
+    # without a phash get `None` (the scorer treats those as "always keep").
+    groups = group_duplicates(
+        [(c["path"], c.get("phash")) for c in catalog]
+    )
+    n_grouped = sum(1 for gid in groups.values() if gid is not None)
+    if n_grouped:
+        n_clusters = len({gid for gid in groups.values() if gid is not None})
+        log(f"  visual duplicates: {n_grouped} clip(s) across {n_clusters} cluster(s)")
+    for c in catalog:
+        c["duplicate_group"] = groups.get(c["path"])
+
     out = Path(args.out).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"clips": catalog}, indent=2))

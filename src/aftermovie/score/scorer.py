@@ -127,6 +127,57 @@ def _source_captured_at(src_clip: dict[str, Any]) -> float | None:
         return None
 
 
+def _suppress_visual_duplicates(candidates: list[Candidate],
+                                by_source: dict[str, dict[str, Any]]) -> list[Candidate]:
+    """Collapse candidates whose source shares a `duplicate_group` (set at
+    analyze time by `analyze/duplicates.group_duplicates`). For each cluster,
+    keep ONLY the highest-scoring candidate; drop the rest of the group.
+
+    Sources without a duplicate_group (singletons / clips that had no phash)
+    are passed through untouched.
+
+    Composes with `_suppress_bursts`: bursts fire first to drop same-moment
+    same-camera spam, then this filter catches same-look-from-anywhere.
+    Doing it in this order means a burst cluster's best candidate has
+    already been chosen by the time we ask "is this also a visual twin of
+    something else?", so we never overcount the work."""
+    if not candidates:
+        return candidates
+
+    # Per-group, find the source whose best-scoring candidate wins.
+    group_best_source: dict[str, tuple[float, str]] = {}
+    for c in candidates:
+        src = by_source.get(c.source) or {}
+        gid = src.get("duplicate_group")
+        if not gid:
+            continue
+        prev = group_best_source.get(gid)
+        if prev is None or c.score > prev[0]:
+            group_best_source[gid] = (c.score, c.source)
+
+    if not group_best_source:
+        return candidates
+
+    # Every source in a cluster that ISN'T the winner gets dropped.
+    suppressed_sources: set[str] = set()
+    cluster_members: dict[str, list[str]] = {}
+    for src, info in by_source.items():
+        gid = info.get("duplicate_group")
+        if gid:
+            cluster_members.setdefault(gid, []).append(src)
+    for gid, members in cluster_members.items():
+        keep = group_best_source.get(gid, (0.0, None))[1]
+        for src in members:
+            if src != keep:
+                suppressed_sources.add(src)
+
+    if not suppressed_sources:
+        return candidates
+    log(f"visual-dup suppress: dropped {len(suppressed_sources)} source(s) "
+        f"sharing a duplicate_group with a higher-scored sibling")
+    return [c for c in candidates if c.source not in suppressed_sources]
+
+
 def _suppress_bursts(candidates: list[Candidate],
                      by_source: dict[str, dict[str, Any]],
                      window_s: float = DEFAULT_BURST_WINDOW_S) -> list[Candidate]:
@@ -346,7 +397,14 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
     candidates = build_candidates(catalog)
+    # Filter order matters: bursts first (catches same-moment, same-camera
+    # repetition where the only signal is timestamp clustering), then
+    # visual-duplicate grouping (catches same-look-from-anywhere using the
+    # phashes attached at analyze time). Reversing the order would let
+    # burst-suppression mask a visual-twin survivor we'd actually want to
+    # drop. See analyze/duplicates.py for the dHash details.
     candidates = _suppress_bursts(candidates, by_source, window_s=burst_window_s)
+    candidates = _suppress_visual_duplicates(candidates, by_source)
     cut_points = select_cut_points(song, target_len, pace)
     picks = allocate_candidates(candidates, cut_points, source_cap=source_cap)
 

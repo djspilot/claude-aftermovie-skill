@@ -110,7 +110,15 @@ class SaveResult:
 
 @dataclass
 class RenderJob:
-    """Mutable state of one in-flight (or finished) render."""
+    """Mutable state of one in-flight (or finished) render.
+
+    `stage` / `stage_index` / `stage_total` / `progress_percent` / `eta_s`
+    are written from the worker thread under `_progress_lock`; readers
+    (HTTP poll) grab a consistent snapshot via `status()`. `cpu_seconds_used`
+    is the sum of `time.process_time()` deltas across stage transitions —
+    when VideoToolbox lands (Phase B) this number drops dramatically while
+    wall-clock holds steady, which is the whole point of A4.
+    """
 
     job_id: str
     state: str = "running"  # "running" | "done" | "error"
@@ -119,6 +127,16 @@ class RenderJob:
     log_tail: deque[str] = field(default_factory=lambda: deque(maxlen=200))
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    # ---- progress fields (Phase A2) ----
+    # `stage` is one of: "", "analyze", "score", "prerender", "assemble",
+    # "mux", "done", "error". Empty string before the worker has set anything.
+    stage: str = ""
+    stage_index: int = 0
+    stage_total: int = 0
+    progress_percent: float = 0.0
+    eta_s: float | None = None
+    current_ffmpeg_pid: int | None = None
+    cpu_seconds_used: float = 0.0
 
 
 @dataclass
@@ -235,6 +253,28 @@ class _LogCapture(io.TextIOBase):
                 pass
 
 
+# Per-stage weight table used to map per-stage fractions onto the overall
+# `progress_percent`. The numbers come from real-world session profiling on
+# an M5 Pro: prerender dominates wall-clock, assemble is a single x264 pass
+# (or a near-instant concat-copy), mux is a video-copy + AAC encode, and
+# analyze/score are tiny compared to the encode work. They sum to 100.
+RENDER_STAGE_WEIGHTS: dict[str, float] = {
+    "analyze": 1.0,
+    "score": 1.0,
+    "prerender": 75.0,
+    "assemble": 18.0,
+    "mux": 5.0,
+}
+# Cumulative % budget before each stage starts — gives the closure a fast
+# "convert (stage, fraction_in_stage) -> overall %" without re-summing.
+_STAGE_CUMULATIVE: dict[str, float] = {}
+_acc = 0.0
+for _stage in ("analyze", "score", "prerender", "assemble", "mux"):
+    _STAGE_CUMULATIVE[_stage] = _acc
+    _acc += RENDER_STAGE_WEIGHTS[_stage]
+del _acc, _stage
+
+
 def _run_render_job(
     job: RenderJob,
     clips: Path,
@@ -250,6 +290,92 @@ def _run_render_job(
 
     saved_stderr = sys.stderr
     sys.stderr = _LogCapture(job, saved_stderr if sys.stderr is not None else None)
+    # Thread-safe progress writes — the HTTP poll thread reads these fields
+    # via `status()` so all mutations go through the lock.
+    progress_lock = threading.Lock()
+    # CPU-seconds bookkeeping. `time.process_time()` measures user+system CPU
+    # consumed by *this* process (the worker thread + any main-thread work it
+    # triggers — librosa/numpy stuff). It doesn't include child processes
+    # like ffmpeg; we add those via `os.times().children_*` below at each
+    # stage boundary so the GUI sees the full picture.
+    import os
+    cpu_start = time.process_time()
+    children_start = os.times()
+    # When did the current stage begin? Used for ETA math.
+    stage_started_wall: dict[str, float] = {}
+    last_stage_seen: list[str] = [""]
+
+    def _set_stage(stage: str, *, index: int = 0, total: int = 0) -> None:
+        """Mark `stage` started; record wall-clock + accumulate CPU seconds."""
+        nonlocal cpu_start, children_start
+        now = time.time()
+        cpu_now = time.process_time()
+        children_now = os.times()
+        delta = (cpu_now - cpu_start) + max(
+            0.0,
+            (children_now.children_user + children_now.children_system)
+            - (children_start.children_user + children_start.children_system),
+        )
+        with progress_lock:
+            job.cpu_seconds_used += delta
+            job.stage = stage
+            job.stage_index = index
+            job.stage_total = total
+            # Anchor `progress_percent` at the stage's cumulative budget so the
+            # bar jumps forward at each boundary even before the first
+            # frame=N tick of the new stage arrives.
+            job.progress_percent = _STAGE_CUMULATIVE.get(stage, job.progress_percent)
+            if stage in ("done", "error"):
+                job.eta_s = 0.0
+        cpu_start = cpu_now
+        children_start = children_now
+        stage_started_wall[stage] = now
+        last_stage_seen[0] = stage
+
+    def _on_progress(event: "Any") -> None:
+        """Translate a `ProgressEvent` into RenderJob field updates.
+
+        Stage boundaries inside the prerender loop are detected here too:
+        when `event.stage_index` jumps to a new value we treat that as the
+        next clip's slice of the prerender budget starting. The per-clip
+        slice is `prerender_weight / N`, so overall % advances smoothly
+        across the whole pool.
+        """
+        stage = event.stage
+        idx = event.stage_index
+        total = max(1, event.stage_total or 1)
+        frac = max(0.0, min(1.0, event.fraction_in_stage))
+        # Map (stage, idx, frac) onto overall percent. For multi-step stages
+        # like prerender, each clip owns 1/N of the stage budget; the current
+        # clip is at fraction `(idx-1+frac) / N`.
+        per_step_frac = ((max(idx, 1) - 1) + frac) / total
+        stage_budget = RENDER_STAGE_WEIGHTS.get(stage, 0.0)
+        base = _STAGE_CUMULATIVE.get(stage, 0.0)
+        overall = base + stage_budget * per_step_frac
+        # ETA from the in-stage progress so far. Cheap, slightly biased on the
+        # first ~5 % of the stage; the GUI surfaces "—" until the bias bleeds
+        # out (>5 % done, see `pollStatus` in app.js).
+        eta: float | None = None
+        started = stage_started_wall.get(stage)
+        if started is not None and overall > 1.0:
+            elapsed = max(0.001, time.time() - job.started_at)
+            remaining_frac = max(0.0, 1.0 - overall / 100.0)
+            eta = (elapsed / max(0.0001, overall / 100.0)) * remaining_frac
+
+        with progress_lock:
+            if stage != job.stage:
+                job.stage = stage
+                stage_started_wall.setdefault(stage, time.time())
+            job.stage_index = idx
+            job.stage_total = total
+            # Monotonic: never let a delayed callback walk the bar backwards.
+            if overall > job.progress_percent:
+                job.progress_percent = min(100.0, overall)
+            if eta is not None:
+                job.eta_s = max(0.0, eta)
+            if event.current_pid is not None:
+                job.current_ffmpeg_pid = event.current_pid
+
     try:
         if song is None:
             raise ValueError("`song` is required to render")
@@ -268,14 +394,30 @@ def _run_render_job(
             out_dir = Path(cfg.output_dir).expanduser()
             out_path = out_dir / f"aftermovie-{clips.resolve().name or 'edit'}.mp4"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path = run_auto(clips, song, out_path, opts)
+
+        # Coarse-grained stage signposts — run_auto goes analyze → score →
+        # render (with prerender/assemble/mux inside render). We mark
+        # analyze/score here; the ProgressEvent callback drives the rest.
+        _set_stage("analyze")
+        # `run_auto` runs analyze internally, but exposing per-Entry analyze
+        # progress is Phase E territory; for now we let analyze + score
+        # consume their cumulative 2 % budget atomically.
+        result_path = run_auto(clips, song, out_path, opts, progress_cb=_on_progress)
         job.output_path = str(result_path)
+        _set_stage("done")
+        with progress_lock:
+            job.progress_percent = 100.0
+            job.eta_s = 0.0
+            job.current_ffmpeg_pid = None
         job.state = "done"
     except Exception as e:
         tb = traceback.format_exc()
         job.error = f"{type(e).__name__}: {e}"
         for line in tb.splitlines():
             job.log_tail.append(line)
+        with progress_lock:
+            job.stage = "error"
+            job.eta_s = None
         job.state = "error"
     finally:
         sys.stderr = saved_stderr
@@ -702,6 +844,16 @@ class SelectionService:
             "log_tail": "\n".join(job.log_tail),
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            # Phase A2/A3/A4 progress fields. Defaults are sensible for a
+            # job that hasn't yet emitted a progress event ("" stage,
+            # 0 percent, no ETA, no pid).
+            "stage": job.stage,
+            "stage_index": job.stage_index,
+            "stage_total": job.stage_total,
+            "progress_percent": job.progress_percent,
+            "eta_s": job.eta_s,
+            "current_ffmpeg_pid": job.current_ffmpeg_pid,
+            "cpu_seconds_used": job.cpu_seconds_used,
         }
 
     # ---- song picker (D1-D4) ----

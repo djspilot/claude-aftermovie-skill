@@ -17,6 +17,7 @@ import json
 import tempfile
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Callable
 
 from aftermovie.analyze.clip import cmd_analyze
 from aftermovie.config import (
@@ -26,11 +27,21 @@ from aftermovie.config import (
     DEFAULT_RES,
 )
 from aftermovie.ffmpeg_cmd import log
-from aftermovie.render.pipeline import cmd_render
+from aftermovie.render.pipeline import ProgressEvent, cmd_render
 from aftermovie.repos import PlanIdOpts, catalog_repo, plan_repo
 from aftermovie.score.scorer import cmd_score
 from aftermovie.themes import BASELINE_DEFAULTS as _THEME_DEFAULTS
 from aftermovie.themes import ThemeResolver
+
+# Re-export so callers can `from aftermovie.pipeline_runner import ProgressEvent`
+# without reaching into render/pipeline.py — keeps the orchestration Module the
+# one Seam progress flows through.
+__all__ = [
+    "AutoOpts", "ProgressEvent", "opts_from_namespace",
+    "run_auto", "run_render_only",
+]
+
+ProgressCallback = Callable[[ProgressEvent], None]
 
 
 @dataclass
@@ -109,7 +120,8 @@ def opts_from_namespace(args: argparse.Namespace) -> AutoOpts:
     return AutoOpts(**kwargs)
 
 
-def run_render_only(plan: Path, output: Path, opts: AutoOpts | None = None) -> Path:
+def run_render_only(plan: Path, output: Path, opts: AutoOpts | None = None,
+                    *, progress_cb: ProgressCallback | None = None) -> Path:
     """Skip analyze + score; just dispatch `cmd_render` on an existing plan.
 
     Used by `aftermovie auto --from-plan` and `aftermovie render-from-plan`
@@ -122,14 +134,15 @@ def run_render_only(plan: Path, output: Path, opts: AutoOpts | None = None) -> P
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     r = argparse.Namespace(plan=str(plan_path), output=str(output_path))
-    cmd_render(r)
+    cmd_render(r, progress_cb=progress_cb)
 
     if opts is None or opts.reveal:
         _notify_and_reveal(output_path)
     return output_path
 
 
-def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
+def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts,
+             *, progress_cb: ProgressCallback | None = None) -> Path:
     """Full analyze → score → render. Returns the output path on success.
 
     Applies the theme bundle (if `opts.theme` is set) before dispatching, so
@@ -223,7 +236,7 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
 
     # 3) render
     r = argparse.Namespace(plan=str(plan_path), output=str(output_path))
-    cmd_render(r)
+    cmd_render(r, progress_cb=progress_cb)
 
     log(f"Intermediate files preserved in: {workdir}")
     if opts.reveal:

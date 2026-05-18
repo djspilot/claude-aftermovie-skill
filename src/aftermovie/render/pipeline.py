@@ -13,10 +13,12 @@ import json
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from aftermovie.config import DEFAULT_FPS, DEFAULT_RES, resolve_lut
-from aftermovie.ffmpeg_cmd import log, run
+from aftermovie.ffmpeg_cmd import log, run, run_with_progress
 from aftermovie.render.audio_mix import filtergraph as audio_filtergraph
 from aftermovie.render.audio_mix import needs_clip_audio
 from aftermovie.render.chip import detect_chip
@@ -35,6 +37,34 @@ from aftermovie.render.titles import (
     resolve_title_times,
 )
 from aftermovie.render.transitions import build_xfade_graph, has_non_cut
+
+
+# ---- progress callback Interface ------------------------------------------
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """One observation of the render's progress, surfaced to the caller's UI.
+
+    `stage` is the coarse phase (`prerender` / `assemble` / `mux`). `stage_index`
+    / `stage_total` count items within a multi-step stage — for `prerender`
+    that's clip 1..N out of len(entries); for `assemble`/`mux` both equal 1.
+    `fraction_in_stage` is 0..1 (frames done out of frames-in-this-step), so
+    the upstream weighting code can map it onto the overall % budget.
+
+    `current_pid` is the ffmpeg subprocess pid driving the current step (or
+    None at stage boundaries between subprocess spawns). The select GUI
+    surfaces it so `kill -INT <pid>` from the operator's terminal aborts the
+    correct process.
+    """
+
+    stage: str
+    stage_index: int
+    stage_total: int
+    fraction_in_stage: float
+    current_pid: int | None = None
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
 
 
 def _audio_interest_threshold() -> float:
@@ -91,7 +121,10 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
                     aspect: str, target_res: str, target_fps: int,
                     lut: Path | None, keep_audio: bool,
                     encoder: EncoderProfile,
-                    enable_reframe: bool = True) -> bool:
+                    enable_reframe: bool = True,
+                    progress_cb: ProgressCallback | None = None,
+                    stage_index: int = 0,
+                    stage_total: int = 0) -> bool:
     src = Path(entry["source"])
     duration = entry["end_s"] - entry["start_s"]
     s_start, s_end = _ramp_speeds(entry)
@@ -252,8 +285,43 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         "-t", f"{slot_dur:.3f}",
         str(out_clip),
     ]
+    # Per-prerender frame target: planner-provided slot length × output fps.
+    # `-progress pipe:1` emits `frame=N` per stats period, so percent-done
+    # = min(1.0, frame / total_frames). Anything within ±5 % is fine for UX.
+    total_frames = max(1, int(slot_dur * target_fps))
+
+    def _on_block(block: dict) -> None:
+        if progress_cb is None:
+            return
+        frame = block.get("frame") or 0
+        # `progress=end` emits even when `frame` lagged; clamp at 1.0.
+        frac = min(1.0, max(0.0, frame / total_frames))
+        if block.get("progress") == "end":
+            frac = 1.0
+        progress_cb(ProgressEvent(
+            stage="prerender",
+            stage_index=stage_index,
+            stage_total=stage_total,
+            fraction_in_stage=frac,
+            current_pid=block.get("_pid"),
+        ))
+
+    captured_pid: list[int] = []
+
+    def _on_pid(pid: int) -> None:
+        captured_pid.append(pid)
+        if progress_cb is not None:
+            progress_cb(ProgressEvent(
+                stage="prerender",
+                stage_index=stage_index,
+                stage_total=stage_total,
+                fraction_in_stage=0.0,
+                current_pid=pid,
+            ))
+
     try:
-        run(cmd, check=True)
+        run_with_progress(cmd, _on_block, check=True,
+                          total_frames=total_frames, on_pid=_on_pid)
         return True
     except subprocess.CalledProcessError:
         log(f"  ! failed to render {src.name} — skipping")
@@ -283,7 +351,8 @@ def _compensated_render_entry(entry: dict, *, transitions_active: bool,
     return render_entry, planned_duration, render_duration
 
 
-def cmd_render(args: argparse.Namespace) -> None:
+def cmd_render(args: argparse.Namespace, *,
+               progress_cb: ProgressCallback | None = None) -> None:
     plan = json.loads(Path(args.plan).expanduser().read_text())
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +383,8 @@ def cmd_render(args: argparse.Namespace) -> None:
         f" encoder={encoder.name}"
         f"{' lut=' + lut.name if lut else ''}")
 
+    n_entries = len(entries)
+
     with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmpdir:
         tmp = Path(tmpdir)
         clip_paths: list[Path] = []
@@ -333,6 +404,9 @@ def cmd_render(args: argparse.Namespace) -> None:
                 lut=lut, keep_audio=keep_audio,
                 encoder=encoder,
                 enable_reframe=enable_reframe,
+                progress_cb=progress_cb,
+                stage_index=i + 1,
+                stage_total=n_entries,
             )
             if not ok:
                 continue
@@ -367,16 +441,59 @@ def cmd_render(args: argparse.Namespace) -> None:
                 keep_audio=keep_audio,
                 encoder=encoder,
                 out=intermediate,
+                progress_cb=progress_cb,
             )
         else:
-            _render_concat(clip_paths, intermediate, keep_audio=keep_audio)
+            _render_concat(clip_paths, intermediate, keep_audio=keep_audio,
+                           progress_cb=progress_cb)
 
-        _final_mux(intermediate, plan, output, audio_mix=audio_mix, keep_audio=keep_audio)
+        _final_mux(intermediate, plan, output, audio_mix=audio_mix,
+                   keep_audio=keep_audio, target_fps=target_fps,
+                   progress_cb=progress_cb)
 
     log(f"Done → {output}")
 
 
-def _render_concat(clip_paths: list[Path], out: Path, *, keep_audio: bool) -> None:
+def _run_assemble_with_progress(
+    cmd: list[str], progress_cb: ProgressCallback | None,
+    *, stage: str = "assemble", total_frames: int | None = None,
+) -> None:
+    """Run an `assemble` / `mux` ffmpeg command and surface progress.
+
+    We don't always know `total_frames` for these single-pass commands (the
+    concat-copy path emits very few `frame=` ticks; final-mux copies video
+    and re-encodes audio), so when `total_frames` is None we use the
+    `out_time_ms` ratio against the planned duration the caller passes via
+    `total_frames` instead. Either way the callback sees `fraction_in_stage`
+    monotonically advancing from 0 → 1.
+    """
+    if progress_cb is None:
+        run(cmd, check=True)
+        return
+
+    def _on_block(block: dict) -> None:
+        frac = 0.0
+        if total_frames and (block.get("frame") or 0) > 0:
+            frac = min(1.0, max(0.0, block["frame"] / total_frames))
+        if block.get("progress") == "end":
+            frac = 1.0
+        progress_cb(ProgressEvent(
+            stage=stage, stage_index=1, stage_total=1,
+            fraction_in_stage=frac, current_pid=block.get("_pid"),
+        ))
+
+    def _on_pid(pid: int) -> None:
+        progress_cb(ProgressEvent(
+            stage=stage, stage_index=1, stage_total=1,
+            fraction_in_stage=0.0, current_pid=pid,
+        ))
+
+    run_with_progress(cmd, _on_block, check=True,
+                      total_frames=total_frames, on_pid=_on_pid)
+
+
+def _render_concat(clip_paths: list[Path], out: Path, *, keep_audio: bool,
+                   progress_cb: ProgressCallback | None = None) -> None:
     concat_file = out.parent / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p.as_posix()}'" for p in clip_paths))
     cmd = [
@@ -384,7 +501,10 @@ def _render_concat(clip_paths: list[Path], out: Path, *, keep_audio: bool) -> No
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-c", "copy", str(out),
     ]
-    run(cmd)
+    # concat-copy is so fast we rarely see more than one `-progress` block,
+    # but plumbing the callback through keeps the assemble stage's % bar
+    # ticking instead of stalling at 0 until the subprocess exits.
+    _run_assemble_with_progress(cmd, progress_cb)
 
 
 def _render_filter_complex(clip_paths: list[Path], durations: list[float],
@@ -393,7 +513,8 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
                            total_duration_s: float,
                            target_fps: int, keep_audio: bool,
                            encoder: EncoderProfile,
-                           out: Path) -> None:
+                           out: Path,
+                           progress_cb: ProgressCallback | None = None) -> None:
     """Build a single ffmpeg call with xfade transitions and PNG-overlay titles."""
     inputs: list[str] = []
     # Prerendered clips are already in the encoder's pixfmt, so we don't add
@@ -461,11 +582,14 @@ def _render_filter_complex(clip_paths: list[Path], durations: list[float],
         "-t", f"{total_duration_s:.3f}",
         str(out),
     ]
-    run(cmd)
+    total_frames = max(1, int(total_duration_s * target_fps))
+    _run_assemble_with_progress(cmd, progress_cb, stage="assemble",
+                                total_frames=total_frames)
 
 
 def _final_mux(intermediate: Path, plan: dict, output: Path,
-               *, audio_mix: str, keep_audio: bool) -> None:
+               *, audio_mix: str, keep_audio: bool, target_fps: int = DEFAULT_FPS,
+               progress_cb: ProgressCallback | None = None) -> None:
     song = plan["song"]
     music_db = plan.get("music_db", -8)
     a_filter = audio_filtergraph(audio_mix, music_db)
@@ -514,4 +638,9 @@ def _final_mux(intermediate: Path, plan: dict, output: Path,
         "-c:a", "aac", "-b:a", "192k",
         str(output),
     ]
-    run(cmd)
+    # `-c:v copy` means video frames stream through verbatim; ffmpeg still
+    # emits `frame=N` ticks though, so the mux bar fills smoothly. Use the
+    # probed intermediate duration × target_fps as the frame target.
+    total_frames = max(1, int(dur * target_fps)) if dur > 0 else None
+    _run_assemble_with_progress(cmd, progress_cb, stage="mux",
+                                total_frames=total_frames)

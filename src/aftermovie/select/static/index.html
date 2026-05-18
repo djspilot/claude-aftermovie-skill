@@ -187,6 +187,15 @@
     <div class="modal-card">
       <h2 id="modal-title">Rendering…</h2>
       <div id="modal-state" class="modal-state">starting…</div>
+      <div class="render-progress-row">
+        <progress id="render-progress" class="render-progress" value="0" max="100"
+                  aria-label="Render progress"></progress>
+        <div class="render-progress-meta">
+          <span id="render-stage-label" class="render-stage-label">idle</span>
+          <span id="render-eta" class="render-eta"></span>
+          <span id="render-cpu" class="render-cpu"></span>
+        </div>
+      </div>
       <pre id="modal-log" class="modal-log" aria-label="Render log"></pre>
       <div id="modal-result" class="modal-result hidden">
         <p>Output:</p>

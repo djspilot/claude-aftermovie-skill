@@ -43,7 +43,7 @@ def _patch_pipeline(monkeypatch) -> dict[str, argparse.Namespace]:
         }
         Path(args.out).write_text(json.dumps(plan))
 
-    def fake_render(args: argparse.Namespace) -> None:
+    def fake_render(args: argparse.Namespace, **_: object) -> None:
         captured["render"] = args
         # Touch the output so callers can verify the path was used.
         Path(args.output).write_bytes(b"")

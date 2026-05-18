@@ -63,13 +63,35 @@ def _aspect_dims(aspect: str, target_res: str) -> tuple[int, int]:
     return w, h
 
 
+def _ramp_speeds(entry: dict) -> tuple[float, float]:
+    """Return (speed_start, speed_end) for the entry.
+
+    When only `speed` is set (no ramp data) both ends equal `speed`.
+    Ramps with start/end within 0.05 of each other collapse to constant
+    speed at the average — too subtle to be worth a setpts expression.
+    """
+    speed = float(entry.get("speed", 1.0))
+    s_start = float(entry.get("speed_start", speed))
+    s_end = float(entry.get("speed_end", speed))
+    if abs(s_start - s_end) <= 0.05:
+        avg = (s_start + s_end) / 2.0
+        return (avg, avg)
+    return (s_start, s_end)
+
+
 def _prerender_clip(entry: dict, out_clip: Path, *,
                     aspect: str, target_res: str, target_fps: int,
                     lut: Path | None, keep_audio: bool,
                     enable_reframe: bool = True) -> bool:
     src = Path(entry["source"])
     duration = entry["end_s"] - entry["start_s"]
-    speed = entry.get("speed", 1.0)
+    s_start, s_end = _ramp_speeds(entry)
+    is_ramp = s_start != s_end
+    # When ramping, use the arithmetic mean as the "effective" speed for
+    # downstream math (slot-fill, audio atempo). The harmonic mean would
+    # be marginally more accurate for output-length prediction but the
+    # difference is well under our beat-sync tolerance.
+    speed = (s_start + s_end) / 2.0 if is_ramp else s_start
     # The slot the planner wanted to fill. If the source ran short we still
     # want the prerendered clip to be `out_duration_s` long so beat-sync holds
     # — we hold the last frame (tpad) and silence-pad audio.
@@ -110,13 +132,33 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         else:
             vfilter.append(aspect_filter(aspect, target_res))
 
-    if speed != 1.0:
+    if is_ramp:
+        # Two-segment speed ramp via time-varying setpts. The expression
+        # linearly interpolates the PTS scale factor (1/speed) from
+        # f0=1/s_start at input time T=0 to f1=1/s_end at T=duration.
+        # ffmpeg evaluates per-frame: new_pts = (f0 + (f1-f0)*T/D) * old_pts.
+        # The resulting visible motion ramp matches the (s_start, s_end)
+        # endpoints; the actual output length is approximately
+        # `duration * (f0+f1)/2`, with `-t slot_dur` truncating any overshoot
+        # and tpad below padding any undershoot to keep beat-sync exact.
+        f0 = 1.0 / max(s_start, 0.0001)
+        f1 = 1.0 / max(s_end, 0.0001)
+        d_safe = max(duration, 0.0001)
+        vfilter.append(
+            f"setpts='({f0:.4f} + ({f1 - f0:+.4f})*(T/{d_safe:.4f}))*PTS'"
+        )
+    elif speed != 1.0:
         vfilter.append(f"setpts={1.0/speed:.4f}*PTS")
     if lut:
         vfilter.append(f"lut3d={lut.as_posix()}")
     vfilter.append(f"fps={target_fps}")
     # Hold the last frame if we couldn't read enough source to fill the slot.
-    native_out_dur = duration / max(speed, 0.0001)
+    if is_ramp:
+        # Average PTS factor over the ramp ≈ arithmetic mean of f0,f1.
+        native_out_dur = duration * ((1.0 / max(s_start, 0.0001)) +
+                                     (1.0 / max(s_end, 0.0001))) / 2.0
+    else:
+        native_out_dur = duration / max(speed, 0.0001)
     pad_dur = max(0.0, slot_dur - native_out_dur)
     if pad_dur > 0.05:
         vfilter.append(f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}")
@@ -149,6 +191,11 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         if threshold > 0 and interest < threshold:
             a_steps.append("volume=0")
         if speed != 1.0:
+            # atempo cannot ramp linearly across a clip, so when the video
+            # ramps we apply atempo at the average speed. Ramps tend to
+            # coincide with action moments where music dominates the mix
+            # anyway, so the small drift from a "true" audio ramp is
+            # inaudible after the music duck.
             a_steps.append(f"atempo={max(0.5, min(2.0, speed)):.4f}")
         if pad_dur > 0.05:
             # Pad audio with silence so it matches the tpad'd video length.

@@ -17,6 +17,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """Check if the local ffmpeg ships a given encoder. Used to skip
+    VideoToolbox tests on Linux CI."""
+    if shutil.which("ffmpeg") is None:
+        return False
+    try:
+        res = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            check=True, capture_output=True, text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    return any(name in line for line in res.stdout.splitlines())
+
+
 def test_auto_produces_valid_mp4(tmp_path: Path, fixtures_dir: Path, tone: Path):
     out_path = tmp_path / "smoke.mp4"
     clips_dir = tmp_path / "clips"
@@ -46,7 +61,9 @@ def test_auto_produces_valid_mp4(tmp_path: Path, fixtures_dir: Path, tone: Path)
     codecs = {s.get("codec_name") for s in streams}
     types = {s.get("codec_type") for s in streams}
 
-    assert "h264" in codecs, f"expected h264 video, got {codecs}"
+    # B1: the default encoder is now chip-dependent — h264 (libx264 on Linux
+    # CI) or hevc (hevc_videotoolbox on Apple Silicon). Both are valid mp4.
+    assert codecs & {"h264", "hevc"}, f"expected h264 or hevc video, got {codecs}"
     assert "aac" in codecs, f"expected aac audio, got {codecs}"
     assert "video" in types and "audio" in types
 
@@ -93,3 +110,39 @@ def test_score_then_render_roundtrip(tmp_path: Path, fixtures_dir: Path, tone: P
     ])
     args.func(args)
     assert output.exists()
+
+
+@pytest.mark.skipif(
+    not _ffmpeg_has_encoder("h264_videotoolbox"),
+    reason="h264_videotoolbox not available (likely non-Apple-Silicon host)",
+)
+def test_render_with_h264_vt_env_override(
+    tmp_path: Path, fixtures_dir: Path, tone: Path, monkeypatch,
+):
+    """A render with AFTERMOVIE_VIDEO_CODEC=h264_vt produces a valid mp4."""
+    monkeypatch.setenv("AFTERMOVIE_VIDEO_CODEC", "h264_vt")
+
+    out_path = tmp_path / "smoke_vt.mp4"
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    for name in ("clip_a.mp4", "clip_b.mp4", "clip_c.mp4"):
+        shutil.copy(fixtures_dir / name, clips_dir / name)
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "auto",
+        "--clips", str(clips_dir),
+        "--song", str(tone),
+        "--output", str(out_path),
+        "--max-length", "6",
+        "--res", "320x240",
+        "--fps", "24",
+        "--source-cap", "3",
+    ])
+    args.func(args)
+
+    assert out_path.exists(), "VT-encoded mp4 was not produced"
+    info = ffprobe_json(out_path)
+    codecs = {s.get("codec_name") for s in info.get("streams", [])}
+    # h264_videotoolbox produces an h264 stream, just like libx264.
+    assert "h264" in codecs, f"expected h264, got {codecs}"

@@ -44,6 +44,8 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **Sidecar** — a small JSON file the `select` GUI writes at the root of the Source folder to influence later renders without mutating the clips themselves. Two of them today: `.aftermovie-selection.json` (the exclusion list) and `.aftermovie-preferences.json` (favorites / bans / reserved pins). Both go through the `SidecarStore` Module (`analyze/sidecar.py`), which owns mtime-aware caching, atomic writes, and malformed-input recovery so the per-file Adapters stay thin.
 
+- **Score component** — one named signal that contributes to a Candidate's total score (`motion`, `audio`, `hilight_tag`, `accl_jump`, `gps_speed`, `face`, `user_favorite`, `blurry`, `poor_exposure`). Declared once in `score/components.py`; the scorer threads `ScoreComponent` instances (not raw strings) into the `Candidate.components` / `PlanEntry.components` breakdown so the "why this entry won?" inspector has a fixed vocabulary. Not "score field", not "signal" (signal is the analyze-time input — `motion_energy`, `accl_peaks`, ...; the *component* is what the scorer derives from it).
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

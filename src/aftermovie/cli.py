@@ -357,6 +357,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     import shutil
 
     from aftermovie.config import lut_dir
+    from aftermovie.score import components as sc
 
     print("aftermovie doctor")
     print("-----------------")
@@ -389,6 +390,16 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     print(f"  LUTs:          {len(luts)} found in {lut_d}")
     for l in luts:
         print(f"    - {l.name}")
+
+    # Score-component vocabulary — the names that may appear in
+    # Candidate.components / PlanEntry.components. Surfacing them here so
+    # users (and a future "why this entry won?" UI) have one place to
+    # consult the registry.
+    print()
+    print("  score components:")
+    for c in sc.iter_components():
+        hint = "" if c.weight_hint is None else f" (hint {c.weight_hint:+.1f})"
+        print(f"    [{c.polarity}] {c.name:14s}{hint}  {c.description}")
 
 
 def main() -> None:

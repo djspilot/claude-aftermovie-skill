@@ -42,6 +42,11 @@ This file defines the terms the codebase uses. Match them when extending or refa
 
 - **GPMF** — GoPro Metadata Format: per-frame telemetry (accel, gyro, GPS speed) embedded in the MP4. Parsed at analyze time and contributes to scoring.
 
+## Storage
+
+- **Catalog Repository** — `aftermovie.repos.CatalogRepository` (singleton: `catalog_repo`). Owns id derivation, cache-hit lookup, and on-disk persistence of Catalogs under `~/.skills-data/aftermovie/catalogs/<catalog_id>.json`. `put(folder, catalog)` stamps `_aftermovie.catalog_id` onto the catalog. Pipeline + MCP + select-GUI all go through this Seam.
+- **Plan Repository** — `aftermovie.repos.PlanRepository` (singleton: `plan_repo`). Same role for Plans under `plans/<plan_id>.json`. `put(catalog_id, song, opts, plan)` stamps both `_aftermovie.catalog_id` and `_aftermovie.plan_id`; `get_latest_for_catalog(cid)` backs the GUI's `/api/plan` endpoint.
+
 ## Surfaces
 
 - **CLI** — `aftermovie` command, argparse subcommands (`analyze`, `score`, `render`, `auto`, `doctor`, `init-config`, `show-config`).

@@ -213,24 +213,29 @@ def test_build_plan_drop_has_higher_motion_than_verse():
     """End-to-end: a catalog with two clearly-tagged groups (motion-heavy
     and face-heavy) plus a 3-section song (verse / drop / verse) must
     produce a plan whose drop entries have higher mean `motion`
-    component than its verse entries."""
-    # Five motion-heavy clips and five face-heavy clips, all the same
-    # objective score so the bias is the only differentiator.
+    component than its verse entries.
+
+    Setup: 15 motion sources + 5 face sources × 20s. With F3 budget=2
+    per source clamped to source_cap=1 → 15 motion + 5 face candidates.
+    Total slots = verse_a (5) + drop (10) + verse_b (5) = 20. Motion
+    supply (15) covers verse_a + drop; faces fill verse_b. Drop ends up
+    100% motion while verses average ~50% motion, so drop > verse.
+    """
     catalog = {"clips": []}
-    for i in range(5):
+    for i in range(15):
         catalog["clips"].append(_clip(
-            f"/motion_{i}.mp4", duration=10.0,
-            motion_energy=[1.0] * 10,
-            accl_peaks=[16.0] * 10,  # triggers high_accel_jump
-            audio_energy=[0.0] * 10,
+            f"/motion_{i}.mp4", duration=20.0,
+            motion_energy=[1.0] * 20,
+            accl_peaks=[16.0] * 20,  # triggers high_accel_jump
+            audio_energy=[0.0] * 20,
         ))
     for i in range(5):
         catalog["clips"].append(_clip(
-            f"/face_{i}.mp4", duration=10.0,
-            motion_energy=[0.0] * 10,
-            accl_peaks=[9.8] * 10,
-            audio_energy=[0.0] * 10,
-            face_bboxes=[{"x": 0, "y": 0, "w": 10, "h": 10}] * 10,
+            f"/face_{i}.mp4", duration=20.0,
+            motion_energy=[0.0] * 20,
+            accl_peaks=[9.8] * 20,
+            audio_energy=[0.0] * 20,
+            face_bboxes=[{"x": 0, "y": 0, "w": 10, "h": 10}] * 20,
         ))
 
     sections = [
@@ -242,7 +247,7 @@ def test_build_plan_drop_has_higher_motion_than_verse():
 
     plan = build_plan(
         catalog, song, target_len=30.0, no_speed_ramp=True,
-        pace="auto", source_cap=2,
+        pace="auto", source_cap=1,
         chronological=False,   # keep section ordering preserved
         hook=False, climax=False,
     )

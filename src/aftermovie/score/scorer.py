@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -534,16 +535,25 @@ def allocate_candidates(candidates: list[Candidate],
                         auto_bump_cap: bool = True,
                         max_auto_cap: int = 5,
                         sections: list[dict[str, Any]] | None = None,
+                        source_budgets: dict[str, int] | None = None,
                         ) -> list[tuple[float, Candidate]]:
     """Greedy fill: walk cut points, pick the highest-scoring unused candidate
-    that hasn't already hit `source_cap` reuses of the same source file.
+    that hasn't already hit its per-source reuse cap.
 
-    When `auto_bump_cap=True` (default) and the available unique sources
-    can't fill every cut point at the given `source_cap`, the cap is bumped
-    automatically (up to `max_auto_cap`). This lets users hit a target
-    length (e.g. `--max-length 120`) even when their source folder is small:
-    some sources will appear more than once, but the alternative is a
-    truncated edit. A single log line surfaces the bump.
+    Per-source cap resolution (F3): when `source_budgets` is provided, each
+    source's effective cap is `min(source_budgets[source], source_cap)`. The
+    user-supplied `source_cap` becomes a HARD CEILING — a budget of 6 with
+    `source_cap=2` clamps to 2 — but otherwise the budget controls the cap
+    so a 70s GoPro can contribute up to 7 distinct moments while a 4s Live
+    Photo can only contribute 1.
+
+    When `auto_bump_cap=True` and `source_budgets is None` (legacy path) and
+    the unique sources can't fill every cut point at the given `source_cap`,
+    the cap is bumped automatically (up to `max_auto_cap`). This path is
+    near-unreachable under F3 moment-budget mode because each source's
+    budget already covers more than one moment for long footage, but it
+    remains intact for callers that bypass `build_plan` (e.g. unit tests
+    that pass a hand-rolled Candidate list).
 
     When `sections` is provided (Phase C5), the per-anchor candidate ranking
     is re-scored via `SECTION_BIAS` so drops/builds tend to pull motion- and
@@ -556,9 +566,21 @@ def allocate_candidates(candidates: list[Candidate],
     n_unique = len({c.source for c in candidates})
     n_slots = max(0, len(cut_points) - 1)
     effective_cap = source_cap
-    # Only auto-bump from the strict-no-duplicates default. When the caller
-    # explicitly passed source_cap > 1 they already weighed reuse vs. variety.
-    if (auto_bump_cap and source_cap == 1
+    # Build a per-source cap map. Default is `effective_cap` for any source
+    # not present in `source_budgets`; when a budget IS present it's clamped
+    # by `source_cap` so the user's hard ceiling always wins.
+    per_source_cap: dict[str, int] = {}
+    if source_budgets:
+        for src, budget in source_budgets.items():
+            per_source_cap[src] = max(1, min(int(budget), source_cap))
+
+    # Legacy auto-bump path: only fires when no per-source budget is supplied
+    # AND the caller is still at the strict-no-duplicates default. With F3
+    # moment-budgets the planner sums the per-source budgets BEFORE allocate
+    # is called, so this branch is effectively a no-op in the new pipeline —
+    # we leave it in place for the small handful of tests/callers that drive
+    # `allocate_candidates` directly with a flat `source_cap`.
+    if (auto_bump_cap and source_cap == 1 and not source_budgets
             and n_unique > 0 and n_unique * source_cap < n_slots):
         # Round up: e.g. 64 sources, 75 slots, cap=1 → need cap=2.
         needed = -(-n_slots // n_unique)
@@ -566,6 +588,9 @@ def allocate_candidates(candidates: list[Candidate],
         if effective_cap > source_cap:
             log(f"  ! source_cap auto-bumped {source_cap} → {effective_cap} to fit "
                 f"{n_slots} cuts from {n_unique} unique sources")
+
+    def _cap_for(src: str) -> int:
+        return per_source_cap.get(src, effective_cap)
 
     # We keep a pool sorted by base score and re-rank per-anchor when
     # sections are in play. When sections are absent the inner loop falls
@@ -590,7 +615,7 @@ def allocate_candidates(candidates: list[Candidate],
                 clip_len = c.end_s - c.start_s
                 if clip_len < MIN_CLIP_S:
                     continue
-                if used_sources.get(c.source, 0) >= effective_cap:
+                if used_sources.get(c.source, 0) >= _cap_for(c.source):
                     continue
                 s = _section_picker_score(c, kind)
                 if best is None or s > best[0]:
@@ -602,7 +627,7 @@ def allocate_candidates(candidates: list[Candidate],
                 clip_len = c.end_s - c.start_s
                 if clip_len < MIN_CLIP_S:
                     continue
-                if used_sources.get(c.source, 0) >= effective_cap:
+                if used_sources.get(c.source, 0) >= _cap_for(c.source):
                     continue
                 pick = c
                 break
@@ -647,47 +672,100 @@ STRETCH_TAIL_FACTOR = 1.5           # last-entries beat-slot stretch ceiling
 STRETCH_TAIL_ENTRIES = 4            # how many trailing entries the lever 3
                                     # stretch is allowed to dilate
 
-# Subset-mode tunables (C4). When the candidate pool is large enough that
-# `len(candidates) * average_slot_s > target_len * SUBSET_TRIGGER_RATIO`,
-# we trim it to roughly `SUBSET_KEEP_RATIO × needed-slot-count` candidates,
-# keeping the top by score. Avoids quality dilution on a 200-clip pool.
-SUBSET_TRIGGER_RATIO = 1.5
-SUBSET_KEEP_RATIO = 1.2
+# Moment-budget tunables (F3). Replaces the legacy C4 "subset mode" pool-level
+# top-N trim, which concentrated cuts on a handful of high-scoring sources and
+# dropped the rest of the catalog entirely. The C4 approach was correct about
+# "don't show the bottom of the score pile" but wrong about HOW to trim — a
+# global top-N is blind to source provenance, so a 200-clip pool with one
+# loud GoPro got reduced to that GoPro's 36 best windows and 0 from the
+# other 60 cameras.
+#
+# Moment-budget mode instead asks: "for each source, what's the maximum
+# number of *distinct* high-score moments it could plausibly contribute?"
+# A 30s clip can hold ~3 separate beats of interest; a 3s Live Photo MOV
+# holds exactly 1. We compute that per-source ceiling, then take the top-K
+# candidates from each source by score. The result: every source gets a
+# fair shot at the plan, but no single source can flood it.
+SECONDS_PER_MOMENT = 10.0      # one distinct "moment" per 10s of footage
+MAX_MOMENTS_PER_SOURCE = 8     # ceiling so no source ever dominates the plan
+SHORT_SOURCE_DURATION_S = 4.0  # stills + sub-4s Live Photo MOVs → budget=1
 
 
-def _average_slot_seconds(cut_points: list[float]) -> float:
-    """Mean inter-beat interval across the cut anchors. Used by subset mode
-    to estimate how many candidates a plan can possibly need."""
-    if len(cut_points) < 2:
-        return 0.0
-    gaps = [cut_points[i + 1] - cut_points[i]
-            for i in range(len(cut_points) - 1)]
-    return sum(gaps) / max(len(gaps), 1)
+def _compute_source_budgets(catalog: dict[str, Any],
+                            candidates: list[Candidate]) -> dict[str, int]:
+    """Per-source moment budget — how many distinct windows from each source
+    are eligible for the plan.
 
+    For each source path present in `candidates`, looks up its
+    `duration_s` in the catalog and computes:
 
-def _subset_filter_candidates(candidates: list[Candidate],
-                              cut_points: list[float],
-                              target_len: float) -> list[Candidate]:
-    """Subset mode (C4): when the Candidate pool dwarfs what a plan can use,
-    drop the bottom-scoring ones until ~1.2× the needed count remains.
+        budget = max(1, ceil(duration_s / SECONDS_PER_MOMENT))
 
-    Operates at the Candidate level (not the source-file level) because
-    `allocate_candidates` already enforces `source_cap`-aware diversity; we
-    only need the top scorers to be available to the greedy walker.
+    capped at `MAX_MOMENTS_PER_SOURCE`. Sources shorter than
+    `SHORT_SOURCE_DURATION_S` (stills + sub-4s Live Photo MOVs) always
+    get exactly budget=1 — they hold one moment by construction.
+
+    Sources that appear in the catalog but produced no Candidates (e.g.
+    banned, suppressed by burst/visual-dup) are absent from the returned
+    dict — there is no budget to spend on a source that has nothing left
+    to offer.
     """
-    n_slots = max(1, len(cut_points) - 1)
-    avg_slot = _average_slot_seconds(cut_points) or 1.0
-    pool_capacity_s = len(candidates) * avg_slot
-    if pool_capacity_s <= target_len * SUBSET_TRIGGER_RATIO:
+    by_source: dict[str, dict[str, Any]] = {
+        c["path"]: c for c in catalog.get("clips", [])
+    }
+    present_sources = {c.source for c in candidates}
+    budgets: dict[str, int] = {}
+    for src in present_sources:
+        clip = by_source.get(src, {})
+        duration = float(clip.get("duration_s", 0.0) or 0.0)
+        if duration <= SHORT_SOURCE_DURATION_S:
+            budgets[src] = 1
+            continue
+        n = int(math.ceil(duration / SECONDS_PER_MOMENT))
+        budgets[src] = max(1, min(n, MAX_MOMENTS_PER_SOURCE))
+    return budgets
+
+
+def _apply_moment_budget(candidates: list[Candidate],
+                         budgets: dict[str, int]) -> list[Candidate]:
+    """Take top-`budgets[source]` candidates from each source by score; drop
+    the rest. Replaces the C4 pool-level subset trim.
+
+    Order of the returned list is unspecified — the allocator re-sorts by
+    score anyway. We preserve the relative order *within* a source so that
+    when two candidates from the same source tie on score, the earlier one
+    (lower `start_s`) wins, matching the legacy `sorted(..., reverse=True)`
+    stable-sort tiebreak.
+    """
+    if not candidates:
         return candidates
-    keep = max(n_slots, int(round(n_slots * SUBSET_KEEP_RATIO)))
-    if keep >= len(candidates):
-        return candidates
-    ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
-    trimmed = ranked[:keep]
-    log(f"  ! subset-mode: pool {len(candidates)} cand → top {len(trimmed)} by "
-        f"score (target {target_len:.1f}s, ~{n_slots} slots)")
-    return trimmed
+    by_src: dict[str, list[Candidate]] = {}
+    for c in candidates:
+        by_src.setdefault(c.source, []).append(c)
+    kept: list[Candidate] = []
+    for src, group in by_src.items():
+        budget = budgets.get(src, 1)
+        # Stable: ties broken by original index (which is `start_s` order
+        # because `build_candidates` walks windows left-to-right).
+        ranked = sorted(group, key=lambda c: c.score, reverse=True)
+        kept.extend(ranked[:budget])
+    return kept
+
+
+def _format_top_source_for_log(budgets: dict[str, int],
+                               catalog: dict[str, Any]) -> str:
+    """Find the source contributing the largest budget and format
+    `<filename> <duration>s` for the log line. Best-effort — returns a
+    fallback string when the catalog can't surface a duration."""
+    if not budgets:
+        return "n/a"
+    top_src = max(budgets, key=lambda s: budgets[s])
+    by_source: dict[str, dict[str, Any]] = {
+        c["path"]: c for c in catalog.get("clips", [])
+    }
+    duration = float(by_source.get(top_src, {}).get("duration_s", 0.0) or 0.0)
+    name = os.path.basename(top_src) or top_src
+    return f"{name} {duration:.1f}s"
 
 
 def _plan_total_duration_s(plan_entries: list[dict[str, Any]]) -> float:
@@ -728,9 +806,14 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     `STRETCH_MAX_STILL_DURATION_S`, and dilate the trailing entries' beat
     slots up to `STRETCH_TAIL_FACTOR×`. Each lever logs a single line.
 
-    Subset mode (C4): when the Candidate pool is much larger than the
-    target can consume, the bottom-scoring candidates are dropped before
-    `allocate_candidates` runs. Logged. Avoids quality dilution.
+    Moment-budget mode (F3, replaces C4 subset mode): every source in the
+    catalog gets a per-source "moment budget" — `ceil(duration / 10s)`
+    capped at 8 — and the candidate pool is trimmed to the top-K windows
+    per source by score. This guarantees every source contributes to the
+    plan (no more "25 out of 61 sources" pool concentration) while still
+    keeping the highest-scoring windows from each. The allocator then uses
+    each source's budget as its per-source repetition cap, with the
+    user-supplied `source_cap` enforced as a hard ceiling.
     """
     # Map source path → original clip dict so we can attach face data + dims.
     by_source = {c["path"]: c for c in catalog["clips"]}
@@ -744,18 +827,36 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     candidates = _suppress_bursts(candidates, by_source, window_s=burst_window_s)
     candidates = _suppress_visual_duplicates(candidates, by_source)
     cut_points = select_cut_points(song, target_len, pace)
-    # Subset mode runs BEFORE allocate so the greedy walker never sees the
-    # low-score noise. Composes with the suppress-* filters above (which trim
-    # near-duplicates) — order matters: duplicates first (cluster-aware), then
-    # the global top-N cut. Reversing would let a low-scoring twin survive.
-    candidates = _subset_filter_candidates(candidates, cut_points, target_len)
+
+    # F3 moment-budget pass — replaces the C4 pool-level top-N subset trim.
+    # The old subset mode sorted ALL candidates globally by score and kept
+    # the top N. That dropped low-scoring sources entirely (a "loud" GoPro
+    # crowded out 60 other cameras' best moments). The new pass instead
+    # asks "how many distinct moments can each source plausibly contribute?"
+    # and keeps the top-K per source. The burst-suppress + visual-duplicate
+    # passes above remain — those are PER-CLIP cleanups (same-camera burst,
+    # same-look-everywhere), not pool reductions, so they compose cleanly
+    # with the per-source budget.
+    source_budgets = _compute_source_budgets(catalog, candidates)
+    if source_budgets:
+        budget_values = sorted(source_budgets.values())
+        n_sources = len(budget_values)
+        budget_sum = sum(budget_values)
+        median = budget_values[n_sources // 2]
+        max_budget = budget_values[-1]
+        log(f"moment budget: {n_sources} sources, sum={budget_sum} "
+            f"(median={median}, max={max_budget} from "
+            f"{_format_top_source_for_log(source_budgets, catalog)})")
+    candidates = _apply_moment_budget(candidates, source_budgets)
+
     # Section-aware allocation only fires for pace=auto. fast/medium/slow
     # are kept deliberately predictable per the IMPROVEMENT_PLAN.md spec:
     # "Preserve manual fast, medium, and slow modes for predictable behavior."
     alloc_sections = song.get("sections") if pace == "auto" else None
     picks = allocate_candidates(candidates, cut_points,
                                 source_cap=source_cap,
-                                sections=alloc_sections)
+                                sections=alloc_sections,
+                                source_budgets=source_budgets)
 
     # Stretch mode lever 1 (C3): if the greedy allocator left obvious holes
     # (`< STRETCH_FILL_RATIO × n_slots` picked) AND the caller is still at
@@ -770,10 +871,13 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             and source_cap == 1):
         new_cap = min(source_cap + 1, STRETCH_MAX_SOURCE_CAP)
         # Re-run the greedy walker with a slightly looser cap. We use the
-        # same Candidate list — bursts/visual-dups/subset already pruned it.
+        # same Candidate list — bursts/visual-dups/moment-budget already
+        # pruned it. The per-source budgets still apply (clamped by
+        # `new_cap`) so the retry can't suddenly let one source dominate.
         retry_picks = allocate_candidates(candidates, cut_points,
                                           source_cap=new_cap,
-                                          sections=alloc_sections)
+                                          sections=alloc_sections,
+                                          source_budgets=source_budgets)
         if len(retry_picks) > len(picks):
             log(f"  ! stretch-mode: bumped source_cap {source_cap} → {new_cap} "
                 f"to fill {target_len:.1f}s ({len(picks)} → {len(retry_picks)} "
@@ -1010,7 +1114,17 @@ def cmd_score(args: argparse.Namespace) -> None:
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):
         decide_transitions(entries, song, mode=tmode)
-    log(f"Built {len(entries)} cuts over {target_len:.1f}s")
+    # Coverage: how many source files actually contributed an entry vs. how
+    # many were available in the catalog. The "3 had no in-range moments"
+    # tail surfaces sources that fell out at burst-suppress / visual-dup /
+    # moment-budget time so the user can see catalog → plan attrition.
+    used_sources = {e["source"] for e in entries}
+    total_sources = len({c.get("path") for c in catalog.get("clips", [])
+                         if c.get("path")})
+    unused = max(0, total_sources - len(used_sources))
+    tail = f" ({unused} had no in-range moments)" if unused else ""
+    log(f"built {len(entries)} cuts over {target_len:.1f}s — "
+        f"{len(used_sources)}/{total_sources} sources used{tail}")
 
     # Heuristic: pace=auto produces beat anchors based on tempo + energy.
     # If the planner emitted noticeably fewer cuts than the target window's

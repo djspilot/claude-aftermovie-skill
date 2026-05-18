@@ -112,6 +112,29 @@ class RenderJob:
     finished_at: float | None = None
 
 
+@dataclass
+class ImportJob:
+    """Mutable state of one in-flight (or finished) import.
+
+    Mirrors `RenderJob` shape — same lifecycle (`running` → `done`/`error`),
+    same `log_tail` deque so `_LogCapture` can be reused unchanged. Adds
+    progress counters (`copied`, `skipped`, `failed`, `total`) and the
+    `dest_folder` the worker is writing into.
+    """
+
+    job_id: str
+    state: str = "running"  # "running" | "done" | "error"
+    copied: int = 0
+    skipped: int = 0
+    failed: int = 0
+    total: int = 0
+    dest_folder: str | None = None
+    error: str | None = None
+    log_tail: deque[str] = field(default_factory=lambda: deque(maxlen=200))
+    started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+
+
 # Whitelist of render overrides — only known knobs flow through. Kept at
 # module level so it's discoverable and the test suite can assert against it.
 ALLOWED_RENDER_OVERRIDES = frozenset({
@@ -133,9 +156,13 @@ def _kind_for(p: Path, live_movs: set[str]) -> str:
 
 
 class _LogCapture(io.TextIOBase):
-    """A tee-style stderr replacement that pushes each line into a job's log_tail."""
+    """A tee-style stderr replacement that pushes each line into a job's log_tail.
 
-    def __init__(self, job: RenderJob, mirror: io.TextIOBase | None) -> None:
+    Works for any object with a `log_tail: deque[str]` attribute — currently
+    `RenderJob` and `ImportJob` both qualify.
+    """
+
+    def __init__(self, job: "RenderJob | ImportJob", mirror: io.TextIOBase | None) -> None:
         super().__init__()
         self._job = job
         self._mirror = mirror
@@ -209,6 +236,68 @@ def _run_render_job(
         job.finished_at = time.time()
 
 
+def _run_import_job(
+    job: ImportJob,
+    sources: list[Any],
+    since: "Any",
+    until: "Any",
+    dest_folder: Path,
+    dry_run: bool,
+) -> None:
+    """Worker thread: walk each `ImportSource`, copy items, update `job`.
+
+    `sources` is a list of `ImportSource` instances already filtered to the
+    user's selection. `since` / `until` are `datetime` objects passed straight
+    through to each source's `list_in_range`. On `dry_run=True` we only count
+    items via `list_in_range` and never call `copy_into`.
+    """
+    saved_stderr = sys.stderr
+    sys.stderr = _LogCapture(job, saved_stderr if sys.stderr is not None else None)
+    try:
+        # First pass: discover items per source so we know the grand total.
+        items_per_source: list[tuple[Any, list[Any]]] = []
+        for src in sources:
+            items = list(src.list_in_range(since, until))
+            items_per_source.append((src, items))
+            job.total += len(items)
+
+        if dry_run:
+            job.state = "done"
+            return
+
+        dest_folder.mkdir(parents=True, exist_ok=True)
+
+        def _progress_cb(event: str, _item: Any = None) -> None:
+            # `copy_into` is expected to call this with one of:
+            # "copied" | "skipped" | "failed" per item processed.
+            if event == "copied":
+                job.copied += 1
+            elif event == "skipped":
+                job.skipped += 1
+            elif event == "failed":
+                job.failed += 1
+
+        for src, items in items_per_source:
+            if not items:
+                continue
+            result = src.copy_into(items, dest_folder, progress_cb=_progress_cb)
+            # If the source didn't drive progress_cb, fall back to its tally.
+            if result is not None and (job.copied + job.skipped + job.failed) == 0:
+                job.copied += getattr(result, "copied", 0)
+                job.skipped += getattr(result, "skipped", 0)
+                job.failed += getattr(result, "failed", 0)
+        job.state = "done"
+    except Exception as e:
+        tb = traceback.format_exc()
+        job.error = f"{type(e).__name__}: {e}"
+        for line in tb.splitlines():
+            job.log_tail.append(line)
+        job.state = "error"
+    finally:
+        sys.stderr = saved_stderr
+        job.finished_at = time.time()
+
+
 # ---- the service -----------------------------------------------------------
 
 class SelectionService:
@@ -227,6 +316,7 @@ class SelectionService:
         song_default: Path | None = None,
         *,
         render_runner: "Any" = None,
+        import_runner: "Any" = None,
     ) -> None:
         self.clips_root = Path(clips_root).expanduser().resolve()
         self.song_default = song_default
@@ -234,9 +324,15 @@ class SelectionService:
         # in the same process don't share state.
         self._jobs: dict[str, RenderJob] = {}
         self._jobs_lock = threading.Lock()
+        # Import-job tracking — separate dict so render and import job IDs
+        # never collide and either Module can evolve independently.
+        self._import_jobs: dict[str, ImportJob] = {}
+        self._import_jobs_lock = threading.Lock()
         # Render dispatch is parameterized so tests can stub `run_auto`
         # without monkey-patching the module-level import.
         self._render_runner = render_runner or _run_render_job
+        # Same pattern for the import worker so tests can stub it out.
+        self._import_runner = import_runner or _run_import_job
 
     # ---- source discovery ----
 
@@ -484,4 +580,100 @@ class SelectionService:
             "log_tail": "\n".join(job.log_tail),
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+        }
+
+    # ---- import jobs ----
+
+    def available_import_sources(self) -> list[dict[str, Any]]:
+        """Return `[{name, label, available}]` for each known ImportSource.
+
+        Lazy import of `aftermovie.import_sources` so the (parallel) backend
+        Module landing late doesn't break the rest of the service. The HTTP
+        Adapter catches `ModuleNotFoundError` and returns 503 to the GUI.
+        """
+        from aftermovie.import_sources import all_sources  # local: lazy
+        rows: list[dict[str, Any]] = []
+        for src in all_sources():
+            try:
+                avail = bool(src.available())
+            except Exception:
+                avail = False
+            rows.append({
+                "name": src.name,
+                "label": src.label,
+                "available": avail,
+            })
+        return rows
+
+    def start_import(
+        self,
+        since: str,
+        until: str,
+        source_names: list[str],
+        dest_parent: str | Path | None = None,
+        dry_run: bool = False,
+    ) -> ImportJob:
+        """Kick off an import in a worker thread; return the new `ImportJob`.
+
+        `since` / `until` are ISO `YYYY-MM-DD` strings; they're parsed here
+        (a `ValueError` bubbles up so the HTTP Adapter can map it to 400).
+        `source_names` selects which `ImportSource`s to drive; unknown names
+        are silently dropped so a stale GUI selection doesn't error out.
+        """
+        from datetime import datetime as _dt
+
+        from aftermovie.import_sources import all_sources  # local: lazy
+
+        # Date parsing — fromisoformat raises ValueError on garbage like "tomorrow".
+        since_dt = _dt.fromisoformat(since)
+        until_dt = _dt.fromisoformat(until)
+
+        if not source_names:
+            raise ValueError("at least one source name is required")
+
+        # Filter `all_sources()` down to the user's selection, preserving the
+        # order they requested so the worker's traversal is deterministic.
+        by_name = {s.name: s for s in all_sources()}
+        selected = [by_name[n] for n in source_names if n in by_name]
+        if not selected:
+            raise ValueError("none of the requested sources are known")
+
+        parent = Path(dest_parent).expanduser() if dest_parent else (
+            Path.home() / "Movies" / "aftermovie-imports"
+        )
+        dest_folder = parent / f"{since}_to_{until}"
+
+        job = ImportJob(job_id=str(uuid.uuid4()), dest_folder=str(dest_folder))
+        with self._import_jobs_lock:
+            self._import_jobs[job.job_id] = job
+        worker = threading.Thread(
+            target=self._import_runner,
+            args=(job, selected, since_dt, until_dt, dest_folder, dry_run),
+            name=f"import-{job.job_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
+        return job
+
+    def import_status(self, job_id: str) -> dict[str, Any] | None:
+        """Snapshot of import `job_id` as a JSON-friendly dict, or None.
+
+        Shape matches the HTTP contract the GUI is hard-coded against:
+        `{job_id, state, copied, skipped, failed, total, dest_folder,
+        error, log_tail}`. None → the HTTP Adapter renders 404.
+        """
+        with self._import_jobs_lock:
+            job = self._import_jobs.get(job_id)
+        if job is None:
+            return None
+        return {
+            "job_id": job.job_id,
+            "state": job.state,
+            "copied": job.copied,
+            "skipped": job.skipped,
+            "failed": job.failed,
+            "total": job.total,
+            "dest_folder": job.dest_folder,
+            "error": job.error,
+            "log_tail": "\n".join(job.log_tail),
         }

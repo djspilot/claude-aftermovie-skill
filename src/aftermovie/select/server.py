@@ -12,6 +12,9 @@ Endpoints (all JSON unless otherwise noted):
     POST /api/preferences           → save .aftermovie-preferences.json
     POST /api/render                → launch run_auto in a worker thread → {job_id}
     GET  /api/status/<job_id>       → {state, output_path, log_tail}
+    GET  /api/import-sources        → [{name, label, available}, ...]
+    POST /api/import                → launch import worker → {job_id, dest_folder}
+    GET  /api/import-status/<job_id> → {state, copied, skipped, failed, total, ...}
 
 The server is intentionally synchronous and single-threaded except for the
 render worker (one per render job). Stdlib HTTPServer is the only
@@ -110,6 +113,13 @@ class _Handler(BaseHTTPRequestHandler):
             if m:
                 self._serve_status(m.group(1))
                 return
+            if route == "/api/import-sources":
+                self._serve_import_sources()
+                return
+            m = re.match(r"^/api/import-status/([A-Za-z0-9\-]+)$", route)
+            if m:
+                self._serve_import_status(m.group(1))
+                return
             # Static sibling files (app.js, style.css, any future assets).
             # Restricted to `static_dir` so we can't escape via ../ traversal.
             if self.static_dir is not None and "/" not in route.lstrip("/")[1:]:
@@ -140,6 +150,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if route == "/api/render":
                 self._handle_render(self._read_json())
+                return
+            if route == "/api/import":
+                self._handle_import(self._read_json())
                 return
             self._send_json({"error": "not_found", "path": route}, status=404)
         except Exception as e:
@@ -233,6 +246,36 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_render(self, body: dict[str, Any]) -> None:
         job = self.service.start_render(body)
         self._send_json({"job_id": job.job_id})
+
+    def _serve_import_sources(self) -> None:
+        try:
+            self._send_json(self.service.available_import_sources())
+        except ModuleNotFoundError:
+            self._send_json({"error": "import_module_missing"}, status=503)
+
+    def _serve_import_status(self, job_id: str) -> None:
+        body = self.service.import_status(job_id)
+        if body is None:
+            self._send_json({"error": "not_found", "job_id": job_id}, status=404)
+            return
+        self._send_json(body)
+
+    def _handle_import(self, body: dict[str, Any]) -> None:
+        try:
+            job = self.service.start_import(
+                since=str(body.get("since", "")),
+                until=str(body.get("until", "")),
+                source_names=list(body.get("sources") or []),
+                dest_parent=body.get("dest_parent"),
+                dry_run=bool(body.get("dry_run", False)),
+            )
+        except ValueError as e:
+            self._send_json({"error": "bad_request", "detail": str(e)}, status=400)
+            return
+        except ModuleNotFoundError:
+            self._send_json({"error": "import_module_missing"}, status=503)
+            return
+        self._send_json({"job_id": job.job_id, "dest_folder": job.dest_folder})
 
 
 # ---- server boot ------------------------------------------------------------

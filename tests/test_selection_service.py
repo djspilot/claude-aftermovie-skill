@@ -24,6 +24,7 @@ from aftermovie.analyze.selection import (
 )
 from aftermovie.select.service import (
     ALLOWED_RENDER_OVERRIDES,
+    ImportJob,
     RenderJob,
     SelectionService,
 )
@@ -327,3 +328,193 @@ def test_start_render_filters_unknown_overrides(
     # Sanity check: the whitelist is the source of truth.
     assert "secret_back_door" not in ALLOWED_RENDER_OVERRIDES
     assert "theme" in ALLOWED_RENDER_OVERRIDES
+
+
+# ---- import sources / start_import / import_status -------------------------
+
+class _FakeImportItem:
+    """Stand-in for `aftermovie.import_sources.ImportItem` — duck-typed."""
+
+    def __init__(self, src_path: str, kind: str = "video", size_bytes: int = 1024,
+                 source_label: str = "fake") -> None:
+        self.src_path = src_path
+        self.captured_at = 0.0
+        self.kind = kind
+        self.size_bytes = size_bytes
+        self.source_label = source_label
+        self.extra = {}
+
+
+class _FakeCopyResult:
+    def __init__(self, copied: int = 0, skipped: int = 0, failed: int = 0,
+                 bytes_written: int = 0, dest_folder: str = "") -> None:
+        self.copied = copied
+        self.skipped = skipped
+        self.failed = failed
+        self.bytes_written = bytes_written
+        self.dest_folder = dest_folder
+
+
+class _FakeSource:
+    """Duck-typed `ImportSource` for service tests; tracks calls."""
+
+    def __init__(self, name: str = "fake", label: str = "Fake",
+                 items: list[_FakeImportItem] | None = None,
+                 available: bool = True) -> None:
+        self.name = name
+        self.label = label
+        self._items = items or []
+        self._available = available
+        self.copy_calls: list[tuple] = []
+
+    def available(self) -> bool:
+        return self._available
+
+    def list_in_range(self, since, until):
+        return list(self._items)
+
+    def copy_into(self, items, dest_folder, progress_cb=None):
+        self.copy_calls.append((list(items), Path(dest_folder)))
+        for _ in items:
+            if progress_cb is not None:
+                progress_cb("copied")
+        return _FakeCopyResult(copied=len(items), dest_folder=str(dest_folder))
+
+
+def _install_fake_import_module(monkeypatch, sources: list[_FakeSource]) -> None:
+    """Inject a fake `aftermovie.import_sources` Module exporting `all_sources`.
+
+    The real Module is being built by a parallel agent; this lets the service
+    tests run regardless of whether that work has landed.
+    """
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("aftermovie.import_sources")
+    fake_mod.all_sources = lambda: list(sources)  # type: ignore[attr-defined]
+    fake_mod.ImportItem = _FakeImportItem  # type: ignore[attr-defined]
+    fake_mod.CopyResult = _FakeCopyResult  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aftermovie.import_sources", fake_mod)
+
+
+def test_available_import_sources_projects_each_source(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """`available_import_sources` returns `{name, label, available}` per source."""
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    _install_fake_import_module(monkeypatch, [
+        _FakeSource(name="photos_library", label="Photos library", available=True),
+        _FakeSource(name="gopro_X", label="GoPro X", available=False),
+    ])
+    svc = SelectionService(clips_dir)
+
+    rows = svc.available_import_sources()
+    assert len(rows) >= 1
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["photos_library"] == {
+        "name": "photos_library", "label": "Photos library", "available": True,
+    }
+    assert by_name["gopro_X"]["available"] is False
+
+
+def test_start_import_happy_path_copies_items(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """`start_import` runs the worker; status reaches `done` with copied=2."""
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    items = [
+        _FakeImportItem(src_path=str(fixtures_dir / "clip_a.mp4")),
+        _FakeImportItem(src_path=str(fixtures_dir / "clip_b.mp4")),
+    ]
+    fake = _FakeSource(name="fake", label="Fake", items=items)
+    _install_fake_import_module(monkeypatch, [fake])
+
+    dest_parent = tmp_path / "imports"
+    svc = SelectionService(clips_dir)
+    job = svc.start_import(
+        since="2026-05-15",
+        until="2026-05-18",
+        source_names=["fake"],
+        dest_parent=str(dest_parent),
+    )
+    assert isinstance(job, ImportJob)
+    assert job.dest_folder == str(dest_parent / "2026-05-15_to_2026-05-18")
+
+    # Wait for the worker (sub-millisecond stub; cap at 2s).
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        snap = svc.import_status(job.job_id)
+        assert snap is not None
+        if snap["state"] != "running":
+            break
+        time.sleep(0.02)
+
+    snap = svc.import_status(job.job_id)
+    assert snap is not None, "job vanished from the import-job dict"
+    assert snap["state"] == "done", snap
+    assert snap["copied"] == 2
+    assert snap["total"] == 2
+    assert snap["failed"] == 0
+    assert snap["dest_folder"] == str(dest_parent / "2026-05-15_to_2026-05-18")
+    assert Path(snap["dest_folder"]).is_dir()
+    assert len(fake.copy_calls) == 1
+
+
+def test_start_import_dry_run_skips_copy(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """`dry_run=True` counts items via `list_in_range`; no `copy_into` call."""
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    items = [_FakeImportItem(src_path="a"), _FakeImportItem(src_path="b"),
+             _FakeImportItem(src_path="c")]
+    fake = _FakeSource(name="fake", label="Fake", items=items)
+    _install_fake_import_module(monkeypatch, [fake])
+
+    svc = SelectionService(clips_dir)
+    job = svc.start_import(
+        since="2026-05-15",
+        until="2026-05-18",
+        source_names=["fake"],
+        dest_parent=str(tmp_path / "imports"),
+        dry_run=True,
+    )
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        snap = svc.import_status(job.job_id)
+        assert snap is not None
+        if snap["state"] != "running":
+            break
+        time.sleep(0.02)
+
+    snap = svc.import_status(job.job_id)
+    assert snap is not None
+    assert snap["state"] == "done"
+    assert snap["copied"] == 0
+    assert snap["total"] == 3
+    assert fake.copy_calls == [], "copy_into should not be called on dry_run"
+
+
+def test_start_import_bad_date_format_raises(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch,
+) -> None:
+    """Garbage `since` raises ValueError — HTTP layer catches it for 400."""
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    _install_fake_import_module(monkeypatch, [_FakeSource()])
+    svc = SelectionService(clips_dir)
+
+    with pytest.raises(ValueError):
+        svc.start_import(
+            since="tomorrow",
+            until="2026-05-18",
+            source_names=["fake"],
+        )
+
+
+def test_import_status_unknown_returns_none(
+    tmp_path: Path, fixtures_dir: Path,
+) -> None:
+    """Unknown job_id → None (HTTP Adapter renders 404)."""
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    svc = SelectionService(clips_dir)
+    assert svc.import_status("no-such-import-job") is None

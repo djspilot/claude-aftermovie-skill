@@ -397,3 +397,37 @@ def test_import_status_unknown_returns_404(
             assert e.code == 404
             payload = json.loads(e.read())
             assert payload["error"] == "not_found"
+
+
+# ---- Phase A2/A3 progress fields on /api/status/<job> ----------------------
+
+def test_render_status_includes_progress_fields_with_defaults(
+    tmp_path: Path, fixtures_dir: Path,
+) -> None:
+    """`/api/status/<id>` carries `stage`/`stage_index`/`stage_total`/
+    `progress_percent`/`eta_s`/`current_ffmpeg_pid`/`cpu_seconds_used`
+    with sensible defaults when the worker hasn't fired a progress event yet.
+    """
+    from aftermovie.select.service import RenderJob
+
+    clear_cache()
+    clips_dir = _seed_folder(tmp_path, fixtures_dir)
+    port = _free_port()
+    with SelectServer(clips_dir, port=port) as srv:
+        # Inject a freshly-allocated RenderJob via the service so we can
+        # query the HTTP payload without actually spawning a worker.
+        job = RenderJob(job_id="status-progress-1")
+        with srv.service._jobs_lock:
+            srv.service._jobs[job.job_id] = job
+
+        status, body, _ = _http_get(f"{srv.url}api/status/{job.job_id}")
+    assert status == 200
+    payload = json.loads(body)
+    # Every Phase A field is present, even before the first progress event.
+    assert payload["stage"] == ""
+    assert payload["stage_index"] == 0
+    assert payload["stage_total"] == 0
+    assert payload["progress_percent"] == 0.0
+    assert payload["eta_s"] is None
+    assert payload["current_ffmpeg_pid"] is None
+    assert payload["cpu_seconds_used"] == 0.0

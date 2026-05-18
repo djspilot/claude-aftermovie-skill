@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aftermovie — pick your clips</title>
-  <link rel="stylesheet" href="style.css?v=7">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
   <header class="topbar">
@@ -145,6 +145,15 @@
     <div class="modal-card">
       <h2 id="modal-title">Rendering…</h2>
       <div id="modal-state" class="modal-state">starting…</div>
+      <div class="render-progress-row">
+        <progress id="render-progress" class="render-progress" value="0" max="100"
+                  aria-label="Render progress"></progress>
+        <div class="render-progress-meta">
+          <span id="render-stage-label" class="render-stage-label">idle</span>
+          <span id="render-eta" class="render-eta"></span>
+          <span id="render-cpu" class="render-cpu"></span>
+        </div>
+      </div>
       <pre id="modal-log" class="modal-log" aria-label="Render log"></pre>
       <div id="modal-result" class="modal-result hidden">
         <p>Output:</p>
@@ -194,6 +203,6 @@
     </div>
   </template>
 
-  <script src="app.js?v=7" defer></script>
+  <script src="app.js?v=8" defer></script>
 </body>
 </html>

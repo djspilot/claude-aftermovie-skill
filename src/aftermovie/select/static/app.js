@@ -45,6 +45,10 @@
     modal: $("#modal"),
     modalState: $("#modal-state"),
     modalLog: $("#modal-log"),
+    renderProgress: $("#render-progress"),
+    renderStageLabel: $("#render-stage-label"),
+    renderEta: $("#render-eta"),
+    renderCpu: $("#render-cpu"),
     modalResult: $("#modal-result"),
     modalPath: $("#modal-path"),
     modalClose: $("#modal-close"),
@@ -365,7 +369,9 @@
       if (currentIsPreview && s && s.cache_hit) {
         els.cacheIndicator.classList.remove("hidden");
       }
+      updateRenderProgress(s);
       if (s.state === "done") {
+        finalizeProgressBar();
         showResult(s.output_path || "");
         els.render.disabled = false;
         els.renderPreviewBtn.disabled = false;
@@ -410,10 +416,63 @@
     els.modalState.className = `modal-state${cls ? " " + cls : ""}`;
   }
 
+  // Per-stage labels — keep the codebase's terminology (prerender Entry,
+  // assemble, mux) instead of generic "encoding / muxing".
+  const STAGE_LABELS = {
+    "": "idle",
+    analyze: "Analyzing source folder",
+    score: "Scoring candidates",
+    prerender: "Prerendering Entry",
+    assemble: "Assembling cuts",
+    mux: "Muxing audio",
+    done: "Done",
+    error: "Error",
+  };
+
+  function formatEta(seconds) {
+    if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return "";
+    if (seconds < 60) return `~${Math.ceil(seconds)}s left`;
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `~${m}m${s.toString().padStart(2, "0")}s left`;
+  }
+
+  function updateRenderProgress(s) {
+    if (!s) return;
+    const pct = Math.max(0, Math.min(100, Number(s.progress_percent) || 0));
+    els.renderProgress.value = pct;
+    const stageBase = STAGE_LABELS[s.stage] != null ? STAGE_LABELS[s.stage] : s.stage;
+    let label = stageBase;
+    if (s.stage === "prerender" && s.stage_total > 0) {
+      label = `${stageBase} ${s.stage_index} of ${s.stage_total}`;
+    }
+    els.renderStageLabel.textContent = `${label}  ·  ${pct.toFixed(1)}%`;
+    els.renderEta.textContent = formatEta(s.eta_s);
+    if (typeof s.cpu_seconds_used === "number" && s.cpu_seconds_used > 0) {
+      els.renderCpu.textContent = `CPU ${s.cpu_seconds_used.toFixed(1)}s`;
+    } else {
+      els.renderCpu.textContent = "";
+    }
+  }
+
+  function resetRenderProgress() {
+    if (!els.renderProgress) return;
+    els.renderProgress.value = 0;
+    els.renderStageLabel.textContent = "starting…";
+    els.renderEta.textContent = "";
+    els.renderCpu.textContent = "";
+  }
+
+  function finalizeProgressBar() {
+    els.renderProgress.value = 100;
+    els.renderEta.textContent = "";
+  }
+
   function openModal() {
     els.modal.classList.remove("hidden");
     els.modalResult.classList.add("hidden");
     els.modalLog.textContent = "";
+    resetRenderProgress();
   }
   function closeModal() {
     els.modal.classList.add("hidden");

@@ -46,7 +46,20 @@ def _capture_run(monkeypatch):
         out.write_bytes(b"")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
+    def fake_run_with_progress(cmd, on_progress=None, *, check=True,
+                               total_frames=None, on_pid=None):
+        captured.append(list(cmd))
+        out = Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
     monkeypatch.setattr(render_pipeline, "run", fake_run)
+    # Phase A1 moved the prerender subprocess call from `run` to
+    # `run_with_progress`; stub both so existing tests that introspect the
+    # ffmpeg cmd list keep working without ffmpeg installed.
+    monkeypatch.setattr(render_pipeline, "run_with_progress",
+                        fake_run_with_progress)
     # `_source_has_audio` shells out to ffprobe; stub it so unit tests
     # don't need ffmpeg installed.
     monkeypatch.setattr(render_pipeline, "_source_has_audio", lambda _src: True)

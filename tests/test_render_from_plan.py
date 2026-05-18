@@ -35,7 +35,7 @@ def _patch_pipeline(monkeypatch) -> dict[str, argparse.Namespace]:
         captured["score"] = args
         Path(args.out).write_text(json.dumps({"entries": []}))
 
-    def fake_render(args: argparse.Namespace) -> None:
+    def fake_render(args: argparse.Namespace, **_: object) -> None:
         captured["render"] = args
         Path(args.output).write_bytes(b"")
 

@@ -672,6 +672,58 @@ main {
 .modal-state.error { color: var(--danger); }
 .modal-state.done { color: #6cd47a; }
 
+/* Render progress bar — sits between the modal state line and the log tail.
+   `progress` element styling is intentionally minimal so the dark theme
+   tokens (--accent, --bg-elev, --border) drive the look. The row spans
+   the full card width; the meta line below carries stage label + ETA. */
+.render-progress-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.render-progress {
+  width: 100%;
+  height: 10px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+/* WebKit-flavoured browsers need the inner pseudo-element for the fill. */
+.render-progress::-webkit-progress-bar {
+  background: var(--bg-elev);
+  border-radius: 6px;
+}
+.render-progress::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: 6px;
+  transition: width 250ms ease;
+}
+.render-progress::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: 6px;
+}
+.render-progress-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  gap: 8px;
+}
+.render-stage-label {
+  color: var(--fg);
+  font-weight: 500;
+}
+.render-eta { color: var(--fg-dim); }
+.render-cpu {
+  color: var(--fg-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
 .modal-log {
   background: #0a0b0e;
   border: 1px solid var(--border);

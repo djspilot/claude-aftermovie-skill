@@ -44,7 +44,7 @@ def _patch_pipeline(monkeypatch) -> dict[str, int]:
         }
         Path(args.out).write_text(json.dumps(plan))
 
-    def fake_render(args: argparse.Namespace) -> None:
+    def fake_render(args: argparse.Namespace, **_: object) -> None:
         counts["render"] += 1
         Path(args.output).write_bytes(b"")
 

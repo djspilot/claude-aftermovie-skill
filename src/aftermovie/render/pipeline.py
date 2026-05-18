@@ -9,6 +9,7 @@ Two paths:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import shutil
@@ -32,6 +33,7 @@ from aftermovie.render.encoder import (
     vfilter_output_guard,
 )
 from aftermovie.render.filters import aspect_filter
+from aftermovie.render.parallel import choose_max_workers, parallel_prerender
 from aftermovie.render.prerender_cache import PrerenderCache, PrerenderOpts
 from aftermovie.render.reframe import crop_x_expr_for_entry
 from aftermovie.render.titles import (
@@ -385,6 +387,44 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     return True
 
 
+def _prerender_worker(
+    entry: dict,
+    out_clip: Path,
+    stage_index: int,
+    stage_total: int,
+    *,
+    aspect: str,
+    target_res: str,
+    target_fps: int,
+    lut: Path | None,
+    keep_audio: bool,
+    encoder: EncoderProfile,
+    enable_reframe: bool,
+) -> bool:
+    """Picklable Adapter that calls `_prerender_clip` from a worker process.
+
+    The parallel pool can't ferry a `ProgressCallback` across the process
+    boundary (closures aren't picklable, and even module-level callables
+    would need a reverse Queue to reach the GUI's progress lock). So this
+    Adapter strips `progress_cb` — the parent process emits coalesced
+    `ProgressEvent`s after each future resolves; see
+    `aftermovie.render.parallel.parallel_prerender`.
+
+    Stage_index/total are still threaded in so legacy logs that reference
+    them stay accurate. They're not used to drive progress here.
+    """
+    return _prerender_clip(
+        entry, out_clip,
+        aspect=aspect, target_res=target_res, target_fps=target_fps,
+        lut=lut, keep_audio=keep_audio,
+        encoder=encoder,
+        enable_reframe=enable_reframe,
+        progress_cb=None,
+        stage_index=stage_index,
+        stage_total=stage_total,
+    )
+
+
 def _compensated_render_entry(entry: dict, *, transitions_active: bool,
                               is_first: bool) -> tuple[dict, float, float]:
     """Return (render_entry, planned_duration, prerender_duration).
@@ -431,7 +471,11 @@ def cmd_render(args: argparse.Namespace, *,
     # cheap (one sysctl on darwin, nothing elsewhere) and select_from_env
     # honours AFTERMOVIE_VIDEO_CODEC while falling back gracefully when an
     # env value asks for a profile ffmpeg doesn't ship.
-    encoder = select_from_env(detect_chip())
+    chip = detect_chip()
+    encoder = select_from_env(chip)
+    # B4: pool size from the chip × encoder heuristic, honouring
+    # AFTERMOVIE_RENDER_WORKERS for ops tuning / deterministic CI.
+    max_workers = choose_max_workers(chip, encoder)
 
     # E1: per-clip prerender cache. Lives at ~/.skills-data/aftermovie/
     # prerender-cache/; a single instance is reused for every clip in this
@@ -447,6 +491,7 @@ def cmd_render(args: argparse.Namespace, *,
         f" audio={audio_mix} transitions={'yes' if transitions_active else 'no'}"
         f" titles={'yes' if titles else 'no'}"
         f" encoder={encoder.name}"
+        f" workers={max_workers}"
         f"{' lut=' + lut.name if lut else ''}"
         f"{' cache=on' if cache else ' cache=off'}")
 
@@ -454,36 +499,122 @@ def cmd_render(args: argparse.Namespace, *,
 
     with tempfile.TemporaryDirectory(prefix="aftermovie_") as tmpdir:
         tmp = Path(tmpdir)
-        clip_paths: list[Path] = []
-        durations: list[float] = []
+        # Pre-build the per-slot render entries + output paths. Doing this
+        # upfront keeps the parallel pool ignorant of `_compensated_render_entry`
+        # — the worker just gets a finished entry dict + path. It also lets
+        # us preserve plan order for the post-parallel filter_complex pass
+        # by indexing back into `render_entries` / `durations` using the
+        # same slot index the parallel helper returns paths for.
         render_entries: list[dict] = []
-        planned_total = 0.0
-
+        planned_durations: list[float] = []
+        render_durations: list[float] = []
+        work: list[tuple[dict, Path]] = []
         for i, entry in enumerate(entries):
             render_entry, planned_duration, render_duration = _compensated_render_entry(
                 entry, transitions_active=transitions_active, is_first=(i == 0)
             )
+            render_entries.append(render_entry)
+            planned_durations.append(planned_duration)
+            render_durations.append(render_duration)
+            work.append((render_entry, tmp / f"clip_{i:04d}.mp4"))
 
-            out_clip = tmp / f"clip_{i:04d}.mp4"
-            ok = _prerender_clip(
-                render_entry, out_clip,
-                aspect=aspect, target_res=target_res, target_fps=target_fps,
-                lut=lut, keep_audio=keep_audio,
-                encoder=encoder,
-                enable_reframe=enable_reframe,
-                progress_cb=progress_cb,
-                stage_index=i + 1,
-                stage_total=n_entries,
-                cache=cache,
-            )
-            if not ok:
+        # E1: consult the prerender cache up-front on the main thread.
+        # Cache hits skip the parallel pool entirely (their `out_clip`
+        # gets hard-linked from the cache); only misses are dispatched
+        # to workers. Lookup is cheap (one hash + one stat).
+        prerender_opts = PrerenderOpts(
+            aspect=aspect, target_res=target_res, fps=target_fps,
+            lut=lut, encoder=encoder, keep_audio=keep_audio,
+            audio_interest_threshold=_audio_interest_threshold(),
+        ) if cache is not None else None
+
+        cache_hits: dict[int, Path] = {}
+        cache_keys: dict[int, str] = {}
+        work_misses: list[tuple[int, dict, Path]] = []
+        for idx, (entry, out_clip) in enumerate(work):
+            if cache is not None and prerender_opts is not None:
+                key = cache.key_for(entry, prerender_opts)
+                hit = cache.get(key)
+                if hit is not None:
+                    # Materialize into the workdir at the expected path so
+                    # the downstream assemble pass treats it like a freshly
+                    # rendered clip. Hard-link is cheap (same inode); fall
+                    # back to copy when the cache lives on a different
+                    # volume from the temp dir.
+                    out_clip.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        out_clip.unlink(missing_ok=True)
+                        os.link(hit, out_clip)
+                    except OSError:
+                        import shutil as _shutil
+                        _shutil.copy2(hit, out_clip)
+                    cache_hits[idx] = out_clip
+                    # Synthetic 100% progress so the GUI bar advances on hits.
+                    if progress_cb is not None:
+                        progress_cb(ProgressEvent(
+                            stage="prerender",
+                            stage_index=idx + 1,
+                            stage_total=n_entries,
+                            fraction_in_stage=1.0,
+                            current_pid=None,
+                        ))
+                    continue
+                cache_keys[idx] = key
+            work_misses.append((idx, entry, out_clip))
+
+        # B4: factory binds the encode flags so the parallel helper only
+        # sees `(entry, out_clip, idx, total) -> bool`. `functools.partial`
+        # over a module-level function is picklable, which keeps the
+        # ProcessPoolExecutor path viable.
+        factory = functools.partial(
+            _prerender_worker,
+            aspect=aspect, target_res=target_res, target_fps=target_fps,
+            lut=lut, keep_audio=keep_audio,
+            encoder=encoder,
+            enable_reframe=enable_reframe,
+        )
+
+        # parallel_prerender only sees the misses; results align with
+        # `work_misses` in order.
+        miss_work = [(entry, out_clip) for _, entry, out_clip in work_misses]
+        miss_results = parallel_prerender(
+            miss_work, factory,
+            max_workers=max_workers,
+            progress_cb=progress_cb,
+            encoder_name=encoder.name,
+        ) if miss_work else []
+
+        # On miss completion, populate the cache so the next render reuses.
+        if cache is not None:
+            for (orig_idx, _entry, _out), result in zip(work_misses, miss_results):
+                if result is not None and orig_idx in cache_keys:
+                    try:
+                        cache.put(cache_keys[orig_idx], result)
+                    except Exception as e:
+                        log(f"  ! prerender_cache.put failed: {e}")
+
+        # Stitch cache hits + miss results back together in plan order.
+        prerender_results: list[Path | None] = [None] * n_entries
+        for idx, out_clip in cache_hits.items():
+            prerender_results[idx] = out_clip
+        for (orig_idx, _, _), result in zip(work_misses, miss_results):
+            prerender_results[orig_idx] = result
+
+        # Filter dropped clips, preserving plan order. `parallel_prerender`
+        # returns `None` in failed slots — same skip semantics as the
+        # legacy for-loop's `if not ok: continue`.
+        clip_paths: list[Path] = []
+        durations: list[float] = []
+        kept_render_entries: list[dict] = []
+        planned_total = 0.0
+        for idx, out_clip in enumerate(prerender_results):
+            if out_clip is None:
                 continue
             clip_paths.append(out_clip)
-            render_entries.append(render_entry)
-            planned_total += planned_duration
-            # The prerender pads to `out_duration_s` so beat-sync holds even
-            # when the source ran short. Use that as the authoritative duration.
-            durations.append(render_duration)
+            kept_render_entries.append(render_entries[idx])
+            planned_total += planned_durations[idx]
+            durations.append(render_durations[idx])
+        render_entries = kept_render_entries
 
         if not clip_paths:
             sys.exit("No clips rendered. Aborting.")

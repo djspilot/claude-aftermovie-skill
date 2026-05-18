@@ -162,6 +162,25 @@
         toggle(node, src.path);
       }
     });
+
+    // Wire the favorite/ban buttons (defined in the preferences section
+    // below). stopPropagation so clicking a pref button doesn't also flip
+    // the cell's selection state via the cell-level click handler above.
+    const favBtn = node.querySelector(".pref-fav");
+    const banBtn = node.querySelector(".pref-ban");
+    if (favBtn) {
+      favBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        togglePreference(node, src.path, "favorited");
+      });
+    }
+    if (banBtn) {
+      banBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        togglePreference(node, src.path, "banned");
+      });
+    }
+    applyPreferenceClasses(node, src.path);
     return node;
   }
 
@@ -536,6 +555,85 @@
     return i >= 0 ? p.slice(i + 1) : p;
   }
 
+  // -------- Preferences (favorite / ban) --------
+  // Per-folder preferences sidecar (.aftermovie-preferences.json). Persisted
+  // through POST /api/preferences (debounced) and hydrated on load through
+  // GET /api/preferences. Favoriting a clip boosts every Candidate from it
+  // by +2.0 in the scorer; banning a clip drops it from the candidate pool
+  // entirely. Both controls are independent of the selection toggle.
+  /** @type {Set<string>} */
+  const favorited = new Set();
+  /** @type {Set<string>} */
+  const banned = new Set();
+  /** @type {string[]} reserved — pinning isn't wired through the scorer yet */
+  let pinnedEntries = [];
+  let prefsSaveTimer = null;
+
+  async function loadPreferences() {
+    try {
+      const data = await fetch("/api/preferences").then((r) => {
+        if (!r.ok) throw new Error(`GET /api/preferences -> ${r.status}`);
+        return r.json();
+      });
+      favorited.clear();
+      banned.clear();
+      for (const p of data.favorited || []) favorited.add(p);
+      for (const p of data.banned || []) banned.add(p);
+      pinnedEntries = Array.isArray(data.pinned_entries) ? data.pinned_entries : [];
+      // Re-apply classes to whatever cells already exist (loadSources may
+      // have raced ahead). Cheap: handful of attribute writes per cell.
+      for (const cell of els.grid.children) {
+        const p = cell.dataset.path;
+        if (p) applyPreferenceClasses(cell, p);
+      }
+    } catch (err) {
+      console.warn("Failed to load preferences:", err);
+    }
+  }
+
+  function togglePreference(cell, path, kind) {
+    const target = kind === "favorited" ? favorited : banned;
+    const other = kind === "favorited" ? banned : favorited;
+    if (target.has(path)) {
+      target.delete(path);
+    } else {
+      target.add(path);
+      // Favorite and ban are mutually exclusive — toggling one clears the
+      // other so the visual state can't say "favorite AND banned".
+      other.delete(path);
+    }
+    applyPreferenceClasses(cell, path);
+    schedulePreferenceSave();
+  }
+
+  function applyPreferenceClasses(cell, path) {
+    const isFav = favorited.has(path);
+    const isBan = banned.has(path);
+    cell.classList.toggle("is-favorited", isFav);
+    cell.classList.toggle("is-banned", isBan);
+    const favBtn = cell.querySelector(".pref-fav");
+    const banBtn = cell.querySelector(".pref-ban");
+    if (favBtn) favBtn.setAttribute("aria-pressed", String(isFav));
+    if (banBtn) banBtn.setAttribute("aria-pressed", String(isBan));
+  }
+
+  function schedulePreferenceSave() {
+    if (prefsSaveTimer) clearTimeout(prefsSaveTimer);
+    prefsSaveTimer = setTimeout(savePreferences, 300);
+  }
+
+  async function savePreferences() {
+    try {
+      await api("POST", "/api/preferences", {
+        favorited: [...favorited],
+        banned: [...banned],
+        pinned_entries: pinnedEntries,
+      });
+    } catch (err) {
+      console.warn("Failed to persist preferences:", err);
+    }
+  }
+
   // -------- Wire-up --------
   els.selectAll.addEventListener("click", selectAll);
   els.deselectAll.addEventListener("click", deselectAll);
@@ -550,6 +648,7 @@
   });
 
   loadOptions();
+  loadPreferences();
   // Load sources first so the plan can resolve thumb URLs via path → /thumbs/<key>.jpg.
   loadSources().finally(loadPlan);
 })();

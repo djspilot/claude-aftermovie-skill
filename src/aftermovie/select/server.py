@@ -34,6 +34,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from aftermovie.analyze.capture_time import captured_at_for
+from aftermovie.analyze.preferences import (
+    load_preferences,
+    save_preferences,
+)
 from aftermovie.analyze.selection import (
     SELECTION_FILENAME,
     load_excluded,
@@ -329,6 +333,9 @@ class _Handler(BaseHTTPRequestHandler):
             if route == "/api/plan":
                 self._serve_plan()
                 return
+            if route == "/api/preferences":
+                self._serve_preferences()
+                return
             m = re.match(r"^/thumbs/([A-Fa-f0-9]+)\.jpg$", route)
             if m:
                 self._serve_thumb(m.group(1))
@@ -361,6 +368,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if route == "/api/selection":
                 self._handle_selection(self._read_json())
+                return
+            if route == "/api/preferences":
+                self._handle_preferences(self._read_json())
                 return
             if route == "/api/render":
                 self._handle_render(self._read_json())
@@ -517,6 +527,31 @@ class _Handler(BaseHTTPRequestHandler):
         sidecar = save_excluded(self.clips_root, excluded)
         self._send_json({"ok": True, "sidecar": str(sidecar),
                          "filename": SELECTION_FILENAME, "n_excluded": len(excluded)})
+
+    def _serve_preferences(self) -> None:
+        """Return the current per-folder preferences dict (favorited/banned/pinned)."""
+        prefs = load_preferences(self.clips_root)
+        self._send_json(prefs)
+
+    def _handle_preferences(self, body: dict[str, Any]) -> None:
+        """Persist favorited/banned (and reserved pinned_entries) to the sidecar.
+
+        Any field missing from the request body is treated as an empty list —
+        the GUI always POSTs the full intended state. Non-string entries and
+        non-list values are dropped silently by `save_preferences`.
+        """
+        if not isinstance(body, dict):
+            self._send_json({"error": "bad_request",
+                             "detail": "expected JSON object"},
+                            status=400)
+            return
+        prefs = {
+            "favorited": body.get("favorited", []),
+            "banned": body.get("banned", []),
+            "pinned_entries": body.get("pinned_entries", []),
+        }
+        save_preferences(self.clips_root, prefs)
+        self._send_json({"ok": True})
 
     def _handle_render(self, body: dict[str, Any]) -> None:
         raw_excluded = body.get("excluded")

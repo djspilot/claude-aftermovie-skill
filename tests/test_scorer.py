@@ -235,3 +235,62 @@ def test_missing_quality_lists_skip_penalties():
     _, reasons = score_window(clip, 2, 4)
     assert "blurry" not in reasons
     assert "poor_exposure" not in reasons
+
+
+def test_banned_source_is_dropped_from_candidates():
+    """A path listed in `preferences['banned']` produces zero Candidates."""
+    catalog = {"clips": [
+        _clip("/kept.mp4", duration_s=8.0),
+        _clip("/banned.mp4", duration_s=8.0),
+    ]}
+    candidates = build_candidates(
+        catalog,
+        preferences={"banned": ["/banned.mp4"]},
+    )
+    sources = {c.source for c in candidates}
+    assert "/banned.mp4" not in sources, "banned source leaked into candidate pool"
+    assert "/kept.mp4" in sources
+
+
+def test_favorited_source_gets_boost_and_reason():
+    """Favorited sources gain a flat +2.0 score and a 'user_favorite' reason."""
+    catalog = {"clips": [_clip("/fav.mp4", duration_s=8.0)]}
+    baseline = build_candidates(catalog)
+    boosted = build_candidates(catalog, preferences={"favorited": ["/fav.mp4"]})
+    # Same shape, same source — only the score and reasons differ.
+    assert len(baseline) == len(boosted)
+    by_window = {(c.start_s, c.end_s): c for c in baseline}
+    for c in boosted:
+        match = by_window[(c.start_s, c.end_s)]
+        assert c.score == match.score + 2.0, (
+            f"expected +2.0 boost, got {c.score} vs baseline {match.score}"
+        )
+        assert "user_favorite" in c.reasons
+
+
+def test_build_plan_drops_banned_and_boosts_favorited():
+    """End-to-end: banned source absent from plan; favorited carries its tag."""
+    catalog = {"clips": [
+        _clip("/fav.mp4", duration_s=8.0),
+        _clip("/banned.mp4", duration_s=8.0, hilight_tags_ms=[1000]),
+        _clip("/neutral.mp4", duration_s=8.0),
+    ]}
+    song = {
+        "duration_s": 20.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(40)],
+        "downbeats": [i * 2.0 for i in range(10)],
+        "intro_end_s": 0.0,
+    }
+    plan = build_plan(
+        catalog, song, target_len=12.0, no_speed_ramp=True,
+        source_cap=3,
+        preferences={"favorited": ["/fav.mp4"], "banned": ["/banned.mp4"]},
+    )
+    sources = {e["source"] for e in plan}
+    # The banned clip is gone even though it had the highest objective score.
+    assert "/banned.mp4" not in sources
+    # The favorited clip is present and its entries carry the user_favorite tag.
+    fav_entries = [e for e in plan if e["source"] == "/fav.mp4"]
+    assert fav_entries, "favorited clip should appear in the plan"
+    assert all("user_favorite" in e["reasons"] for e in fav_entries)

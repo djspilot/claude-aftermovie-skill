@@ -20,7 +20,11 @@ from aftermovie.env_config import (
     config_path,
     load_env_file,
 )
-from aftermovie.pipeline_runner import opts_from_namespace, run_auto
+from aftermovie.pipeline_runner import (
+    opts_from_namespace,
+    run_auto,
+    run_render_only,
+)
 from aftermovie.render.pipeline import cmd_render
 from aftermovie.score.scorer import cmd_score
 
@@ -73,6 +77,28 @@ def cmd_auto(args: argparse.Namespace) -> None:
     # then delegate to the shared pipeline_runner so the CLI and MCP
     # surfaces drive the same code path.
     args = _resolved_namespace(args)
+    from_plan = getattr(args, "from_plan", None)
+    if from_plan:
+        # Skip analyze + score — the plan already encodes clips, song, and
+        # all scoring decisions. Only the output path + reveal honour the
+        # CLI namespace; everything else is read from plan.json by cmd_render.
+        plan_path = Path(from_plan).expanduser().resolve()
+        if not plan_path.is_file():
+            raise SystemExit(f"--from-plan path is not a file: {plan_path}")
+        if not getattr(args, "output", None):
+            out_dir = Path(getattr(args, "output_dir", "")
+                           or str(Path.home() / "Downloads")).expanduser()
+            args.output = str(out_dir / f"aftermovie-{plan_path.stem}.mp4")
+            log(f"Output → {args.output}")
+        opts = opts_from_namespace(args)
+        if getattr(args, "no_reveal", None):
+            opts.reveal = False
+        run_render_only(plan_path, Path(args.output), opts)
+        return
+    if not getattr(args, "clips", None) or not getattr(args, "song", None):
+        raise SystemExit(
+            "auto requires --clips and --song (or pass --from-plan PATH)."
+        )
     if not getattr(args, "output", None):
         out_dir = Path(getattr(args, "output_dir", "")
                        or str(Path.home() / "Downloads")).expanduser()
@@ -185,9 +211,26 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--output", required=True)
     pr.set_defaults(func=cmd_render)
 
+    # Alias for discoverability — `render-from-plan` reads more clearly in
+    # docs and chat transcripts than the bare `render` verb. Delegates to
+    # the same handler so behaviour is identical.
+    prfp = sub.add_parser(
+        "render-from-plan",
+        help="Alias for `render` — execute an existing plan.json.",
+    )
+    prfp.add_argument("--plan", required=True)
+    prfp.add_argument("--output", required=True)
+    prfp.set_defaults(func=cmd_render)
+
     pu = sub.add_parser("auto", help="One-shot: analyze → score → render.")
-    pu.add_argument("--clips", required=True)
-    pu.add_argument("--song", required=True)
+    pu.add_argument("--clips", default=None,
+                    help="Folder of source clips. Required unless --from-plan "
+                         "is given (in which case the plan already encodes it).")
+    pu.add_argument("--song", default=None,
+                    help="Song path. Required unless --from-plan is given.")
+    pu.add_argument("--from-plan", dest="from_plan", default=None,
+                    help="Skip analyze + score; render the supplied plan.json "
+                         "directly. --clips/--song become optional.")
     pu.add_argument("--output", default=None,
                     help="Output path. Defaults to "
                          "<AFTERMOVIE_OUTPUT_DIR>/aftermovie-<source>.mp4 "

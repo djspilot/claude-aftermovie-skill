@@ -123,6 +123,26 @@ def opts_from_namespace(args: argparse.Namespace) -> AutoOpts:
     return AutoOpts(**kwargs)
 
 
+def run_render_only(plan: Path, output: Path, opts: AutoOpts | None = None) -> Path:
+    """Skip analyze + score; just dispatch `cmd_render` on an existing plan.
+
+    Used by `aftermovie auto --from-plan` and `aftermovie render-from-plan`
+    so a saved plan can be re-rendered without re-walking the source folder
+    or re-scoring against the song. Honours `opts.reveal` for the macOS
+    Finder reveal at the end (default True for parity with `run_auto`).
+    """
+    plan_path = Path(plan).expanduser().resolve()
+    output_path = Path(output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    r = argparse.Namespace(plan=str(plan_path), output=str(output_path))
+    cmd_render(r)
+
+    if opts is None or opts.reveal:
+        _notify_and_reveal(output_path)
+    return output_path
+
+
 def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts) -> Path:
     """Full analyze → score → render. Returns the output path on success.
 

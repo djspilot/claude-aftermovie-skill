@@ -13,28 +13,31 @@ On-disk schema:
       "version": 1
     }
 
-`is_excluded(path, folder)` is the hot path the analyzer calls per source —
-it caches the parsed JSON per folder so we read each sidecar at most once
-per process (mtime-aware so test runs that rewrite the file see the update).
+`is_excluded(path, folder)` is the hot path the analyzer calls per source.
+The mtime-aware caching, atomic write, and malformed-JSON recovery all live
+in `SidecarStore` (`analyze/sidecar.py`); this Module is a thin Adapter
+that projects the raw sidecar dict into the frozenset shape callers want.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
+
+from aftermovie.analyze.sidecar import SidecarStore
 
 SELECTION_FILENAME = ".aftermovie-selection.json"
 SELECTION_VERSION = 1
 SELECTION_GENERATOR = "aftermovie-select"
 
-# Cache: folder_path_str -> (mtime_ns, frozenset[abs_path_str])
-# Mtime tracking lets tests (and the server) rewrite the sidecar mid-process
-# and have subsequent `is_excluded` calls see the new value.
-_CACHE: dict[str, tuple[int, frozenset[str]]] = {}
+_DEFAULTS: dict[str, list[str]] = {"excluded": []}
 
 
 def selection_path(folder: Path) -> Path:
     """Where the sidecar lives for a clips folder."""
     return folder / SELECTION_FILENAME
+
+
+def _store(folder: Path) -> SidecarStore:
+    return SidecarStore(folder, SELECTION_FILENAME, _DEFAULTS)
 
 
 def load_excluded(folder: Path) -> frozenset[str]:
@@ -44,52 +47,21 @@ def load_excluded(folder: Path) -> frozenset[str]:
     empty set — selection is opt-in; failing closed (i.e. excluding
     nothing) is the safe default.
     """
-    sidecar = selection_path(folder)
-    key = str(folder.resolve())
-    try:
-        st = sidecar.stat()
-    except OSError:
-        # No sidecar — clear any stale cache entry for this folder.
-        _CACHE.pop(key, None)
-        return frozenset()
-
-    cached = _CACHE.get(key)
-    if cached is not None and cached[0] == st.st_mtime_ns:
-        return cached[1]
-
-    try:
-        raw = sidecar.read_text()
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        excluded: frozenset[str] = frozenset()
-        _CACHE[key] = (st.st_mtime_ns, excluded)
-        return excluded
-
-    items = data.get("excluded") if isinstance(data, dict) else None
+    data = _store(folder).read()
+    items = data.get("excluded")
     if not isinstance(items, list):
-        excluded = frozenset()
-    else:
-        excluded = frozenset(str(p) for p in items if isinstance(p, str))
-    _CACHE[key] = (st.st_mtime_ns, excluded)
-    return excluded
+        return frozenset()
+    return frozenset(str(p) for p in items if isinstance(p, str))
 
 
 def save_excluded(folder: Path, excluded: list[str] | tuple[str, ...]) -> Path:
     """Write the sidecar atomically and bust the in-process cache."""
-    folder = folder.resolve()
-    folder.mkdir(parents=True, exist_ok=True)
-    sidecar = selection_path(folder)
     payload = {
         "excluded": list(dict.fromkeys(str(p) for p in excluded)),  # de-dup, keep order
         "generated_by": SELECTION_GENERATOR,
         "version": SELECTION_VERSION,
     }
-    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(sidecar)
-    # Invalidate cache; load_excluded will pick up the new mtime next call.
-    _CACHE.pop(str(folder), None)
-    return sidecar
+    return _store(folder).write(payload)
 
 
 def is_excluded(path: Path, folder: Path) -> bool:
@@ -111,4 +83,10 @@ def is_excluded(path: Path, folder: Path) -> bool:
 
 def clear_cache() -> None:
     """Drop the in-process cache. Tests call this between runs."""
-    _CACHE.clear()
+    # Selection's cache is keyed per-folder inside SidecarStore. Tests
+    # typically call this without a folder reference, so flush everything
+    # owned by any SidecarStore — cheap and matches the prior behavior of
+    # `_CACHE.clear()` in the old implementation.
+    from aftermovie.analyze.sidecar import clear_all_caches
+
+    clear_all_caches()

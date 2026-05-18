@@ -210,6 +210,7 @@ def test_photos_library_list_in_range_empty_when_dep_missing(monkeypatch, tmp_pa
 def test_all_sources_orders_photos_library_first(monkeypatch, tmp_path):
     """Registry contract: photos_library always first, gopros after."""
     from aftermovie.import_sources import gopro as gopro_mod
+    from aftermovie.import_sources import gopro_icc as icc_mod
 
     fake_mount_a = tmp_path / "GOPRO_A"
     fake_mount_b = tmp_path / "GOPRO_B"
@@ -220,6 +221,8 @@ def test_all_sources_orders_photos_library_first(monkeypatch, tmp_path):
         gopro_mod, "detect_gopro_mounts",
         lambda: [fake_mount_a, fake_mount_b],
     )
+    # Pin the ICC branch off so this test only asserts the MS path.
+    monkeypatch.setattr(icc_mod, "detect_icc_gopros", lambda: [])
 
     sources = all_sources()
     assert len(sources) == 3
@@ -233,8 +236,10 @@ def test_all_sources_orders_photos_library_first(monkeypatch, tmp_path):
 def test_all_sources_yields_only_photos_when_no_gopros(monkeypatch):
     """No mounts → just the Photos library Adapter is returned."""
     from aftermovie.import_sources import gopro as gopro_mod
+    from aftermovie.import_sources import gopro_icc as icc_mod
 
     monkeypatch.setattr(gopro_mod, "detect_gopro_mounts", lambda: [])
+    monkeypatch.setattr(icc_mod, "detect_icc_gopros", lambda: [])
     sources = all_sources()
     assert len(sources) == 1
     assert sources[0].name == "photos_library"

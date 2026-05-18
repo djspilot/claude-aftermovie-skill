@@ -200,16 +200,45 @@ def all_sources() -> list[ImportSource]:
     """Return every ImportSource present on this machine, in stable order.
 
     photos_library lands first if `osxphotos` is importable; one
-    GoProAdapter follows per `/Volumes/<name>/DCIM/` mount the OS exposes.
-    Adapter constructors must be cheap — `available()` is the predicate
-    callers use to gate UI/listing work, NOT construction.
+    GoProAdapter follows per `/Volumes/<name>/DCIM/` mount the OS exposes;
+    finally one GoProICCAdapter per HERO/GoPro reached over MTP via
+    Apple's ImageCaptureCore (when `pyobjc-framework-ImageCaptureCore` is
+    importable). Adapter constructors must be cheap — `available()` is the
+    predicate callers use to gate UI/listing work, NOT construction.
+
+    Dedup: if a HERO presents BOTH as a Mass-Storage mount AND as an MTP
+    camera (rare — user manually toggled the mode), we skip the ICC
+    Adapter so the simpler filesystem path wins; the uuid match is the
+    handle for that comparison.
     """
-    # Local imports so a missing optional dep (osxphotos) doesn't break
-    # `from aftermovie.import_sources import all_sources` at module load.
+    # Local imports so a missing optional dep (osxphotos / pyobjc) doesn't
+    # break `from aftermovie.import_sources import all_sources` at module
+    # load.
     from aftermovie.import_sources.photos import PhotosLibraryAdapter
     from aftermovie.import_sources.gopro import GoProAdapter, detect_gopro_mounts
 
     out: list[ImportSource] = [PhotosLibraryAdapter()]
-    for mount in detect_gopro_mounts():
+    ms_mounts = list(detect_gopro_mounts())
+    for mount in ms_mounts:
         out.append(GoProAdapter(mount))
+
+    # ICC GoPros — only added when the optional dep loads. Browse failures
+    # (no camera, ICC unavailable) degrade to an empty list.
+    try:
+        from aftermovie.import_sources.gopro_icc import detect_icc_gopros
+        icc_adapters = detect_icc_gopros()
+    except Exception as e:
+        log(f"  ! gopro_icc: registry skipped ({e})")
+        icc_adapters = []
+
+    # Dedup against Mass-Storage mounts. The only stable handle we have on
+    # both sides is the volume name vs. the camera name; both surface
+    # "HERO9" / "HERO10" so a substring match across the existing labels
+    # is the cheap-and-correct check.
+    ms_labels = {a.label for a in out if isinstance(a, GoProAdapter)}
+    for icc in icc_adapters:
+        if any(icc.camera_name in lbl or lbl.split("(")[-1].rstrip(")") in icc.camera_name
+               for lbl in ms_labels):
+            continue
+        out.append(icc)
     return out

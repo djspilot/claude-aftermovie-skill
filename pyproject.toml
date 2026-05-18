@@ -35,8 +35,8 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
 faces = ["mediapipe==0.10.18"]
-import = ["osxphotos>=0.68"]
-all = ["mcp>=1.0", "mediapipe==0.10.18", "osxphotos>=0.68"]
+import = ["osxphotos>=0.68", "pyobjc-framework-ImageCaptureCore>=12"]
+all = ["mcp>=1.0", "mediapipe==0.10.18", "osxphotos>=0.68", "pyobjc-framework-ImageCaptureCore>=12"]
 dev = ["pytest>=7", "pytest-timeout>=2"]
 
 [project.scripts]

@@ -216,12 +216,16 @@ def build_candidates(
     candidates: list[Candidate] = []
     for clip in catalog["clips"]:
         path = clip["path"]
-        if path in banned:
+        # The GUI stores bans/favorites by the ORIGINAL file path; for
+        # materialized stills `path` is the synthetic cache mp4, so match
+        # the origin too.
+        origin = clip.get("origin_still")
+        if path in banned or (origin and origin in banned):
             continue
         duration = clip["duration_s"]
         fps = clip.get("fps", 30.0)
         is_short = clip.get("is_short_form", False)
-        is_favorite = path in favorited
+        is_favorite = path in favorited or (origin and origin in favorited)
         if duration <= 4.0:
             score, reasons, components = score_window(clip, 0, int(duration))
             if is_favorite:
@@ -1360,8 +1364,13 @@ def _infer_clips_root(catalog: dict[str, Any]) -> Path | None:
     deepest existing directory as the clips root. Returns None when the
     catalog has no clips or the prefix doesn't resolve to a directory.
     """
-    sources = [c.get("path") for c in catalog.get("clips", [])
-               if isinstance(c.get("path"), str)]
+    # Materialized stills live in the app cache, not the user's folder —
+    # their `origin_still` is what points at the real clips root. Without
+    # this, one photo drags commonpath up to $HOME and the preferences
+    # sidecar (bans/favorites) is silently never found.
+    sources = [c.get("origin_still") or c.get("path")
+               for c in catalog.get("clips", [])
+               if isinstance(c.get("origin_still") or c.get("path"), str)]
     if not sources:
         return None
     import os

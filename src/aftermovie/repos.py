@@ -62,16 +62,18 @@ class CatalogRepository:
         clips still in it. Content (not mtime) — the GUI rewrites the file
         on every render start even when nothing changed.
         """
+        from aftermovie.analyze.preferences import PREFERENCES_FILENAME
         from aftermovie.analyze.selection import SELECTION_FILENAME
 
         folder = Path(folder).resolve()
         pieces = [str(folder)]
-        sel = folder / SELECTION_FILENAME
-        if sel.is_file():
-            try:
-                pieces.append(f"selection|{_hash(sel.read_text())}")
-            except OSError:
-                pass
+        for sidecar_name in (SELECTION_FILENAME, PREFERENCES_FILENAME):
+            sidecar = folder / sidecar_name
+            if sidecar.is_file():
+                try:
+                    pieces.append(f"{sidecar_name}|{_hash(sidecar.read_text())}")
+                except OSError:
+                    pass
         for f in sorted(folder.rglob("*")):
             if f.is_file():
                 try:

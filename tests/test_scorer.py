@@ -218,6 +218,26 @@ def test_visual_dup_threshold_zero_disables_filter():
     assert "/twin_hi.mp4" in sources
 
 
+def test_ban_matches_materialized_stills_origin_path():
+    """GUI bans store the ORIGINAL photo path; a materialized still (whose
+    catalog path is the synthetic cache mp4) must still be dropped, and a
+    favorite on the origin must still boost."""
+    catalog = {"clips": [
+        _clip("/cache/stills/abc123.mp4", duration=2.5,
+              origin_still="/folder/IMG-1.jpg"),
+        _clip("/cache/stills/def456.mp4", duration=2.5,
+              origin_still="/folder/IMG-2.jpg"),
+        _clip("/folder/video.mp4", duration=8.0),
+    ]}
+    prefs = {"banned": ["/folder/IMG-1.jpg"], "favorited": ["/folder/IMG-2.jpg"]}
+    cands = build_candidates(catalog, preferences=prefs)
+    sources = {c.source for c in cands}
+    assert "/cache/stills/abc123.mp4" not in sources  # banned via origin
+    assert "/cache/stills/def456.mp4" in sources
+    fav = [c for c in cands if c.source == "/cache/stills/def456.mp4"]
+    assert all("user_favorite" in c.reasons for c in fav)
+
+
 def test_semantic_duplicates_collapse_and_respect_off_switch():
     """Sources whose embeddings are near-parallel (same scene, different
     angle — phashes far apart) collapse to the best one; setting

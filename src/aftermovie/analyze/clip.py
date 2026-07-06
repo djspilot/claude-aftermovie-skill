@@ -163,6 +163,7 @@ def analyze_clip(path: Path, origin_still: Path | None = None) -> ClipInfo | Non
         exposure_per_s=exposure,
         phash=phash,
         embedding=embedding,
+        origin_still=str(origin_still) if origin_still is not None else None,
         # duplicate_group is stamped in after the whole catalog is built
         # (we need every clip's phash before we can cluster them).
     )
@@ -236,7 +237,14 @@ def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURAT
             # Two portrait photos captured close together share one shot:
             # side-by-side on the landscape canvas instead of two padded
             # singles. Failed duos fall back to the single-still path.
-            duos, singles = pair_portrait_stills(stills)
+            # Banned stills never pair — a duo can't be half-banned; they
+            # stay single so the scorer's ban check can drop them cleanly.
+            from aftermovie.analyze.preferences import load_preferences
+            banned = {str(p) for p in
+                      (load_preferences(folder).get("banned") or [])}
+            duos, singles = pair_portrait_stills(
+                [s for s in stills if str(s) not in banned])
+            singles.extend(s for s in stills if str(s) in banned)
             log(f"Materializing {len(stills)} stills "
                 f"({len(duos)} portrait pair(s), {len(singles)} single(s), "
                 f"{still_duration_s}s each)...")

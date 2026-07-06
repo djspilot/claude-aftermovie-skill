@@ -91,7 +91,7 @@ class AnalyzeCache:
     # Bump when the ANALYZER changes what it extracts (new ClipInfo fields,
     # different captured_at strategy, ...) so every stale entry misses and
     # re-analyzes — nobody remembers to --force-reanalyze.
-    SCHEMA_VERSION = 2  # v2: filename capture-time + gyro_peaks + embedding
+    SCHEMA_VERSION = 3  # v3: origin_still on materialized stills
 
     def key_for(self, path: Path) -> str:
         """SHA1 over `schema | abs_path | mtime_ns | size`.

@@ -49,6 +49,11 @@ class ClipInfo:
     # L2-normalized semantic embedding of a representative frame (MediaPipe
     # ImageEmbedder), or None when the optional dep/model is unavailable.
     embedding: list[float] | None = None
+    # For materialized stills: absolute path of the ORIGINAL image in the
+    # user's folder. `path` points at the synthetic cache mp4, so anything
+    # that must line up with user-facing paths (GUI bans/favorites, clips
+    # root inference) matches against this instead. None for real videos.
+    origin_still: str | None = None
     # Visual-duplicate cluster id assigned at the end of analyze; None means
     # "singleton" (no near-twins in this folder). The scorer uses this to
     # keep only the highest-scoring candidate from each cluster.

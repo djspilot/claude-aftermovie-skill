@@ -68,7 +68,9 @@ class AutoOpts:
     title_text: str | None = None
     source_cap: int = 1
     chronological: bool = True
+    strict_chronological: bool = False  # no hook/climax reshuffle
     burst_window_s: float = 3.0
+    visual_dup_threshold: int | None = None  # dHash bits; 0 = off, None = scorer default (8)
     preview: bool = False
     reveal: bool = True
     force_reanalyze: bool = False
@@ -216,7 +218,9 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts,
         no_reframe=opts.no_reframe,
         source_cap=opts.source_cap,
         chronological=opts.chronological,
+        strict_chronological=opts.strict_chronological,
         burst_window_s=opts.burst_window_s,
+        visual_dup_threshold=opts.visual_dup_threshold,
         moments_per_source=opts.moments_per_source,
     )
     cmd_score(s)

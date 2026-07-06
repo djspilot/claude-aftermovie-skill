@@ -147,6 +147,24 @@ def test_hamming_distance_handles_length_mismatch():
     assert hamming_distance("zzzz", "0000") == 64  # invalid hex → 64
 
 
+def test_signature_distance_multi_frame_matches_any_shared_frame():
+    """Multi-frame signatures match when ANY frame pair is close — offset
+    twins with one shared frame cluster; fully-different clips don't.
+    Legacy single hashes are the 1-frame special case."""
+    from aftermovie.analyze.duplicates import signature_distance
+    shared = "0000000000000000"
+    a = f"{shared}:ffffffffffffffff:00ff00ff00ff00ff"
+    b = f"ff00ff00ff00ff00:{shared}"
+    assert signature_distance(a, b) == 0
+    assert signature_distance(a, shared) == 0  # multi vs legacy single
+    c = "0f0f0f0f0f0f0f0f:f0f0f0f0f0f0f0f0"
+    assert signature_distance(shared, c) == 32
+    groups = group_duplicates([("/a.mp4", a), ("/b.mp4", b), ("/c.mp4", c)])
+    assert groups["/a.mp4"] is not None
+    assert groups["/a.mp4"] == groups["/b.mp4"]
+    assert groups["/c.mp4"] is None
+
+
 def test_compute_phash_returns_none_on_unreadable_file(tmp_path: Path):
     """Missing / corrupt files must return None instead of raising."""
     bad = tmp_path / "nope.png"

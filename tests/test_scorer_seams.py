@@ -47,6 +47,31 @@ def test_select_cut_points_appends_target_len_sentinel():
         assert cuts[-1] == 4.0, f"pace={pace} missing sentinel"
 
 
+def test_select_cut_points_snaps_to_nearby_onsets():
+    """Cuts land on the actual audio onset when one sits within ±80ms of the
+    beat; far-away onsets don't pull, and order stays ascending."""
+    song = {
+        "beats": [0.0, 1.0, 2.0, 3.0],
+        "intro_end_s": 0.0,
+        # 1.05 pulls the beat at 1.0; 2.5 is too far from any beat.
+        "onset_peaks": [1.05, 2.5],
+    }
+    cuts = select_cut_points(song, target_len=4.0, pace="fast")
+    assert 1.05 in cuts
+    assert 1.0 not in cuts
+    assert 2.0 in cuts  # unpulled
+    assert cuts == sorted(cuts)
+
+
+def test_snap_rejected_when_it_crowds_previous_cut():
+    """A snap that would push two cuts closer than the anti-strobe gap keeps
+    the original beat time instead."""
+    from aftermovie.score.scorer import _snap_to_onsets
+    # Cuts 0.30s apart; onset pulls the second one backwards toward the first.
+    snapped = _snap_to_onsets([1.0, 1.30], [1.24], tol=0.08, min_gap=0.25)
+    assert snapped == [1.0, 1.30]
+
+
 def test_allocate_candidates_respects_source_cap():
     """The same source path cannot appear more than `source_cap` times in the
     picks, even if every candidate from that source out-scores everything else."""
@@ -123,6 +148,28 @@ def test_decide_speed_requires_action_reason():
     boring = Candidate(source="/c.mp4", start_s=0.0, end_s=2.0,
                        src_fps=240.0, reasons=["face_present", "loud_audio"])
     assert decide_speed(boring, 0.0, song, no_speed_ramp=False) == (1.0, 1.0)
+
+
+def test_decide_speed_drop_slam_ignores_reasons():
+    """The first cut of a `drop` section ramps even without action reasons
+    or a downbeat — the drop itself is the event. High-fps gate still holds."""
+    song = {
+        "downbeats": [0.0],
+        "sections": [
+            {"kind": "verse", "start_s": 0.0, "end_s": 8.0},
+            {"kind": "drop", "start_s": 8.0, "end_s": 16.0},
+        ],
+    }
+    boring = Candidate(source="/c.mp4", start_s=0.0, end_s=2.0,
+                       src_fps=240.0, reasons=["face_present"])
+    # First beat inside the drop → slam.
+    assert decide_speed(boring, 8.2, song, no_speed_ramp=False) == (0.4, 1.0)
+    # Later beat in the same drop → no slam (and no downbeat/reason → flat).
+    assert decide_speed(boring, 12.0, song, no_speed_ramp=False) == (1.0, 1.0)
+    # Low fps never slams.
+    low = Candidate(source="/d.mp4", start_s=0.0, end_s=2.0,
+                    src_fps=30.0, reasons=["face_present"])
+    assert decide_speed(low, 8.2, song, no_speed_ramp=False) == (1.0, 1.0)
 
 
 def test_decide_speed_no_speed_ramp_flag_forces_one():

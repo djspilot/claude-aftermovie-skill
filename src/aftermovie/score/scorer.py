@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from aftermovie.analyze.duplicates import group_duplicates
 from aftermovie.config import DEFAULT_TARGET_LEN_S, MIN_CLIP_S
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.transitions import decide_transitions
@@ -17,6 +18,19 @@ from aftermovie.score.song import analyze_song
 from aftermovie.types import Candidate
 
 DEFAULT_BURST_WINDOW_S = 3.0
+
+
+# dHash Hamming-distance threshold for the visual-duplicate filter. 0 turns
+# the filter off entirely. Override via `AFTERMOVIE_VISUAL_DUP_THRESHOLD` env
+# or `--visual-dup-threshold N` CLI flag.
+def _default_visual_dup_threshold() -> int:
+    raw = os.environ.get("AFTERMOVIE_VISUAL_DUP_THRESHOLD", "8").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 8
+    return max(0, min(n, 64))
+DEFAULT_VISUAL_DUP_THRESHOLD = _default_visual_dup_threshold()
 
 # Float tolerance for `sum(components.values()) == score`. Generous because
 # the legacy total is also accumulated by repeated `+=` in arbitrary order,
@@ -81,6 +95,19 @@ def score_window(
     if audio_avg > 0.7:
         reasons.append("loud_audio")
 
+    # Audio excitement: this window is loud RELATIVE to the clip's own
+    # baseline — a cheer, impact, or crowd roar. A steadily loud clip
+    # (motor, wind) has a flat energy curve, so no window clears its own
+    # 85th percentile by margin and nothing fires. Needs a few seconds of
+    # baseline and an absolute floor so quiet clips can't self-excite.
+    if audio_avg > 0.4 and len(audio) >= 4:
+        sorted_audio = sorted(audio)
+        p85 = sorted_audio[min(len(sorted_audio) - 1,
+                               int(len(sorted_audio) * 0.85))]
+        if audio_avg >= p85 and audio_avg >= 1.25 * (sum(audio) / len(audio)):
+            _add(sc.AUDIO_PEAK, 1.5)
+            reasons.append("audio_peak")
+
     accl = clip.get("accl_peaks", [])
     if accl[start:end]:
         accl_max = max(accl[start:end])
@@ -90,6 +117,14 @@ def score_window(
         elif accl_max > 12:
             _add(sc.ACCL_JUMP, 1.5)
             reasons.append("moderate_accel")
+
+    gyro = clip.get("gyro_peaks") or []
+    if gyro[start:end]:
+        # >3 rad/s sustained-peak rotation ≈ a deliberate spin/whip/trick,
+        # well above walking-with-camera wobble.
+        if max(gyro[start:end]) > 3.0:
+            _add(sc.GYRO_SPIN, 1.5)
+            reasons.append("gyro_spin")
 
     speeds = clip.get("gps_speed", [])
     if speeds[start:end]:
@@ -241,27 +276,34 @@ def _source_captured_at(src_clip: dict[str, Any]) -> float | None:
 
 
 def _suppress_visual_duplicates(candidates: list[Candidate],
-                                by_source: dict[str, dict[str, Any]]) -> list[Candidate]:
-    """Collapse candidates whose source shares a `duplicate_group` (set at
-    analyze time by `analyze/duplicates.group_duplicates`). For each cluster,
-    keep ONLY the highest-scoring candidate; drop the rest of the group.
+                                by_source: dict[str, dict[str, Any]],
+                                threshold: int = DEFAULT_VISUAL_DUP_THRESHOLD,
+                                ) -> list[Candidate]:
+    """Collapse candidates whose sources are visual twins. Clustering happens
+    HERE at selection time — `group_duplicates` re-runs over the phashes the
+    analyze stage stored in the catalog — so the threshold is a live knob:
+    changing it (or setting 0 to disable) never requires re-analyzing.
+    For each cluster, keep ONLY the highest-scoring candidate; drop the rest.
 
-    Sources without a duplicate_group (singletons / clips that had no phash)
-    are passed through untouched.
+    Sources without a phash never cluster and pass through untouched.
 
     Composes with `_suppress_bursts`: bursts fire first to drop same-moment
     same-camera spam, then this filter catches same-look-from-anywhere.
     Doing it in this order means a burst cluster's best candidate has
     already been chosen by the time we ask "is this also a visual twin of
     something else?", so we never overcount the work."""
-    if not candidates:
+    if threshold <= 0 or not candidates:
         return candidates
+
+    groups = group_duplicates(
+        [(src, info.get("phash")) for src, info in by_source.items()],
+        threshold=threshold,
+    )
 
     # Per-group, find the source whose best-scoring candidate wins.
     group_best_source: dict[str, tuple[float, str]] = {}
     for c in candidates:
-        src = by_source.get(c.source) or {}
-        gid = src.get("duplicate_group")
+        gid = groups.get(c.source)
         if not gid:
             continue
         prev = group_best_source.get(gid)
@@ -274,8 +316,8 @@ def _suppress_visual_duplicates(candidates: list[Candidate],
     # Every source in a cluster that ISN'T the winner gets dropped.
     suppressed_sources: set[str] = set()
     cluster_members: dict[str, list[str]] = {}
-    for src, info in by_source.items():
-        gid = info.get("duplicate_group")
+    for src in by_source:
+        gid = groups.get(src)
         if gid:
             cluster_members.setdefault(gid, []).append(src)
     for gid, members in cluster_members.items():
@@ -287,7 +329,8 @@ def _suppress_visual_duplicates(candidates: list[Candidate],
     if not suppressed_sources:
         return candidates
     log(f"visual-dup suppress: dropped {len(suppressed_sources)} source(s) "
-        f"sharing a duplicate_group with a higher-scored sibling")
+        f"visually twinned with a higher-scored sibling "
+        f"(threshold={threshold})")
     return [c for c in candidates if c.source not in suppressed_sources]
 
 
@@ -424,6 +467,35 @@ def _auto_cut_points(beats: list[float], intro_end_s: float, target_len: float,
     return out
 
 
+def _snap_to_onsets(cut_points: list[float], onsets: list[float],
+                    tol: float = 0.08, min_gap: float = 0.25) -> list[float]:
+    """Nudge each cut to the nearest audio onset within ±`tol` seconds.
+
+    Beats are a grid; the actual snare/kick/vocal hits sit slightly off it.
+    Cutting on the onset instead of the grid makes every cut FEEL edited to
+    the music. A snap is rejected when it would bring two cuts closer than
+    `min_gap` (anti-strobe) or break ascending order — then the original
+    beat time is kept. `onsets` must be sorted."""
+    if not onsets:
+        return cut_points
+    out: list[float] = []
+    j = 0
+    for t in cut_points:
+        # Advance j to the first onset >= t, then compare with predecessor.
+        while j < len(onsets) and onsets[j] < t:
+            j += 1
+        best = t
+        best_d = tol
+        for cand in (onsets[j - 1] if j > 0 else None,
+                     onsets[j] if j < len(onsets) else None):
+            if cand is not None and abs(cand - t) < best_d:
+                best, best_d = cand, abs(cand - t)
+        if out and best - out[-1] < min_gap:
+            best = t  # snap would crowd the previous cut — keep the grid
+        out.append(best if not out or best > out[-1] else t)
+    return out
+
+
 def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> list[float]:
     """Pick beat times that anchor cuts, respecting `pace`.
 
@@ -452,6 +524,8 @@ def select_cut_points(song: dict[str, Any], target_len: float, pace: str) -> lis
         if factor > 1:
             cut_points = cut_points[::factor]
         cut_points = [t for t in cut_points if t < target_len]
+    cut_points = _snap_to_onsets(cut_points,
+                                 sorted(song.get("onset_peaks") or []))
     cut_points.append(target_len)
     return cut_points
 
@@ -661,12 +735,23 @@ def decide_speed(pick: Candidate, beat_t: float,
     Beat-anchored ramp: when a high-fps source lands on a downbeat with an
     action-peak reason, we ramp 0.4x → 1.0x across the slot so the cut
     "lands" on the beat at full speed. Otherwise flat (1.0, 1.0).
+
+    Drop slam: the first cut of a detected `drop` section always ramps
+    (high-fps sources only) — slow-in that snaps to full speed right when
+    the drop hits, regardless of the pick's own action reasons.
     """
     if no_speed_ramp:
         return (1.0, 1.0)
     if pick.src_fps < 90:
         return (1.0, 1.0)
-    on_downbeat = any(abs(beat_t - db) < 0.05 for db in song["downbeats"])
+    # ponytail: sections have whole-second starts, so "first cut of the
+    # drop" = beat within 1s after the section boundary.
+    for s in song.get("sections") or []:
+        if s.get("kind") == "drop" and 0.0 <= beat_t - float(s.get("start_s", 0.0)) < 1.0:
+            return (0.4, 1.0)
+    # 0.1s tolerance (was 0.05): cut anchors may be onset-snapped up to
+    # 0.08s off the beat grid and must still count as "on the downbeat".
+    on_downbeat = any(abs(beat_t - db) < 0.1 for db in song["downbeats"])
     if not on_downbeat:
         return (1.0, 1.0)
     if not any(r in ("high_accel_jump", "motion_peak", "hilight_tag") for r in pick.reasons):
@@ -825,6 +910,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                source_cap: int = 3,
                chronological: bool = True,
                burst_window_s: float = DEFAULT_BURST_WINDOW_S,
+               visual_dup_threshold: int = DEFAULT_VISUAL_DUP_THRESHOLD,
                hook: bool = True,
                climax: bool = True,
                stretch_stills: bool = True,
@@ -873,7 +959,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     # burst-suppression mask a visual-twin survivor we'd actually want to
     # drop. See analyze/duplicates.py for the dHash details.
     candidates = _suppress_bursts(candidates, by_source, window_s=burst_window_s)
-    candidates = _suppress_visual_duplicates(candidates, by_source)
+    candidates = _suppress_visual_duplicates(candidates, by_source,
+                                             threshold=visual_dup_threshold)
     cut_points = select_cut_points(song, target_len, pace)
 
     # F3 moment-budget pass — replaces the C4 pool-level top-N subset trim.
@@ -937,10 +1024,13 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             source_cap = new_cap
 
     if chronological and picks:
-        def _captured(pick) -> float:
+        def _captured(pick) -> tuple[float, str]:
+            # Secondary key = source path: clips without captured_at all
+            # collapse to inf, and without a tiebreak their relative order
+            # would be allocator-dependent (non-deterministic across runs).
             src = by_source.get(pick.source, {}) or {}
             ts = src.get("captured_at")
-            return float(ts) if ts is not None else float("inf")
+            return (float(ts) if ts is not None else float("inf"), pick.source)
 
         beats = [b for b, _ in picks]
         sorted_picks = sorted([p for _, p in picks], key=_captured)
@@ -976,6 +1066,18 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     for i in range(len(cut_points) - 1):
         next_cut[cut_points[i]] = cut_points[i + 1]
 
+    # Color consistency: mixed sources (iPhone vs GoPro vs drone) sit at
+    # visibly different brightness levels. Target = catalog-median mean luma;
+    # each entry gets a small corrective offset the renderer applies as
+    # `eq=brightness=`. Half-strength + ±0.08 clamp: nudge toward uniform,
+    # never fully re-expose (crushing a deliberate sunset would be worse).
+    _clip_lumas = [
+        sum(expo) / len(expo)
+        for c in catalog["clips"]
+        if (expo := c.get("exposure_per_s") or [])
+    ]
+    target_luma = sorted(_clip_lumas)[len(_clip_lumas) // 2] if _clip_lumas else None
+
     plan_entries: list[dict[str, Any]] = []
     for beat_t, pick in picks:
         gap = next_cut[beat_t] - beat_t
@@ -1001,6 +1103,12 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             audio_interest = float(sum(window) / max(len(window), 1))
         else:
             audio_interest = 0.0
+        luma_offset = 0.0
+        expo = src_clip.get("exposure_per_s") or []
+        if target_luma is not None and expo:
+            window = expo[start_i:end_i] or expo
+            win_mean = sum(window) / len(window)
+            luma_offset = max(-0.08, min(0.08, (target_luma - win_mean) * 0.5))
         plan_entries.append({
             "source": pick.source,
             "start_s": pick.start_s,
@@ -1014,6 +1122,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "reasons": pick.reasons,
             "components": dict(pick.components),
             "audio_interest": audio_interest,
+            "luma_offset": round(luma_offset, 4),
             "source_width": int(src_clip.get("width", 1920)),
             "source_height": int(src_clip.get("height", 1080)),
             "face_bboxes": src_faces[start_i:end_i] if src_faces else [],
@@ -1159,8 +1268,16 @@ def cmd_score(args: argparse.Namespace) -> None:
         burst_window_s=float(getattr(args, "burst_window_s",
                                       DEFAULT_BURST_WINDOW_S)
                               or DEFAULT_BURST_WINDOW_S),
-        hook=bool(getattr(args, "hook", True)),
-        climax=bool(getattr(args, "climax", True)),
+        # `or` is wrong here: 0 means "filter off" and must survive.
+        visual_dup_threshold=(
+            int(v) if (v := getattr(args, "visual_dup_threshold", None))
+            is not None else DEFAULT_VISUAL_DUP_THRESHOLD),
+        # Strict mode: pure capture-time order, no trailer arc (hook/climax
+        # deliberately hoist the best picks out of time order).
+        hook=bool(getattr(args, "hook", True))
+             and not getattr(args, "strict_chronological", False),
+        climax=bool(getattr(args, "climax", True))
+               and not getattr(args, "strict_chronological", False),
         stretch_stills=bool(getattr(args, "stretch_stills", True)),
         preferences=preferences,
         moments_per_source=moments_per_source,

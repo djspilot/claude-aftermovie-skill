@@ -37,6 +37,8 @@ class ClipInfo:
     accl_peaks: list[float]
     gps_speed: list[float]
     is_short_form: bool
+    # Per-second peak GPMF gyro magnitude (rad/s); empty when no telemetry.
+    gyro_peaks: list[float] = field(default_factory=list)
     captured_at: float | None = None
     face_bboxes: list[dict | None] = field(default_factory=list)
     sharpness_per_s: list[float] = field(default_factory=list)

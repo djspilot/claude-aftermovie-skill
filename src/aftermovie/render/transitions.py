@@ -2,8 +2,8 @@
 
 Three kinds:
     cut       — hard cut, no fade. Uses the concat-demuxer fast path.
-    crossfade — xfade=fade, 200ms.
-    whip      — xfade=wipeleft / wiperight, 250ms.
+    crossfade — xfade=fade, beat-scaled (~0.4 beat).
+    whip      — xfade=wipeleft / wiperight, beat-scaled (~0.5 beat).
 
 When any entry has a non-cut transition_in we switch the whole render to
 filter_complex; xfade requires both source streams to be live.
@@ -12,12 +12,34 @@ from __future__ import annotations
 
 from typing import Any
 
-XFADE_TYPES = {
-    "cut": (None, 0.0),
-    "crossfade": ("fade", 0.2),
-    "whip": ("wipeleft", 0.25),
-    "whip_right": ("wiperight", 0.25),
-}
+# Transition durations are expressed in BEATS and converted per song, so a
+# crossfade eats the same musical fraction at 90 and at 160 BPM. The beat
+# fractions are chosen to reproduce the old fixed-seconds feel at 120 BPM
+# (beat = 0.5s): e.g. crossfade 0.4 beat × 0.5s = the old 0.2s.
+# Absolute clamps keep extreme tempos sane; the 0.9s ceiling matches the
+# audio acrossfade clamp in pipeline.py.
+_TDUR_MIN_S = 0.12
+_TDUR_MAX_S = 0.9
+# A transition may cover at most this fraction of the incoming clip's slot —
+# without it a calm 0.85s dissolve can be LONGER than a tight drop cut,
+# erasing the cut entirely.
+_MAX_SLOT_FRACTION = 0.4
+
+
+def _beat_gap_s(song_meta: dict[str, Any] | None) -> float:
+    bpm = float((song_meta or {}).get("tempo_bpm") or 0.0)
+    return 60.0 / bpm if bpm > 0 else 0.5
+
+
+def _fit_tdur(beats: float, beat_gap_s: float, entry: dict[str, Any]) -> float:
+    """Beat-count → seconds, clamped to absolute bounds and to a fraction of
+    the incoming entry's slot. May return < 0.05, which build_xfade_graph
+    treats as a hard cut — that's intentional for very tight slots."""
+    tdur = max(_TDUR_MIN_S, min(beats * beat_gap_s, _TDUR_MAX_S))
+    slot = float(entry.get("out_duration_s") or 0.0)
+    if slot > 0:
+        tdur = min(tdur, _MAX_SLOT_FRACTION * slot)
+    return tdur
 
 # Every input to xfade must share time_base, frame rate, pixel format, and SAR.
 # concat preserves the FIRST input's timebase; xfade rewrites output to
@@ -49,12 +71,30 @@ def decide_transitions(entries: list[dict[str, Any]],
     if not entries:
         return
     n = len(entries)
+    beat_gap = _beat_gap_s(song_meta)
     for e in entries:
         e["transition_in"] = {"kind": "cut", "duration_s": 0.0}
 
-    # Crossfade every 4th cut, skipping the first one.
-    for i in range(4, n, 4):
-        entries[i]["transition_in"] = {"kind": "crossfade", "duration_s": 0.2}
+    # Structural crossfades: on cuts that land on a musical downbeat (bar
+    # start), spaced at least 4 cuts apart so most entries stay hard cuts.
+    # 0.4 beat ≈ the old fixed 0.2s at 120 BPM. Without downbeat data we
+    # fall back to the legacy every-4th-cut rule.
+    downbeats = list((song_meta or {}).get("downbeats") or [])
+    marks: list[int] = []
+    if downbeats:
+        last = 0
+        for i in range(1, n):
+            beat_t = float(entries[i].get("beat_time_s", -1.0))
+            if i - last >= 4 and any(abs(beat_t - db) < 0.15 for db in downbeats):
+                marks.append(i)
+                last = i
+    if not marks:
+        marks = list(range(4, n, 4))
+    for i in marks:
+        entries[i]["transition_in"] = {
+            "kind": "crossfade",
+            "duration_s": _fit_tdur(0.4, beat_gap, entries[i]),
+        }
 
     # Whip on the highest-scoring entry in each 8-cut block, max 3 whips total.
     whips = 0
@@ -69,7 +109,9 @@ def decide_transitions(entries: list[dict[str, Any]],
             continue  # nothing to transition INTO at index 0
         direction = "wipeleft" if best_i % 2 == 0 else "wiperight"
         entries[best_i]["transition_in"] = {
-            "kind": "whip", "duration_s": 0.25, "direction": direction,
+            "kind": "whip",
+            "duration_s": _fit_tdur(0.5, beat_gap, entries[best_i]),
+            "direction": direction,
         }
         whips += 1
 
@@ -91,6 +133,7 @@ def _decide_soft(entries: list[dict[str, Any]],
     energy: list[float] = list(song_meta.get("energy_per_s") or [])
     downbeats: list[float] = list(song_meta.get("downbeats") or [])
     onset_peaks: list[float] = list(song_meta.get("onset_peaks") or [])
+    beat_gap = _beat_gap_s(song_meta)
     scores = sorted(float(e.get("score", 0)) for e in entries)
     top_idx = max(0, int(0.85 * len(scores)) - 1)
     top_score = scores[top_idx] if scores else 0.0
@@ -120,18 +163,24 @@ def _decide_soft(entries: list[dict[str, Any]],
 
         on_downbeat = any(abs(beat_t - db) < 0.15 for db in downbeats)
 
-        # Durations bumped ~2x from the original mix: the user kept
-        # asking for slower transitions. Audio acrossfade clamp in
-        # pipeline.py was widened to 0.7 to match.
+        # Durations in BEATS (converted by _fit_tdur), tuned to match the
+        # old fixed seconds at 120 BPM — the user kept asking for slower
+        # transitions, so the calm end stays breathy. On fast tracks these
+        # now shrink with the beat instead of smearing across it, and
+        # _fit_tdur additionally caps each fade to 40% of the incoming slot
+        # so a dissolve can never swallow a tight drop cut.
         if on_downbeat and e_val >= 0.6:
-            tdur = 0.65   # structural-beat marker
+            beats = 1.3   # structural-beat marker (0.65s @ 120 BPM)
         elif e_val < 0.35:
-            tdur = 0.85   # calm dissolve
+            beats = 1.7   # calm dissolve (0.85s @ 120 BPM)
         elif e_val >= 0.75:
-            tdur = 0.30   # tight glide in loud sections (was 0.15)
+            beats = 0.6   # tight glide in loud sections (0.30s @ 120 BPM)
         else:
-            tdur = 0.45   # default mid-tempo
-        e["transition_in"] = {"kind": "crossfade", "duration_s": tdur}
+            beats = 0.9   # default mid-tempo (0.45s @ 120 BPM)
+        e["transition_in"] = {
+            "kind": "crossfade",
+            "duration_s": _fit_tdur(beats, beat_gap, e),
+        }
 
 
 def has_non_cut(entries: list[dict[str, Any]]) -> bool:

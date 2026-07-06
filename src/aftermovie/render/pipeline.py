@@ -250,6 +250,11 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
         )
     elif speed != 1.0:
         vfilter.append(f"setpts={1.0/speed:.4f}*PTS")
+    # Color-consistency nudge from the planner (catalog-median luma match).
+    # Before the LUT so the grade sits on already-normalized footage.
+    luma_offset = float(entry.get("luma_offset") or 0.0)
+    if abs(luma_offset) >= 0.02:
+        vfilter.append(f"eq=brightness={luma_offset:.4f}")
     if lut:
         vfilter.append(f"lut3d={lut.as_posix()}")
     vfilter.append(f"fps={target_fps}")
@@ -811,6 +816,15 @@ def _final_mux(intermediate: Path, plan: dict, output: Path,
             a_filter.replace("[a_out]", "[a_pre]")
             + f";[a_pre]afade=t=out:st={fade_start:.3f}:d={fade_out_d:.3f}[a_out]"
         )
+
+    # Loudness-normalize the final mix to -14 LUFS (streaming standard) so
+    # every export sounds consistent across phone/TV regardless of how hot
+    # the song file was mastered. After the tail fade, last in the chain.
+    # loudnorm internally upsamples to 192kHz — aresample restores 48k.
+    a_filter = (
+        a_filter.replace("[a_out]", "[a_norm]")
+        + ";[a_norm]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a_out]"
+    )
 
     # Where in the song do the cuts actually live? The planner places the
     # first cut at song_meta.intro_end_s, so we seek the music there so

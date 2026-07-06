@@ -182,10 +182,21 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
                    action="store_const", const=False, default=None,
                    help="Don't re-order picks by EXIF/creation time. "
                         "Env: AFTERMOVIE_CHRONOLOGICAL.")
+    p.add_argument("--strict-chronological", dest="strict_chronological",
+                   action="store_true", default=False,
+                   help="Pure capture-time order: disables the trailer arc "
+                        "(best-shot hook at the front, top picks at the end) "
+                        "that normally reshuffles a chronological plan.")
     p.add_argument("--burst-window-s", dest="burst_window_s", type=float,
                    default=None,
                    help="Seconds used to collapse near-duplicate burst shots. "
                         "0 disables burst suppression.")
+    p.add_argument("--visual-dup-threshold", dest="visual_dup_threshold",
+                   type=int, default=None,
+                   help="dHash Hamming distance below which clips count as "
+                        "visual duplicates (only the best one is kept). "
+                        "0 disables the filter; higher = more aggressive "
+                        "(default 8). Env: AFTERMOVIE_VISUAL_DUP_THRESHOLD.")
 
 
 def build_parser() -> argparse.ArgumentParser:

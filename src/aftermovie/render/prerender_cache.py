@@ -135,6 +135,7 @@ class PrerenderCache:
             | lut_name_or_none
             | encoder.name | encoder.pix_fmt
             | audio_interest_gate_threshold | keep_audio
+            | luma_offset
         """
         src = Path(entry["source"])
         try:
@@ -182,6 +183,9 @@ class PrerenderCache:
             opts.encoder.pix_fmt,
             f"{float(opts.audio_interest_threshold):.6f}",
             "1" if opts.keep_audio else "0",
+            # Color-consistency nudge — same span, different brightness
+            # correction must be a different cached clip.
+            f"{float(entry.get('luma_offset') or 0.0):.4f}",
         ]
         seed = "|".join(parts)
         return hashlib.sha1(seed.encode("utf-8")).hexdigest()

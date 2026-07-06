@@ -49,6 +49,29 @@ def test_hilight_dominates_scoring():
     assert "hilight_tag" not in q_reasons
 
 
+def test_audio_peak_rewards_spike_not_steady_loudness():
+    """A window that spikes above the clip's own audio baseline (cheer,
+    impact) gets the audio_peak bonus; a uniformly loud clip (motor) with
+    the same window loudness does not."""
+    spike = _clip("/cheer.mp4", audio_energy=[0.2] * 6 + [0.9, 0.9])
+    steady = _clip("/motor.mp4", audio_energy=[0.9] * 8)
+    s_score, s_reasons, _ = score_window(spike, 6, 8)
+    m_score, m_reasons, _ = score_window(steady, 6, 8)
+    assert "audio_peak" in s_reasons
+    assert "audio_peak" not in m_reasons
+
+
+def test_gyro_spin_adds_bonus():
+    """A fast-rotation gyro peak in the window adds the gyro_spin bonus."""
+    spin = _clip("/spin.mp4", gyro_peaks=[0.5, 0.5, 4.0, 0.5, 0.5, 0.5, 0.5, 0.5])
+    calm = _clip("/calm.mp4", gyro_peaks=[0.5] * 8)
+    sp_score, sp_reasons, _ = score_window(spin, 2, 4)
+    ca_score, ca_reasons, _ = score_window(calm, 2, 4)
+    assert "gyro_spin" in sp_reasons
+    assert "gyro_spin" not in ca_reasons
+    assert sp_score == ca_score + 1.5
+
+
 def test_accel_jump_adds_bonus():
     clip = _clip("/a.mp4", accl_peaks=[10.0, 10.0, 16.0, 10.0, 10.0, 10.0, 10.0, 10.0])
     quiet = _clip("/b.mp4", accl_peaks=[10.0] * 8)
@@ -149,17 +172,59 @@ def test_speed_ramp_suppressed_when_flag_set():
         f"--no-speed-ramp should force speed=1.0, got {[e['speed'] for e in plan]}"
 
 
-def test_duplicate_group_collapses_to_highest_scoring():
-    """Two sources sharing a `duplicate_group` must yield exactly ONE entry
-    in the plan — the higher-scoring one wins, the other is dropped before
-    candidate allocation. Sources outside the group are untouched."""
-    # Two visually-identical clips (same duplicate_group), one with a HiLight
-    # tag so it out-scores its twin by a wide margin. Plus an unrelated clip.
+def _dup_test_fixtures():
+    # Two visually-identical clips (identical phash), one with a HiLight tag
+    # so it out-scores its twin by a wide margin. Plus an unrelated clip
+    # whose phash is 64 bits away.
     catalog = {"clips": [
-        _clip("/twin_lo.mp4", duration=8.0, duplicate_group="g1"),
-        _clip("/twin_hi.mp4", duration=8.0, duplicate_group="g1",
+        _clip("/twin_lo.mp4", duration=8.0, phash="0" * 16),
+        _clip("/twin_hi.mp4", duration=8.0, phash="0" * 16,
               hilight_tags_ms=[2500]),
-        _clip("/other.mp4", duration=8.0, duplicate_group=None),
+        _clip("/other.mp4", duration=8.0, phash="f" * 16),
+    ]}
+    song = {
+        "duration_s": 30.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(60)],
+        "downbeats": [i * 2.0 for i in range(15)],
+        "intro_end_s": 0.0,
+    }
+    return catalog, song
+
+
+def test_visual_duplicates_collapse_to_highest_scoring():
+    """Two sources whose phashes cluster must yield exactly ONE entry in the
+    plan — the higher-scoring one wins, the other is dropped before candidate
+    allocation. Sources outside the cluster are untouched. Clustering happens
+    at plan time from the catalog phashes (no analyze-time duplicate_group)."""
+    catalog, song = _dup_test_fixtures()
+    plan = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
+                      source_cap=5)
+    sources = {entry["source"] for entry in plan}
+    # The low-scoring twin must be evicted; the high-scoring twin survives.
+    assert "/twin_lo.mp4" not in sources
+    assert "/twin_hi.mp4" in sources
+    # The unrelated clip isn't part of the cluster, so it stays available.
+    assert "/other.mp4" in sources
+
+
+def test_visual_dup_threshold_zero_disables_filter():
+    """`visual_dup_threshold=0` must keep both twins in the pool."""
+    catalog, song = _dup_test_fixtures()
+    plan = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
+                      source_cap=5, visual_dup_threshold=0)
+    sources = {entry["source"] for entry in plan}
+    assert "/twin_lo.mp4" in sources
+    assert "/twin_hi.mp4" in sources
+
+
+def test_luma_offset_nudges_outliers_toward_catalog_median():
+    """A clip much darker than the catalog median gets a positive brightness
+    offset (clamped ±0.08); a clip at the median gets ~0."""
+    catalog = {"clips": [
+        _clip("/dark.mp4", duration=8.0, exposure_per_s=[0.2] * 8),
+        _clip("/mid1.mp4", duration=8.0, exposure_per_s=[0.5] * 8),
+        _clip("/mid2.mp4", duration=8.0, exposure_per_s=[0.5] * 8),
     ]}
     song = {
         "duration_s": 30.0,
@@ -169,13 +234,39 @@ def test_duplicate_group_collapses_to_highest_scoring():
         "intro_end_s": 0.0,
     }
     plan = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
-                      source_cap=5)
-    sources = {entry["source"] for entry in plan}
-    # The low-scoring twin must be evicted; the high-scoring twin survives.
-    assert "/twin_lo.mp4" not in sources
-    assert "/twin_hi.mp4" in sources
-    # The unrelated clip isn't part of the cluster, so it stays available.
-    assert "/other.mp4" in sources
+                      source_cap=1)
+    by_src = {e["source"]: e for e in plan}
+    # dark: (0.5 - 0.2) * 0.5 = 0.15 → clamped to 0.08.
+    assert by_src["/dark.mp4"]["luma_offset"] == 0.08
+    assert by_src["/mid1.mp4"]["luma_offset"] == 0.0
+
+
+def test_strict_chronological_disables_trailer_arc():
+    """With hook/climax off, entries follow capture time exactly; with the
+    default trailer arc on, the best pick is hoisted to the front."""
+    clips = []
+    for i in range(10):
+        kw = {"captured_at": 1000.0 + i}
+        if i == 6:  # chronologically mid-late clip out-scores everything
+            kw["hilight_tags_ms"] = [1000]
+        clips.append(_clip(f"/c{i}.mp4", duration=8.0, **kw))
+    catalog = {"clips": clips}
+    song = {
+        "duration_s": 40.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(80)],
+        "downbeats": [i * 2.0 for i in range(20)],
+        "intro_end_s": 0.0,
+    }
+    arc = build_plan(catalog, song, target_len=30.0, no_speed_ramp=True,
+                     source_cap=1)
+    assert arc[0]["source"] == "/c6.mp4"  # hook hoists the best shot
+
+    strict = build_plan(catalog, song, target_len=30.0, no_speed_ramp=True,
+                        source_cap=1, hook=False, climax=False)
+    order = [e["source"] for e in strict]
+    assert order == sorted(order, key=lambda s: int(s[2:-4])), \
+        f"strict plan not in capture order: {order}"
 
 
 def test_low_fps_never_gets_speed_ramp():

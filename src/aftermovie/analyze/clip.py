@@ -146,6 +146,7 @@ def analyze_clip(path: Path, origin_still: Path | None = None) -> ClipInfo | Non
         audio_energy=audio_energy,
         voice_energy=voice_energy,
         accl_peaks=per_second(motion["accl_mag"], n_sec),
+        gyro_peaks=per_second(motion["gyro_mag"], n_sec),
         gps_speed=per_second(motion["gps_speed"], n_sec),
         is_short_form=is_short_form,
         captured_at=captured_at_for(path),

@@ -169,7 +169,7 @@ ALLOWED_RENDER_OVERRIDES = frozenset({
     "audio_mix", "transitions", "no_speed_ramp", "no_reframe", "lut",
     "theme", "source_cap", "chronological", "preview", "no_stills",
     "still_duration", "titles", "title_text", "burst_window_s",
-    "moments_per_source",
+    "moments_per_source", "visual_dup_threshold", "strict_chronological",
 })
 
 # Audio file extensions the song picker accepts and `list_candidate_songs`

@@ -89,6 +89,21 @@ FACE = ScoreComponent(
     polarity="+",
     weight_hint=0.5,
 )
+AUDIO_PEAK = ScoreComponent(
+    name="audio_peak",
+    description="Window's audio loudness spikes vs the clip's own baseline "
+                "(>=85th percentile and loud in absolute terms) — cheers, "
+                "impacts, crowd roars. Steady loudness never trips this.",
+    polarity="+",
+    weight_hint=1.5,
+)
+GYRO_SPIN = ScoreComponent(
+    name="gyro_spin",
+    description="Peak GPMF gyro magnitude in the window exceeds a fast-"
+                "rotation threshold (spins, whips, tricks).",
+    polarity="+",
+    weight_hint=1.5,
+)
 USER_FAVORITE = ScoreComponent(
     name="user_favorite",
     description="Source is in the user's per-folder favorites preferences list.",
@@ -119,6 +134,8 @@ _ALL: tuple[ScoreComponent, ...] = (
     HILIGHT_TAG,
     ACCL_JUMP,
     GPS_SPEED,
+    AUDIO_PEAK,
+    GYRO_SPIN,
     FACE,
     USER_FAVORITE,
     BLURRY,
@@ -148,9 +165,11 @@ def get(name: str) -> ScoreComponent:
 __all__ = [
     "ACCL_JUMP",
     "AUDIO",
+    "AUDIO_PEAK",
     "BLURRY",
     "FACE",
     "GPS_SPEED",
+    "GYRO_SPIN",
     "HILIGHT_TAG",
     "MOTION",
     "POOR_EXPOSURE",

@@ -11,8 +11,8 @@ compare each pixel to its right neighbour → 64 bits → 16-char hex. dHash
 is cheap, robust to mild crop / exposure shifts, and gives us a useful
 Hamming distance metric.
 
-Frame source: for video files we grab a single frame from the middle of
-the clip via ffmpeg into a temp PNG, then hash that. For still images
+Frame source: for video files we grab frames at 25/50/75% of the clip via
+ffmpeg into temp PNGs and hash each (':'-joined signature). For still images
 (materialized stills are mp4s by the time they reach the catalog, so this
 mostly matters for direct callers / tests) we load straight via PIL.
 
@@ -47,34 +47,34 @@ STILL_SUFFIXES = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".webp",
                   ".bmp", ".tiff", ".tif"}
 
 
-def _extract_middle_frame_png(path: Path) -> Path | None:
-    """Grab a single PNG frame from the middle of a video into a temp file.
-
-    Caller is responsible for unlinking the returned path. Returns None if
-    ffprobe or ffmpeg fails (corrupt file, no ffmpeg on PATH, etc.)."""
-    # Probe duration so we can seek to the midpoint. A failed probe usually
-    # means a corrupt clip — bail rather than guess.
+def _probe_duration(path: Path) -> float | None:
+    """ffprobe the container duration; None on failure (corrupt clip etc.)."""
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
             capture_output=True, text=True, check=True, timeout=10,
         )
-        dur = float(probe.stdout.strip() or "0")
+        return float(probe.stdout.strip() or "0")
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired, ValueError):
         # Route the warn-once through the shared registry so the missing-PATH
         # message fires at most once per process.
         _FFPROBE.require()
         return None
-    mid = max(0.0, dur / 2.0)
 
+
+def _extract_frame_png(path: Path, ts: float) -> Path | None:
+    """Grab a single PNG frame at `ts` seconds into a temp file.
+
+    Caller is responsible for unlinking the returned path. Returns None if
+    ffmpeg fails (corrupt file, no ffmpeg on PATH, etc.)."""
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     tmp.close()
     out = Path(tmp.name)
     cmd = [
         "ffmpeg", "-y", "-v", "error",
-        "-ss", f"{mid:.3f}", "-i", str(path),
+        "-ss", f"{max(0.0, ts):.3f}", "-i", str(path),
         "-frames:v", "1",
         "-vf", "scale=64:64:force_original_aspect_ratio=decrease",
         str(out),
@@ -117,10 +117,15 @@ def _dhash_from_pil_image(img) -> str:
 
 
 def compute_phash(path: Path) -> str | None:
-    """Return the 16-hex-char dHash of `path`, or None if hashing failed.
+    """Return the dHash signature of `path`, or None if hashing failed.
 
-    Videos are sampled at their midpoint frame via ffmpeg. Stills load
-    straight through PIL (with pillow-heif's HEIC opener if registered).
+    Videos are sampled at 25/50/75% of their duration and the per-frame
+    hashes are joined with ':' (e.g. "aabb..:ccdd..:eeff.."), so two clips
+    of the same scene with offset timing can still match on ANY shared
+    frame. A single midpoint frame missed exactly that case. Stills load
+    straight through PIL (with pillow-heif's HEIC opener if registered)
+    and yield a single 16-hex-char hash — the legacy single-hash format,
+    which `group_duplicates` still understands.
     Any failure mode (missing PIL, missing ffmpeg, unreadable file, weird
     codec) returns None — never raises — so callers can keep going.
     """
@@ -148,14 +153,26 @@ def compute_phash(path: Path) -> str | None:
             except (OSError, ValueError):
                 return None
         elif suffix in VIDEO_SUFFIXES:
-            tmp_png = _extract_middle_frame_png(path)
-            if tmp_png is None:
+            dur = _probe_duration(path)
+            if dur is None:
                 return None
-            try:
-                with Image.open(tmp_png) as img:
-                    return _dhash_from_pil_image(img)
-            except (OSError, ValueError):
-                return None
+            hashes: list[str] = []
+            for frac in (0.25, 0.5, 0.75):
+                tmp_png = _extract_frame_png(path, dur * frac)
+                if tmp_png is None:
+                    continue
+                try:
+                    with Image.open(tmp_png) as img:
+                        hashes.append(_dhash_from_pil_image(img))
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        tmp_png.unlink()
+                    except OSError:
+                        pass
+                    tmp_png = None
+            return ":".join(hashes) if hashes else None
         else:
             # Unknown extension — try PIL as a last resort.
             try:
@@ -183,6 +200,18 @@ def hamming_distance(a: str, b: str) -> int:
         return bin(int(a, 16) ^ int(b, 16)).count("1")
     except ValueError:
         return 64
+
+
+def signature_distance(a: str, b: str) -> int:
+    """Distance between two (possibly multi-frame) phash signatures.
+
+    Signatures are ':'-joined per-frame dHashes; the distance is the MIN
+    pairwise Hamming distance across all frame combinations — two clips
+    sharing ANY visually-identical sampled frame count as twins, so offset
+    timing can't hide a duplicate. Single legacy hashes are the 1-frame
+    special case."""
+    return min(hamming_distance(ha, hb)
+               for ha in a.split(":") for hb in b.split(":"))
 
 
 def group_duplicates(items: list[tuple[str, str | None]],
@@ -230,7 +259,7 @@ def group_duplicates(items: list[tuple[str, str | None]],
             _, hj = items[j]
             if hj is None:
                 continue
-            if hamming_distance(hi, hj) <= threshold:
+            if signature_distance(hi, hj) <= threshold:
                 union(i, j)
 
     # Count cluster sizes so we can suppress singleton "groups".

@@ -151,7 +151,11 @@ def analyze_clip(path: Path, origin_still: Path | None = None) -> ClipInfo | Non
         gyro_peaks=per_second(motion["gyro_mag"], n_sec),
         gps_speed=per_second(motion["gps_speed"], n_sec),
         is_short_form=is_short_form,
-        captured_at=captured_at_for(path),
+        # Materialized stills: read capture time from the ORIGINAL image —
+        # the cache mp4's mtime is only as good as the stamp it got, and the
+        # original filename (WhatsApp) may be the only timestamp source.
+        captured_at=captured_at_for(origin_still if origin_still is not None
+                                    else path),
         face_bboxes=face_bboxes,
         sharpness_per_s=sharpness,
         exposure_per_s=exposure,

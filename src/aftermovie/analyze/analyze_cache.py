@@ -88,8 +88,13 @@ class AnalyzeCache:
     the bottom of the file is the conventional handle.
     """
 
+    # Bump when the ANALYZER changes what it extracts (new ClipInfo fields,
+    # different captured_at strategy, ...) so every stale entry misses and
+    # re-analyzes — nobody remembers to --force-reanalyze.
+    SCHEMA_VERSION = 2  # v2: filename capture-time + gyro_peaks + embedding
+
     def key_for(self, path: Path) -> str:
-        """SHA1 over `abs_path | mtime_ns | size`.
+        """SHA1 over `schema | abs_path | mtime_ns | size`.
 
         Returns a 40-char hex digest. Raises OSError if the file can't be
         stat'd — callers should let that bubble (a vanished file is also
@@ -98,7 +103,7 @@ class AnalyzeCache:
         """
         p = Path(path).resolve()
         st = p.stat()
-        seed = f"{p}|{st.st_mtime_ns}|{st.st_size}"
+        seed = f"v{self.SCHEMA_VERSION}|{p}|{st.st_mtime_ns}|{st.st_size}"
         return hashlib.sha1(seed.encode("utf-8")).hexdigest()
 
     def path_for_key(self, key: str) -> Path:

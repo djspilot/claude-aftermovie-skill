@@ -5,14 +5,45 @@ For videos: ffprobe `format.tags.creation_time`.
 For materialized stills (mp4 in our cache): we can't read it from the
 output — caller should pass the *source* still path instead.
 
-Falls back to file mtime when no embedded timestamp is found.
+When no embedded timestamp exists (WhatsApp strips EXIF from everything),
+the filename is tried next — WhatsApp exports carry the moment right in
+the name (`00003021-PHOTO-2026-04-08-08-43-11.jpg`, `IMG-20260408-WA0012.jpg`).
+Only then do we fall back to file mtime, which after a chat export is the
+download time and useless for ordering.
 """
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+# `...-2026-04-08-08-43-11.ext` (WhatsApp "export chat" style, full moment).
+_NAME_FULL_TS = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})")
+# `IMG-20260408-WA0012.jpg` / `VID-20260408-WA0034.mp4` (in-app save style,
+# date only). The WA sequence number preserves same-day send order, so we
+# fold it in as seconds to keep the interleave stable.
+_NAME_WA_DAY = re.compile(r"(?:IMG|VID)-(\d{8})-WA(\d+)", re.IGNORECASE)
+
+
+def _from_filename(path: Path) -> float | None:
+    name = path.name
+    m = _NAME_FULL_TS.search(name)
+    if m:
+        try:
+            return datetime(*map(int, m.groups())).timestamp()
+        except ValueError:
+            pass
+    m = _NAME_WA_DAY.search(name)
+    if m:
+        try:
+            day = datetime.strptime(m.group(1), "%Y%m%d")
+            return day.timestamp() + int(m.group(2))
+        except ValueError:
+            pass
+    return None
 
 
 def _from_ffprobe(path: Path) -> float | None:
@@ -85,6 +116,11 @@ def captured_at_for(path: Path) -> float | None:
             return t
     # Cross-try the other strategy in case the file lies about its extension.
     t = _from_pil_exif(path) or _from_ffprobe(path)
+    if t is not None:
+        return t
+    # Embedded metadata stripped (WhatsApp does this) — the filename often
+    # still carries the moment.
+    t = _from_filename(path)
     if t is not None:
         return t
     try:

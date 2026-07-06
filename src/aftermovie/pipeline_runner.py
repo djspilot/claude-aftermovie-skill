@@ -71,6 +71,7 @@ class AutoOpts:
     strict_chronological: bool = False  # no hook/climax reshuffle
     burst_window_s: float = 3.0
     visual_dup_threshold: int | None = None  # dHash bits; 0 = off, None = scorer default (8)
+    stabilize: bool = False  # deshake gyro-shaky clips at prerender
     preview: bool = False
     reveal: bool = True
     force_reanalyze: bool = False
@@ -222,6 +223,7 @@ def run_auto(clips: Path, song: Path, output: Path, opts: AutoOpts,
         burst_window_s=opts.burst_window_s,
         visual_dup_threshold=opts.visual_dup_threshold,
         moments_per_source=opts.moments_per_source,
+        stabilize=opts.stabilize,
     )
     cmd_score(s)
 

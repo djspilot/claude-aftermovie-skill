@@ -12,6 +12,7 @@ from aftermovie.analyze.analyze_cache import analyze_cache
 from aftermovie.analyze.audio import measure_audio_energy, measure_voice_energy
 from aftermovie.analyze.capture_time import captured_at_for
 from aftermovie.analyze.duplicates import compute_phash, group_duplicates
+from aftermovie.analyze.embedding import embed_for_clip
 from aftermovie.analyze.faces import available as faces_available
 from aftermovie.analyze.faces import detect_per_second
 from aftermovie.analyze.motion import measure_motion_energy
@@ -122,6 +123,7 @@ def analyze_clip(path: Path, origin_still: Path | None = None) -> ClipInfo | Non
     # Perceptual hash: hash the origin still if this clip was materialized
     # from one, otherwise hash a midpoint frame of the video.
     phash = compute_phash(origin_still if origin_still is not None else path)
+    embedding = embed_for_clip(path, origin_still)
 
     def per_second(arr: list[float], target_len: int) -> list[float]:
         if not arr or target_len == 0:
@@ -154,6 +156,7 @@ def analyze_clip(path: Path, origin_still: Path | None = None) -> ClipInfo | Non
         sharpness_per_s=sharpness,
         exposure_per_s=exposure,
         phash=phash,
+        embedding=embedding,
         # duplicate_group is stamped in after the whole catalog is built
         # (we need every clip's phash before we can cluster them).
     )

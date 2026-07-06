@@ -201,6 +201,13 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     if input_shim:
         vfilter.append(input_shim)
 
+    # ponytail: single-pass deshake — mediocre vs vidstab's two-pass, but
+    # built into every ffmpeg. Upgrade path: vidstabdetect/vidstabtransform
+    # when libvidstab is available. Runs on the original frame, before any
+    # scale/crop, where the motion estimate is most accurate.
+    if entry.get("stabilize"):
+        vfilter.append("deshake")
+
     reframe_filter = None
     if (enable_reframe and aspect == "9:16"
             and entry.get("face_bboxes")
@@ -268,6 +275,12 @@ def _prerender_clip(entry: dict, out_clip: Path, *,
     pad_dur = max(0.0, slot_dur - native_out_dur)
     if pad_dur > 0.05:
         vfilter.append(f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}")
+    # Outro fade-to-black (planner stamps `fade_out_s` on the final entry).
+    fade_out_s = float(entry.get("fade_out_s") or 0.0)
+    if fade_out_s > 0.05 and slot_dur > fade_out_s:
+        vfilter.append(
+            f"fade=t=out:st={slot_dur - fade_out_s:.3f}:d={fade_out_s:.3f}"
+        )
     # B5: VT encoders are picky about input pixel formats. Re-assert the
     # encoder's target pixfmt at the tail of the chain so setpts/tpad/lut3d
     # outputs don't fall through to a format VT rejects.

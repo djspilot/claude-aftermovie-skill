@@ -36,6 +36,8 @@
     speedRamp: $("#speed-ramp"),
     reframe: $("#reframe"),
     keepBursts: $("#keep-bursts"),
+    visualDup: $("#visual-dup"),
+    strictChrono: $("#strict-chrono"),
     selectAll: $("#select-all"),
     deselectAll: $("#deselect-all"),
     render: $("#render"),
@@ -286,6 +288,8 @@
       no_speed_ramp: !els.speedRamp.checked,
       no_reframe: !els.reframe.checked,
       burst_window_s: els.keepBursts.checked ? 0 : 3,
+      visual_dup_threshold: clampInt(els.visualDup.value, 0, 64, 8),
+      strict_chronological: els.strictChrono.checked || null,
     });
     if (isPreview) body.preview = true;
     openModal();

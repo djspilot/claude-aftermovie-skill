@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from aftermovie.analyze.duplicates import group_duplicates, signature_distance
+from aftermovie.analyze.embedding import cosine
 from aftermovie.config import DEFAULT_TARGET_LEN_S, MIN_CLIP_S
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.transitions import decide_transitions
@@ -299,7 +300,20 @@ def _suppress_visual_duplicates(candidates: list[Candidate],
         [(src, info.get("phash")) for src, info in by_source.items()],
         threshold=threshold,
     )
+    return _keep_best_per_group(
+        candidates, groups,
+        log_line=f"visual-dup suppress: dropped {{n}} source(s) visually "
+                 f"twinned with a higher-scored sibling (threshold={threshold})",
+    )
 
+
+def _keep_best_per_group(candidates: list[Candidate],
+                         groups: dict[str, str | None],
+                         *, log_line: str) -> list[Candidate]:
+    """Shared cluster-suppression: for every non-None group in `groups`
+    (source path → group id), keep only the source whose best candidate
+    scores highest; drop all candidates from the cluster's other sources.
+    `log_line` is formatted with `{n}` = number of dropped sources."""
     # Per-group, find the source whose best-scoring candidate wins.
     group_best_source: dict[str, tuple[float, str]] = {}
     for c in candidates:
@@ -316,8 +330,7 @@ def _suppress_visual_duplicates(candidates: list[Candidate],
     # Every source in a cluster that ISN'T the winner gets dropped.
     suppressed_sources: set[str] = set()
     cluster_members: dict[str, list[str]] = {}
-    for src in by_source:
-        gid = groups.get(src)
+    for src, gid in groups.items():
         if gid:
             cluster_members.setdefault(gid, []).append(src)
     for gid, members in cluster_members.items():
@@ -328,10 +341,61 @@ def _suppress_visual_duplicates(candidates: list[Candidate],
 
     if not suppressed_sources:
         return candidates
-    log(f"visual-dup suppress: dropped {len(suppressed_sources)} source(s) "
-        f"visually twinned with a higher-scored sibling "
-        f"(threshold={threshold})")
+    log(log_line.format(n=len(suppressed_sources)))
     return [c for c in candidates if c.source not in suppressed_sources]
+
+
+# Cosine similarity above which two clips count as "the same scene" even
+# when their frames don't pixel-match (different angle / moment). Only
+# active when the optional embedding layer produced vectors at analyze time.
+SEMANTIC_DUP_COSINE = 0.92
+
+
+def _suppress_semantic_duplicates(candidates: list[Candidate],
+                                  by_source: dict[str, dict[str, Any]],
+                                  sim_threshold: float = SEMANTIC_DUP_COSINE,
+                                  ) -> list[Candidate]:
+    """Collapse candidates whose sources are SEMANTICALLY the same scene
+    (embedding cosine >= `sim_threshold`). Complements the phash filter:
+    dHash catches identical frames, this catches identical subjects from
+    different angles. No-op when embeddings are absent (optional dep)."""
+    if not candidates:
+        return candidates
+    embs = [(src, info["embedding"]) for src, info in by_source.items()
+            if info.get("embedding")]
+    if len(embs) < 2:
+        return candidates
+
+    # Union-find transitive closure, same shape as group_duplicates.
+    n = len(embs)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cosine(embs[i][1], embs[j][1]) >= sim_threshold:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[max(ri, rj)] = min(ri, rj)
+
+    sizes: dict[int, int] = {}
+    for i in range(n):
+        sizes[find(i)] = sizes.get(find(i), 0) + 1
+    groups: dict[str, str | None] = {
+        src: (f"s{find(i)}" if sizes[find(i)] >= 2 else None)
+        for i, (src, _) in enumerate(embs)
+    }
+    return _keep_best_per_group(
+        candidates, groups,
+        log_line=f"semantic-dup suppress: dropped {{n}} source(s) showing "
+                 f"the same scene as a higher-scored sibling "
+                 f"(cosine>={sim_threshold})",
+    )
 
 
 def _suppress_bursts(candidates: list[Candidate],
@@ -776,9 +840,16 @@ def decide_speed(pick: Candidate, beat_t: float,
     Drop slam: the first cut of a detected `drop` section always ramps
     (high-fps sources only) — slow-in that snaps to full speed right when
     the drop hits, regardless of the pick's own action reasons.
+
+    Build lift: cuts inside a `build` section run a subtle 1.0x → 1.15x
+    speed-up (any fps — speeding up never judders) so the visual pace
+    rises with the musical tension toward the drop.
     """
     if no_speed_ramp:
         return (1.0, 1.0)
+    section = _section_for_time(beat_t, song.get("sections") or [])
+    if section == "build":
+        return (1.0, 1.15)
     if pick.src_fps < 90:
         return (1.0, 1.0)
     # ponytail: sections have whole-second starts, so "first cut of the
@@ -952,7 +1023,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
                climax: bool = True,
                stretch_stills: bool = True,
                preferences: dict[str, Any] | None = None,
-               moments_per_source: int | None = None) -> list[dict[str, Any]]:
+               moments_per_source: int | None = None,
+               stabilize: bool = False) -> list[dict[str, Any]]:
     """Greedy-fill plan entries against the song's beat structure.
 
     Orchestrates three seams:
@@ -998,6 +1070,11 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     candidates = _suppress_bursts(candidates, by_source, window_s=burst_window_s)
     candidates = _suppress_visual_duplicates(candidates, by_source,
                                              threshold=visual_dup_threshold)
+    # Third layer, gated on the visual-dup knob too (0 = "keep similar
+    # clips" must also keep same-scene shots): semantic same-scene collapse
+    # via optional embeddings. No-op on catalogs without embeddings.
+    if visual_dup_threshold > 0:
+        candidates = _suppress_semantic_duplicates(candidates, by_source)
     cut_points = select_cut_points(song, target_len, pace)
 
     # F3 moment-budget pass — replaces the C4 pool-level top-N subset trim.
@@ -1156,6 +1233,15 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             audio_interest = float(sum(window) / max(len(window), 1))
         else:
             audio_interest = 0.0
+        # Stabilization (opt-in): flag windows with a sustained-high gyro
+        # baseline — camera shake, not a deliberate spin (those keep their
+        # energy). The renderer runs ffmpeg deshake on flagged entries.
+        stab = False
+        if stabilize and "gyro_spin" not in pick.reasons:
+            g = src_clip.get("gyro_peaks") or []
+            g_win = g[start_i:end_i] or g
+            if g_win and sorted(g_win)[len(g_win) // 2] >= 1.2:
+                stab = True
         luma_offset = 0.0
         expo = src_clip.get("exposure_per_s") or []
         if target_luma is not None and expo:
@@ -1176,6 +1262,7 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             "components": dict(pick.components),
             "audio_interest": audio_interest,
             "luma_offset": round(luma_offset, 4),
+            "stabilize": stab,
             "source_width": int(src_clip.get("width", 1920)),
             "source_height": int(src_clip.get("height", 1080)),
             "face_bboxes": src_faces[start_i:end_i] if src_faces else [],
@@ -1251,6 +1338,14 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
             log(f"  ! stretch-mode: stretched tail {tail_n} entries "
                 f"{old_tail_total:.1f}s → {new_tail_total:.1f}s "
                 f"(×{mult:.2f}) to fill {target_len:.1f}s")
+
+    # Outro: fade the last shot to black so the edit ends instead of stopping.
+    # Duration scales with the final slot (never more than 60% of it, max 1s);
+    # the renderer reads `fade_out_s` and the audio tail fade already matches.
+    if plan_entries:
+        last = plan_entries[-1]
+        last["fade_out_s"] = round(
+            min(1.0, float(last["out_duration_s"]) * 0.6), 3)
 
     return plan_entries
 
@@ -1334,6 +1429,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         stretch_stills=bool(getattr(args, "stretch_stills", True)),
         preferences=preferences,
         moments_per_source=moments_per_source,
+        stabilize=bool(getattr(args, "stabilize", False)),
     )
     tmode = getattr(args, "transitions", "cut")
     if tmode in ("auto", "soft"):

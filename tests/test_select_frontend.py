@@ -197,3 +197,15 @@ def test_import_from_devices_panel_wired() -> None:
     assert "/api/import-sources" in js, "app.js does not call /api/import-sources"
     assert "/api/import" in js, "app.js does not call /api/import"
     assert "/api/import-status" in js, "app.js does not call /api/import-status"
+
+
+def test_similarity_and_strict_timeline_controls_wired() -> None:
+    """The Similar-clips dropdown and Strict-timeline checkbox exist in the
+    DOM and app.js sends their values as render overrides."""
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="visual-dup"' in html, "index.html missing #visual-dup select"
+    assert 'id="strict-chrono"' in html, "index.html missing #strict-chrono checkbox"
+    assert "visual_dup_threshold" in js, "app.js does not send visual_dup_threshold"
+    assert "strict_chronological" in js, "app.js does not send strict_chronological"

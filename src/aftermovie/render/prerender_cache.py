@@ -186,6 +186,9 @@ class PrerenderCache:
             # Color-consistency nudge — same span, different brightness
             # correction must be a different cached clip.
             f"{float(entry.get('luma_offset') or 0.0):.4f}",
+            # Outro fade — the same span with/without a tail fade differs.
+            f"{float(entry.get('fade_out_s') or 0.0):.3f}",
+            "stab" if entry.get("stabilize") else "",
         ]
         seed = "|".join(parts)
         return hashlib.sha1(seed.encode("utf-8")).hexdigest()

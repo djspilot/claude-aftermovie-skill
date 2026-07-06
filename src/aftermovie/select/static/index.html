@@ -44,6 +44,15 @@
           <option value="8">8</option>
         </select>
       </label>
+      <label class="ctrl"
+             title="Drop clips that look like a higher-scored one. Off keeps every similar shot; aggressive also catches near-matches.">
+        <span>Similar clips</span>
+        <select id="visual-dup" aria-label="Similar-clip filter">
+          <option value="0">keep all</option>
+          <option value="8" selected>filter twins</option>
+          <option value="16">aggressive</option>
+        </select>
+      </label>
       <label class="ctrl">
         <span>Look</span>
         <select id="lut" aria-label="LUT">
@@ -95,6 +104,11 @@
       <label class="check">
         <input id="keep-bursts" type="checkbox" checked>
         <span>Keep nearby</span>
+      </label>
+      <label class="check"
+             title="Pure capture-time order: no best-shot opener or top-picks ending.">
+        <input id="strict-chrono" type="checkbox">
+        <span>Strict timeline</span>
       </label>
       <button id="select-all" class="btn ghost" type="button">Select all</button>
       <button id="deselect-all" class="btn ghost" type="button">Deselect all</button>

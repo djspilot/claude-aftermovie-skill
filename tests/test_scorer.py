@@ -218,6 +218,103 @@ def test_visual_dup_threshold_zero_disables_filter():
     assert "/twin_hi.mp4" in sources
 
 
+def test_semantic_duplicates_collapse_and_respect_off_switch():
+    """Sources whose embeddings are near-parallel (same scene, different
+    angle — phashes far apart) collapse to the best one; setting
+    visual_dup_threshold=0 keeps them all. Clips without embeddings pass."""
+    import math
+    a = [1.0, 0.0, 0.0]
+    b = [math.cos(0.2), math.sin(0.2), 0.0]   # cosine ≈ 0.98 with a
+    c = [0.0, 0.0, 1.0]                        # orthogonal
+    catalog = {"clips": [
+        _clip("/scene1_lo.mp4", duration=8.0, embedding=a,
+              phash="0" * 16),
+        _clip("/scene1_hi.mp4", duration=8.0, embedding=b,
+              phash="f" * 16, hilight_tags_ms=[2500]),
+        _clip("/other.mp4", duration=8.0, embedding=c,
+              phash="00ff00ff00ff00ff"),
+    ]}
+    song = {
+        "duration_s": 30.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(60)],
+        "downbeats": [i * 2.0 for i in range(15)],
+        "intro_end_s": 0.0,
+    }
+    plan = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
+                      source_cap=1)
+    sources = {e["source"] for e in plan}
+    assert "/scene1_lo.mp4" not in sources
+    assert "/scene1_hi.mp4" in sources
+    assert "/other.mp4" in sources
+
+    off = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
+                     source_cap=1, visual_dup_threshold=0)
+    off_sources = {e["source"] for e in off}
+    assert {"/scene1_lo.mp4", "/scene1_hi.mp4"} <= off_sources
+
+
+def test_cosine_dot_product_and_mismatch():
+    from aftermovie.analyze.embedding import cosine
+    assert cosine([1.0, 0.0], [1.0, 0.0]) == 1.0
+    assert cosine([1.0, 0.0], [0.0, 1.0]) == 0.0
+    assert cosine([1.0], [1.0, 0.0]) == 0.0  # length mismatch → dissimilar
+
+
+def test_stabilize_flags_shaky_windows_but_not_spins():
+    """With stabilize=True, sustained-high gyro flags the entry; a
+    deliberate spin (gyro_spin reason) and calm footage do not. Default off."""
+    catalog = {"clips": [
+        _clip("/shaky.mp4", duration=8.0, gyro_peaks=[1.5] * 8),
+        _clip("/spin.mp4", duration=8.0,
+              gyro_peaks=[0.5, 0.5, 4.0, 0.5, 0.5, 0.5, 0.5, 0.5]),
+        _clip("/calm.mp4", duration=8.0, gyro_peaks=[0.3] * 8),
+    ]}
+    song = {
+        "duration_s": 30.0,
+        "tempo_bpm": 120,
+        "beats": [i * 0.5 for i in range(60)],
+        "downbeats": [i * 2.0 for i in range(15)],
+        "intro_end_s": 0.0,
+    }
+    plan = build_plan(catalog, song, target_len=20.0, no_speed_ramp=True,
+                      source_cap=1, stabilize=True)
+    by_src = {e["source"]: e for e in plan}
+    assert by_src["/shaky.mp4"]["stabilize"] is True
+    assert by_src["/calm.mp4"]["stabilize"] is False
+    assert by_src["/spin.mp4"]["stabilize"] is False  # gyro_spin reason wins
+
+    default_plan = build_plan(catalog, song, target_len=20.0,
+                              no_speed_ramp=True, source_cap=1)
+    assert all(e["stabilize"] is False for e in default_plan)
+
+
+def test_build_section_gets_speed_lift_and_last_entry_fades_out():
+    """Cuts inside a `build` section run 1.0→1.15x; the final plan entry
+    carries a fade_out_s stamp scaled to its slot."""
+    catalog = {"clips": [
+        _clip(f"/c{i}.mp4", duration=8.0) for i in range(4)
+    ]}
+    song = {
+        "duration_s": 16.0,
+        "tempo_bpm": 120,
+        "beats": [i * 2.0 for i in range(8)],
+        "downbeats": [0.0, 8.0],
+        "intro_end_s": 0.0,
+        "sections": [
+            {"kind": "verse", "start_s": 0.0, "end_s": 4.0},
+            {"kind": "build", "start_s": 4.0, "end_s": 16.0},
+        ],
+    }
+    plan = build_plan(catalog, song, target_len=8.0, no_speed_ramp=False,
+                      source_cap=1, stretch_stills=False)
+    in_build = [e for e in plan if e["beat_time_s"] >= 4.0]
+    assert in_build, plan
+    assert all(e["speed_end"] == 1.15 for e in in_build)
+    assert plan[-1]["fade_out_s"] > 0.05
+    assert all("fade_out_s" not in e for e in plan[:-1])
+
+
 def test_hilight_tag_recentered_at_40pct_of_slot():
     """A pick with a HiLight tag re-anchors its source window so the tag
     sits ~40% into the slot instead of wherever the integer-second window

@@ -191,6 +191,11 @@ def _add_score_flags(p: argparse.ArgumentParser) -> None:
                    default=None,
                    help="Seconds used to collapse near-duplicate burst shots. "
                         "0 disables burst suppression.")
+    p.add_argument("--stabilize", dest="stabilize",
+                   action="store_true", default=False,
+                   help="Deshake clips whose GPMF gyro shows sustained "
+                        "camera shake (deliberate spins are left alone). "
+                        "Slower renders; needs GoPro telemetry.")
     p.add_argument("--visual-dup-threshold", dest="visual_dup_threshold",
                    type=int, default=None,
                    help="dHash Hamming distance below which clips count as "

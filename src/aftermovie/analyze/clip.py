@@ -30,6 +30,8 @@ from aftermovie.analyze.stills import (
     _under_skipped_dir,
     find_live_photos_and_stills,
     materialize_still,
+    materialize_still_duo,
+    pair_portrait_stills,
 )
 from aftermovie.config import VIDEO_EXTS
 from aftermovie.ffmpeg_cmd import ffprobe_json, log
@@ -231,9 +233,23 @@ def discover_sources(folder: Path, still_duration_s: float = DEFAULT_STILL_DURAT
                 f"motion, re-export from Photos.app with 'Keep Originals' or "
                 f"AirDrop the Live Photo directly.")
         if stills:
-            log(f"Materializing {len(stills)} stills ({still_duration_s}s each, "
-                f"Ken Burns zoom)...")
-            for s in stills:
+            # Two portrait photos captured close together share one shot:
+            # side-by-side on the landscape canvas instead of two padded
+            # singles. Failed duos fall back to the single-still path.
+            duos, singles = pair_portrait_stills(stills)
+            log(f"Materializing {len(stills)} stills "
+                f"({len(duos)} portrait pair(s), {len(singles)} single(s), "
+                f"{still_duration_s}s each)...")
+            for a, b in duos:
+                duo_mp4 = materialize_still_duo(a, b, duration_s=still_duration_s)
+                if duo_mp4 is not None:
+                    sources.append(duo_mp4)
+                    # First still is the duo's origin for quality/phash/
+                    # capture-time sampling.
+                    _STILL_ORIGIN[str(duo_mp4)] = a
+                else:
+                    singles.extend((a, b))
+            for s in singles:
                 mp4 = materialize_still(s, duration_s=still_duration_s)
                 if mp4 is not None:
                     sources.append(mp4)

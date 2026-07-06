@@ -152,6 +152,117 @@ def _decode_to_png(src: Path) -> Path | None:
         return None
 
 
+# Two portrait photos shot close together become ONE side-by-side shot on a
+# landscape canvas — the Quik-style duo. Only pairs within this window (same
+# scene, not months apart in a chat export) are combined.
+DUO_PAIR_WINDOW_S = 600.0
+
+
+def _is_portrait(path: Path) -> bool:
+    """True when the image renders taller than wide (EXIF-orientation aware).
+    Header-only read; any failure counts as not-portrait."""
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            w, h = img.size
+            # Orientations 5-8 rotate 90° — displayed dims are swapped.
+            if (img.getexif() or {}).get(274, 1) in (5, 6, 7, 8):
+                w, h = h, w
+        return h > w
+    except Exception:
+        return False
+
+
+def pair_portrait_stills(stills: list[Path]) -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """Split stills into (portrait duo pairs, remaining singles).
+
+    Greedy over capture-time order: two DIRECTLY consecutive portrait stills
+    captured within DUO_PAIR_WINDOW_S pair up; everything else stays single.
+    """
+    from aftermovie.analyze.capture_time import captured_at_for
+
+    timed = sorted(stills, key=lambda p: (captured_at_for(p) or float("inf"),
+                                          str(p)))
+    times = {p: captured_at_for(p) for p in timed}
+    pairs: list[tuple[Path, Path]] = []
+    singles: list[Path] = []
+    i = 0
+    while i < len(timed):
+        a = timed[i]
+        b = timed[i + 1] if i + 1 < len(timed) else None
+        if (b is not None and _is_portrait(a) and _is_portrait(b)
+                and times[a] is not None and times[b] is not None
+                and (times[b] - times[a]) <= DUO_PAIR_WINDOW_S):
+            pairs.append((a, b))
+            i += 2
+        else:
+            singles.append(a)
+            i += 1
+    return pairs, singles
+
+
+def materialize_still_duo(a: Path, b: Path,
+                          duration_s: float = DEFAULT_STILL_DURATION_S,
+                          target_res: str = "1920x1080",
+                          force: bool = False) -> Path | None:
+    """Render two portrait stills side-by-side into one cached mp4.
+
+    Each half scale-fills width/2 × height (center crop), then hstack.
+    ponytail: static duo — no Ken Burns; the split itself is the visual.
+    Returns None if either image can't be decoded."""
+    cache_dir = _stills_cache_dir()
+    key = hashlib.sha1(
+        f"duo|{_cache_key(a, duration_s, target_res)}"
+        f"|{_cache_key(b, duration_s, target_res)}".encode()
+    ).hexdigest()[:16]
+    out = cache_dir / f"duo_{key}.mp4"
+    if out.is_file() and not force:
+        return out
+
+    png_a = _decode_to_png(a)
+    png_b = _decode_to_png(b)
+    if png_a is None or png_b is None:
+        return None
+
+    w, h = (int(x) for x in target_res.split("x"))
+    half = (w // 2) // 2 * 2  # even width for yuv420p
+    fill = (f"scale={half}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={half}:{h},setsar=1")
+    graph = (f"[0:v]{fill}[l];[1:v]{fill}[r];"
+             f"[l][r]hstack=inputs=2,fps=30,format=yuv420p")
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-loop", "1", "-i", str(png_a),
+           "-loop", "1", "-i", str(png_b),
+           "-t", f"{duration_s:.3f}", "-filter_complex", graph, "-an",
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+           str(out)]
+    try:
+        run(cmd, check=True)
+        try:
+            import os
+            from aftermovie.analyze.capture_time import captured_at_for
+            ts = captured_at_for(a)
+            if ts is not None:
+                os.utime(out, (ts, ts))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+    except subprocess.CalledProcessError:
+        log(f"  ! ffmpeg failed on duo still {a.name} + {b.name}")
+        if out.is_file():
+            try:
+                out.unlink()
+            except OSError:
+                pass
+        return None
+    finally:
+        for p in (png_a, png_b):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
 def materialize_still(path: Path, duration_s: float = DEFAULT_STILL_DURATION_S,
                       target_res: str = "1920x1080",
                       force: bool = False) -> Path | None:

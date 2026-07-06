@@ -54,9 +54,24 @@ class CatalogRepository:
     """
 
     def id_for(self, folder: Path) -> str:
-        """Stable Catalog id derived from folder + sorted file list + mtimes."""
+        """Stable Catalog id derived from folder + sorted file list + mtimes.
+
+        The selection sidecar's CONTENT is folded in explicitly: rglob("*")
+        skips dotfiles, so without this a GUI block/unblock never changed
+        the id and renders kept serving the stale catalog with the excluded
+        clips still in it. Content (not mtime) — the GUI rewrites the file
+        on every render start even when nothing changed.
+        """
+        from aftermovie.analyze.selection import SELECTION_FILENAME
+
         folder = Path(folder).resolve()
         pieces = [str(folder)]
+        sel = folder / SELECTION_FILENAME
+        if sel.is_file():
+            try:
+                pieces.append(f"selection|{_hash(sel.read_text())}")
+            except OSError:
+                pass
         for f in sorted(folder.rglob("*")):
             if f.is_file():
                 try:

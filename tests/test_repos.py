@@ -143,3 +143,29 @@ def test_plan_repository_put_stamps_both_ids(tmp_path: Path, monkeypatch) -> Non
     pid = repo.id_for(cid, song, opts.theme, opts.max_length, opts.aspect, opts.seed)
     assert plan["_aftermovie"]["catalog_id"] == cid
     assert plan["_aftermovie"]["plan_id"] == pid
+
+
+def test_catalog_id_changes_when_selection_changes(tmp_path: Path, monkeypatch) -> None:
+    """Blocking a clip in the GUI writes the selection sidecar; the catalog
+    id must change so the cached (unfiltered) catalog misses and analyze
+    re-runs with the exclusion applied. Rewriting the SAME selection (the
+    GUI saves on every render start) must NOT change the id."""
+    _isolated_data_dir(tmp_path, monkeypatch)
+    clips = _seed_clips(tmp_path)
+    repo = CatalogRepository()
+
+    base = repo.id_for(clips)
+
+    sel = clips / ".aftermovie-selection.json"
+    sel.write_text('{"excluded": ["a.mp4"]}')
+    blocked = repo.id_for(clips)
+    assert blocked != base
+
+    # Same content, fresh mtime → id stays stable (no pointless re-analyze).
+    time.sleep(0.01)
+    sel.write_text('{"excluded": ["a.mp4"]}')
+    assert repo.id_for(clips) == blocked
+
+    # Unblocking changes the content again → new id again.
+    sel.write_text('{"excluded": []}')
+    assert repo.id_for(clips) != blocked

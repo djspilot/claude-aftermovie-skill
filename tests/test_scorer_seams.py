@@ -116,6 +116,41 @@ def test_allocate_candidates_custom_cap():
     assert len(picks_cap5) == 5
 
 
+def test_diversity_penalty_prefers_visually_fresh_candidate():
+    """When two candidates tie-ish on score but one looks like an already
+    picked source (phash within DIVERSITY_SIMILAR_BITS, above the hard-dedup
+    threshold), the visually fresh one wins the slot."""
+    from aftermovie.score.scorer import allocate_candidates
+
+    def cand(src: str, score: float) -> Candidate:
+        return Candidate(source=src, start_s=0.0, end_s=2.0,
+                         score=score, reasons=[], src_fps=30.0)
+
+    # `similar` is 12 bits from `first` (past dedup's 8, inside diversity's
+    # 16); `fresh` is ~32 bits away. `similar` out-scores `fresh` by 1.0,
+    # less than the 2.0 penalty → fresh must win slot 2.
+    sigs = {
+        "/first.mp4":   "0000000000000000",
+        "/similar.mp4": "0fff000000000000",  # 12 bits
+        "/fresh.mp4":   "00000000ffffffff",  # 32 bits
+    }
+    picks = allocate_candidates(
+        [cand("/first.mp4", 10.0), cand("/similar.mp4", 5.0),
+         cand("/fresh.mp4", 4.0)],
+        [0.0, 2.0, 4.0], source_cap=1, auto_bump_cap=False,
+        source_phash=sigs,
+    )
+    assert [p.source for _, p in picks] == ["/first.mp4", "/fresh.mp4"]
+
+    # Without signatures the higher base score wins as before.
+    picks = allocate_candidates(
+        [cand("/first.mp4", 10.0), cand("/similar.mp4", 5.0),
+         cand("/fresh.mp4", 4.0)],
+        [0.0, 2.0, 4.0], source_cap=1, auto_bump_cap=False,
+    )
+    assert [p.source for _, p in picks] == ["/first.mp4", "/similar.mp4"]
+
+
 def test_decide_speed_requires_high_fps():
     """Speed ramp only fires when src_fps >= 90, regardless of downbeat + reasons."""
     song = {"downbeats": [0.0, 2.0, 4.0]}

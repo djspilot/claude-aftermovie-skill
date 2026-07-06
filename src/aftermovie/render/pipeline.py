@@ -430,23 +430,41 @@ def _prerender_worker(
     )
 
 
+def _transition_dur_s(entry: dict | None) -> float:
+    """The entry's incoming-transition overlap in seconds (0 for cuts)."""
+    if not entry:
+        return 0.0
+    t = entry.get("transition_in") or {}
+    if (t.get("kind") or "cut") == "cut":
+        return 0.0
+    return float(t.get("duration_s") or 0.0)
+
+
 def _compensated_render_entry(entry: dict, *, transitions_active: bool,
-                              is_first: bool) -> tuple[dict, float, float]:
+                              is_first: bool,
+                              next_entry: dict | None = None,
+                              ) -> tuple[dict, float, float]:
     """Return (render_entry, planned_duration, prerender_duration).
 
-    xfade/acrossfade overlaps the incoming clip by `transition_in.duration_s`.
-    To preserve the planner's visible timeline length, the incoming clip must
-    be prerendered longer by exactly that overlap.
+    Transitions are CENTERED on the planned cut: the fade runs from
+    tdur/2 before to tdur/2 after the beat, so the perceived cut stays on
+    the musical grid (an end-anchored fade reads ~tdur/2 early). That means
+    each clip must be prerendered longer by half its own incoming overlap
+    (consumed at its head) plus half the NEXT entry's overlap (its tail
+    keeps playing through the first half of the outgoing fade). The xfade
+    offset math in build_xfade_graph (`offset = cum - tdur`) then lands the
+    fade midpoint exactly on the planned boundary, and total timeline
+    length telescopes back to the planner's sum.
     """
     planned_duration = float(entry.get(
         "out_duration_s",
         (entry["end_s"] - entry["start_s"]) / entry.get("speed", 1.0),
     ))
     render_duration = planned_duration
-    if transitions_active and not is_first:
-        transition = entry.get("transition_in") or {}
-        if (transition.get("kind") or "cut") != "cut":
-            render_duration += float(transition.get("duration_s") or 0.0)
+    if transitions_active:
+        if not is_first:
+            render_duration += _transition_dur_s(entry) / 2.0
+        render_duration += _transition_dur_s(next_entry) / 2.0
 
     render_entry = dict(entry)
     render_entry["out_duration_s"] = render_duration
@@ -516,7 +534,8 @@ def cmd_render(args: argparse.Namespace, *,
         work: list[tuple[dict, Path]] = []
         for i, entry in enumerate(entries):
             render_entry, planned_duration, render_duration = _compensated_render_entry(
-                entry, transitions_active=transitions_active, is_first=(i == 0)
+                entry, transitions_active=transitions_active, is_first=(i == 0),
+                next_entry=entries[i + 1] if i + 1 < len(entries) else None,
             )
             render_entries.append(render_entry)
             planned_durations.append(planned_duration)

@@ -218,6 +218,29 @@ def test_visual_dup_threshold_zero_disables_filter():
     assert "/twin_hi.mp4" in sources
 
 
+def test_hilight_tag_recentered_at_40pct_of_slot():
+    """A pick with a HiLight tag re-anchors its source window so the tag
+    sits ~40% into the slot instead of wherever the integer-second window
+    happened to put it."""
+    catalog = {"clips": [
+        _clip("/tagged.mp4", duration=20.0, hilight_tags_ms=[10_000]),
+    ]}
+    song = {
+        "duration_s": 10.0,
+        "tempo_bpm": 120,
+        "beats": [0.0, 2.0, 4.0, 6.0, 8.0],
+        "downbeats": [0.0, 4.0, 8.0],
+        "intro_end_s": 0.0,
+    }
+    plan = build_plan(catalog, song, target_len=4.0, no_speed_ramp=True,
+                      source_cap=1, stretch_stills=False)
+    entry = next(e for e in plan if "hilight_tag" in e["reasons"])
+    slot = entry["end_s"] - entry["start_s"]
+    tag_pos = (10.0 - entry["start_s"]) / slot
+    assert 0.3 < tag_pos < 0.5, \
+        f"tag at {tag_pos:.2f} of slot, expected ~0.4 (entry={entry})"
+
+
 def test_luma_offset_nudges_outliers_toward_catalog_median():
     """A clip much darker than the catalog median gets a positive brightness
     offset (clamped ±0.08); a clip at the median gets ~0."""

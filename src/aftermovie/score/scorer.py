@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from aftermovie.analyze.duplicates import group_duplicates
+from aftermovie.analyze.duplicates import group_duplicates, signature_distance
 from aftermovie.config import DEFAULT_TARGET_LEN_S, MIN_CLIP_S
 from aftermovie.ffmpeg_cmd import log
 from aftermovie.render.transitions import decide_transitions
@@ -603,6 +603,15 @@ def _section_picker_score(c: Candidate, kind: str) -> float:
     return c.score + bonus
 
 
+# Pool diversity: a candidate whose phash signature sits within this many
+# bits of an ALREADY-PICKED source is "similar-but-not-duplicate" (the hard
+# dedup filter fires at <=8) and gets a soft score penalty, so the third
+# near-identical beach shot loses ties to something visually fresh without
+# being banned outright.
+DIVERSITY_SIMILAR_BITS = 16
+DIVERSITY_PENALTY = 2.0
+
+
 def allocate_candidates(candidates: list[Candidate],
                         cut_points: list[float],
                         source_cap: int = 3,
@@ -610,6 +619,7 @@ def allocate_candidates(candidates: list[Candidate],
                         max_auto_cap: int = 3,
                         sections: list[dict[str, Any]] | None = None,
                         source_budgets: dict[str, int] | None = None,
+                        source_phash: dict[str, str] | None = None,
                         ) -> list[tuple[float, Candidate]]:
     """Greedy fill: walk cut points, pick the highest-scoring unused candidate
     that hasn't already hit its per-source reuse cap.
@@ -688,6 +698,21 @@ def allocate_candidates(candidates: list[Candidate],
     used_sources: dict[str, int] = {}
     picks: list[tuple[float, Candidate]] = []
 
+    # Signatures of sources already in the plan — the diversity penalty
+    # compares each candidate against these.
+    picked_sigs: list[str] = []
+
+    def _diversity_penalty(c: Candidate) -> float:
+        if not source_phash or not picked_sigs:
+            return 0.0
+        sig = source_phash.get(c.source)
+        if not sig:
+            return 0.0
+        if any(signature_distance(sig, ps) <= DIVERSITY_SIMILAR_BITS
+               for ps in picked_sigs):
+            return DIVERSITY_PENALTY
+        return 0.0
+
     for i in range(len(cut_points) - 1):
         beat_t = cut_points[i]
         next_t = cut_points[i + 1]
@@ -706,25 +731,37 @@ def allocate_candidates(candidates: list[Candidate],
                     continue
                 if used_sources.get(c.source, 0) >= _cap_for(c.source):
                     continue
-                s = _section_picker_score(c, kind)
+                s = _section_picker_score(c, kind) - _diversity_penalty(c)
                 if best is None or s > best[0]:
                     best = (s, c)
             if best is not None:
                 pick = best[1]
         else:
+            best_plain: tuple[float, Candidate] | None = None
             for c in pool:
+                # Pool is score-descending and the penalty only subtracts,
+                # so once the current best can't be beaten we can stop.
+                if best_plain is not None and best_plain[0] >= c.score:
+                    break
                 clip_len = c.end_s - c.start_s
                 if clip_len < MIN_CLIP_S:
                     continue
                 if used_sources.get(c.source, 0) >= _cap_for(c.source):
                     continue
-                pick = c
-                break
+                adj = c.score - _diversity_penalty(c)
+                if best_plain is None or adj > best_plain[0]:
+                    best_plain = (adj, c)
+            if best_plain is not None:
+                pick = best_plain[1]
         if not pick:
             continue
         pool.remove(pick)
         used_sources[pick.source] = used_sources.get(pick.source, 0) + 1
         picks.append((beat_t, pick))
+        if source_phash:
+            sig = source_phash.get(pick.source)
+            if sig:
+                picked_sigs.append(sig)
     return picks
 
 
@@ -991,10 +1028,13 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
     # are kept deliberately predictable per the IMPROVEMENT_PLAN.md spec:
     # "Preserve manual fast, medium, and slow modes for predictable behavior."
     alloc_sections = song.get("sections") if pace == "auto" else None
+    source_phash = {c["path"]: c["phash"] for c in catalog["clips"]
+                    if c.get("path") and c.get("phash")}
     picks = allocate_candidates(candidates, cut_points,
                                 source_cap=source_cap,
                                 sections=alloc_sections,
-                                source_budgets=source_budgets)
+                                source_budgets=source_budgets,
+                                source_phash=source_phash)
 
     # Stretch mode lever 1 (C3): if the greedy allocator left obvious holes
     # (`< STRETCH_FILL_RATIO × n_slots` picked) AND the caller is still at
@@ -1015,7 +1055,8 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
         retry_picks = allocate_candidates(candidates, cut_points,
                                           source_cap=new_cap,
                                           sections=alloc_sections,
-                                          source_budgets=source_budgets)
+                                          source_budgets=source_budgets,
+                                          source_phash=source_phash)
         if len(retry_picks) > len(picks):
             log(f"  ! stretch-mode: bumped source_cap {source_cap} → {new_cap} "
                 f"to fill {target_len:.1f}s ({len(picks)} → {len(retry_picks)} "
@@ -1090,6 +1131,18 @@ def build_plan(catalog: dict[str, Any], song: dict[str, Any],
         # Extend up to the source's full duration when filling the slot — the
         # candidate window is only the scoring centroid, not a usage cap.
         src_dur = float(src_clip.get("duration_s", pick.end_s))
+        # Moment refinement: candidate windows are integer-second aligned,
+        # so a HiLight tag (the user literally marking "this instant") can
+        # sit anywhere in the slot — often right at the edge. Re-anchor the
+        # source window so the tag lands ~40% in: a beat of context, then
+        # the moment, then the aftermath.
+        if "hilight_tag" in pick.reasons:
+            in_win = [t / 1000.0 for t in src_clip.get("hilight_tags_ms") or []
+                      if pick.start_s <= t / 1000.0 <= pick.end_s]
+            if in_win and src_time_needed > 0:
+                new_start = in_win[0] - 0.4 * src_time_needed
+                pick.start_s = max(0.0, min(new_start,
+                                            max(0.0, src_dur - src_time_needed)))
         actual_end = min(src_dur, pick.start_s + src_time_needed)
         start_i = int(pick.start_s)
         end_i = max(start_i + 1, int(actual_end + 0.999))

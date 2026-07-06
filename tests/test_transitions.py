@@ -1,6 +1,8 @@
 """Unit tests for the transition heuristic + xfade graph builder."""
 from __future__ import annotations
 
+import pytest
+
 from aftermovie.render.transitions import (
     build_xfade_graph,
     decide_transitions,
@@ -114,6 +116,8 @@ def test_xfade_graph_splits_on_crossfade():
 
 
 def test_transition_prerender_duration_compensates_for_overlap():
+    """Centered fades: half the entry's own overlap at its head, half the
+    NEXT entry's overlap at its tail. Timeline total stays the planner's."""
     entry = {
         "source": "/clip.mp4",
         "start_s": 0.0,
@@ -121,12 +125,49 @@ def test_transition_prerender_duration_compensates_for_overlap():
         "out_duration_s": 2.0,
         "transition_in": {"kind": "crossfade", "duration_s": 0.45},
     }
+    nxt = {"transition_in": {"kind": "crossfade", "duration_s": 0.3}}
 
     render_entry, planned, prerender = _compensated_render_entry(
-        entry, transitions_active=True, is_first=False,
+        entry, transitions_active=True, is_first=False, next_entry=nxt,
     )
 
     assert planned == 2.0
-    assert prerender == 2.45
-    assert render_entry["out_duration_s"] == 2.45
+    assert prerender == pytest.approx(2.0 + 0.45 / 2 + 0.3 / 2)
+    assert render_entry["out_duration_s"] == prerender
     assert entry["out_duration_s"] == 2.0
+
+    # Last entry: no tail extension.
+    _, _, tail = _compensated_render_entry(
+        entry, transitions_active=True, is_first=False, next_entry=None,
+    )
+    assert tail == pytest.approx(2.0 + 0.45 / 2)
+
+
+def test_centered_fade_midpoint_lands_on_planned_boundary():
+    """End-to-end offset math: with half-extended segments, the xfade
+    midpoint (offset + tdur/2) sits exactly on the planned cut boundary,
+    and the total telescopes back to the planned sum."""
+    tdur = 0.4
+    entries = [
+        {"source": "/a.mp4", "start_s": 0.0, "end_s": 2.0, "out_duration_s": 2.0,
+         "transition_in": {"kind": "cut", "duration_s": 0.0}},
+        {"source": "/b.mp4", "start_s": 0.0, "end_s": 2.0, "out_duration_s": 2.0,
+         "transition_in": {"kind": "crossfade", "duration_s": tdur}},
+    ]
+    rendered = []
+    for i, e in enumerate(entries):
+        re_, _, dur = _compensated_render_entry(
+            e, transitions_active=True, is_first=(i == 0),
+            next_entry=entries[i + 1] if i + 1 < len(entries) else None,
+        )
+        rendered.append((re_, dur))
+    durations = [d for _, d in rendered]
+    graph, _ = build_xfade_graph(2, durations, [r for r, _ in rendered])
+    import re
+    m = re.search(r"xfade=transition=fade:duration=([\d.]+):offset=([\d.]+)", graph)
+    assert m, graph
+    dur_s, offset = float(m.group(1)), float(m.group(2))
+    # Planned boundary is at 2.0; midpoint of the fade must sit there.
+    assert offset + dur_s / 2 == pytest.approx(2.0)
+    # Total output length telescopes to the planned 4.0.
+    assert offset + durations[1] == pytest.approx(4.0)
